@@ -27,8 +27,6 @@ pub struct Session {
     pub id: SessionId,
     pub parent: Option<SessionId>,
     pub title: String,
-    /// 起動時の作業ディレクトリ。
-    pub spawn_cwd: PathBuf,
     /// OSC 7 で通知された現在の作業ディレクトリ。fork はこちらを引き継ぐ。
     pub cwd: PathBuf,
     pub profile: String,
@@ -100,24 +98,14 @@ impl Manager {
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
-    pub fn len(&self) -> usize {
-        self.sessions.len()
-    }
     pub fn selected_index(&self) -> usize {
         self.selected.min(self.sessions.len().saturating_sub(1))
     }
     pub fn selected(&self) -> Option<&Session> {
         self.sessions.get(self.selected_index())
     }
-    pub fn selected_mut(&mut self) -> Option<&mut Session> {
-        let i = self.selected_index();
-        self.sessions.get_mut(i)
-    }
     pub fn sessions(&self) -> &[Session] {
         &self.sessions
-    }
-    pub fn index_of(&self, id: SessionId) -> Option<usize> {
-        self.sessions.iter().position(|s| s.id == id)
     }
     pub fn get_mut(&mut self, id: SessionId) -> Option<&mut Session> {
         self.sessions.iter_mut().find(|s| s.id == id)
@@ -244,20 +232,26 @@ impl Manager {
             .unwrap_or(&parent.profile)
             .to_string();
         let parent_base = parent.base_command.clone();
+        let new_id = uuid::Uuid::new_v4().to_string();
         let vars = Vars {
-            new_id: Some(uuid::Uuid::new_v4().to_string()),
+            new_id: Some(new_id.clone()),
             parent_agent_id: parent.agent_id.clone(),
             cwd: Some(cwd.to_string_lossy().to_string()),
             parent_title: Some(parent_title.clone()),
         };
 
-        let (base, inherited) = match &config.agent.fork {
+        // テンプレートが {new_id} を使うなら、分岐先の ID は起動時点で確定する。
+        // 使わないなら、エージェントが OSC で知らせてくるまで未取得のままになる。
+        let (base, inherited, agent_id) = match &config.agent.fork {
             Some(t) => match config::expand_template(t, &vars) {
-                Ok(argv) => (argv, true),
-                Err(ExpandError::MissingValue(_)) => (parent_base, false),
+                Ok(argv) => {
+                    let knows_id = config::template_vars(t).iter().any(|v| v == "new_id");
+                    (argv, true, knows_id.then_some(new_id))
+                }
+                Err(ExpandError::MissingValue(_)) => (parent_base, false, None),
                 Err(e) => return Err(SessionError::Template(e)),
             },
-            None => (parent_base, false),
+            None => (parent_base, false, None),
         };
 
         let n = self
@@ -273,7 +267,7 @@ impl Manager {
             &cwd,
             base,
             Some(parent_id),
-            None,
+            agent_id,
             title,
             inherited,
         )
@@ -313,7 +307,6 @@ impl Manager {
             id,
             parent,
             title,
-            spawn_cwd: cwd.to_path_buf(),
             cwd: cwd.to_path_buf(),
             profile: profile_name.to_string(),
             agent_id,

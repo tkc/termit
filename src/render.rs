@@ -221,13 +221,6 @@ impl Renderer {
         r
     }
 
-    fn attrs(&self) -> Attrs<'_> {
-        match &self.family {
-            Some(name) => Attrs::new().family(Family::Name(name)),
-            None => Attrs::new().family(Family::Monospace),
-        }
-    }
-
     /// フォント寸法からセルの幅と高さを決め直す。
     fn recompute_metrics(&mut self) {
         let px = (self.font_size * self.scale).max(4.0);
@@ -258,12 +251,6 @@ impl Renderer {
 
     pub fn cell(&self) -> CellMetrics {
         self.cell
-    }
-    pub fn scale(&self) -> f32 {
-        self.scale
-    }
-    pub fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
     }
     pub fn font_size(&self) -> f32 {
         self.font_size

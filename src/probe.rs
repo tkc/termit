@@ -48,7 +48,7 @@ pub fn run(out_path: &str) {
     let (tx, rx) = channel::<UiEvent>();
     let sender = UiSender::Channel(tx);
 
-    let mut renderer = pollster::block_on(Renderer::offscreen(WIDTH, HEIGHT, "Menlo", 13.0));
+    let renderer = pollster::block_on(Renderer::offscreen(WIDTH, HEIGHT, "Menlo", 13.0));
     let cell = renderer.cell();
     let (cols, rows) = renderer.grid_size();
 
@@ -93,10 +93,7 @@ pub fn run(out_path: &str) {
             Err(_) => {}
         }
     }
-    eprintln!("[probe] 取り出した記録 {} 件", records.len());
-    for r in &records {
-        eprintln!("[probe]   session={} code={:?} cmd={:?}", r.session_id, r.exit_code, r.command);
-    }
+    eprintln!("[probe] 取り出したコマンドの記録 {} 件", records.len());
     if let Some(h) = &history {
         for r in &records {
             let _ = h.record(r);

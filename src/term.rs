@@ -67,7 +67,11 @@ impl From<EventLoopProxy<UiEvent>> for UiSender {
 }
 
 /// UI スレッドへ送る通知。
+///
+/// 送り先のセッションを表す `SessionId` は、受け手が使わない通知にも付ける。
+/// どのペインから来たのかを型の上で失わないようにするためである。
 #[derive(Clone)]
+#[allow(dead_code)]
 pub enum UiEvent {
     /// 画面内容が更新された。
     Wakeup(SessionId),

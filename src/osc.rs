@@ -191,16 +191,25 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// シェル統合の設定断片。`Ctrl+R` の履歴はこれが入っていることを前提にする。
+/// zsh 用のシェル統合。これを読み込むと、端末がコマンド履歴を記録できる。
+///
+/// `precmd` で直前の終了コードと作業ディレクトリを知らせ、続けてプロンプトの
+/// 開始を知らせる。入力の開始位置はプロンプト文字列の末尾に置く。
+/// `%{ %}` は幅を持たない区間を表すので、桁の計算は狂わない。
 pub const ZSH_INTEGRATION: &str = r#"# tex shell integration (zsh)
-if [[ -n "$TEX_SHELL_INTEGRATION" ]]; then
-  __tex_prompt_start() { printf '\033]133;A\007'; }
-  __tex_cmd_start()    { printf '\033]133;B\007'; }
-  __tex_preexec()      { printf '\033]133;C\007'; }
-  __tex_precmd()       { printf '\033]133;D;%s\007' "$?"; printf '\033]7;file://%s%s\007' "$HOST" "$PWD"; }
+if [[ -n "$TEX_SHELL_INTEGRATION" && -z "$__TEX_LOADED" ]]; then
+  __TEX_LOADED=1
+  __tex_precmd() {
+    local st=$?
+    printf '\033]133;D;%s\007' "$st"
+    printf '\033]7;file://%s%s\007' "${HOST:-localhost}" "$PWD"
+    printf '\033]133;A\007'
+  }
+  __tex_preexec() { printf '\033]133;C\007' }
+  typeset -ga precmd_functions preexec_functions
   precmd_functions+=(__tex_precmd)
   preexec_functions+=(__tex_preexec)
-  PS1='%{$(__tex_prompt_start)%}'"$PS1"'%{$(__tex_cmd_start)%}'
+  PS1="$PS1"$'%{\e]133;B\a%}'
 fi
 "#;
 

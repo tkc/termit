@@ -17,6 +17,9 @@ use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
 use crate::osc::{OscEvent, OscScanner};
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point};
+
 use crate::session::{grid_text, CommandRecord, SessionId};
 use crate::term::{EventProxy, TermSize, UiEvent, UiSender};
 
@@ -30,10 +33,6 @@ pub struct PtyHandle {
 impl PtyHandle {
     pub fn write(&self, bytes: Vec<u8>) {
         let _ = self.writer_tx.send(bytes);
-    }
-
-    pub fn sender(&self) -> Sender<Vec<u8>> {
-        self.writer_tx.clone()
     }
 
     pub fn resize(&self, size: TermSize, cell_w: u16, cell_h: u16) {
@@ -187,7 +186,11 @@ fn spawn_writer(mut writer: Box<dyn Write + Send>, rx: Receiver<Vec<u8>>) {
 struct CommandTracker {
     cwd: String,
     agent_id: Option<String>,
-    input_start: Option<alacritty_terminal::index::Point>,
+    /// 入力の開始位置と、その時点のスクロールバック行数。
+    ///
+    /// Enter を押すと画面がスクロールし、同じ行番号が別の行を指すようになる。
+    /// 行数の増加分がスクロール量なので、それで行番号を戻す。
+    input_start: Option<(alacritty_terminal::index::Point, usize)>,
     text: Option<String>,
     started_at: Option<SystemTime>,
 }
@@ -215,12 +218,25 @@ impl CommandTracker {
                 None
             }
             OscEvent::CommandStart => {
-                self.input_start = Some(term.grid().cursor.point);
+                self.input_start = Some((term.grid().cursor.point, term.grid().history_size()));
                 None
             }
             OscEvent::CommandExecuted => {
                 let end = term.grid().cursor.point;
-                let start = self.input_start.unwrap_or(end);
+                let start = match self.input_start {
+                    Some((point, history)) => {
+                        let scrolled = term.grid().history_size().saturating_sub(history) as i32;
+                        let line = Line(point.line.0 - scrolled);
+                        let topmost = Line(-(term.grid().history_size() as i32));
+                        if line < topmost {
+                            // 履歴からも押し出された。実行直前の行だけを読む。
+                            Point::new(end.line, Column(0))
+                        } else {
+                            Point::new(line, point.column)
+                        }
+                    }
+                    None => end,
+                };
                 self.text = Some(grid_text(term, start, end));
                 self.started_at = Some(SystemTime::now());
                 None
@@ -383,5 +399,150 @@ mod tests {
             }
         }
         assert!(found, "グリッドに hello が現れる");
+    }
+}
+
+#[cfg(test)]
+mod shell_integration_tests {
+    use super::*;
+    use crate::term::TermSize;
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
+
+    /// 同梱するシェル統合を実際の zsh に読み込ませ、コマンドが記録されるか確かめる。
+    #[test]
+    fn zsh_のシェル統合からコマンドを記録できる() {
+        if !Path::new("/bin/zsh").exists() {
+            eprintln!("zsh がないため飛ばす");
+            return;
+        }
+        let (tx, rx) = channel();
+        let spawned = spawn(
+            11,
+            &[
+                "/bin/zsh".to_string(),
+                "-f".to_string(),
+                "-i".to_string(),
+            ],
+            Path::new("/tmp"),
+            TermSize::new(80, 24),
+            (8, 16),
+            200,
+            crate::term::UiSender::Channel(tx),
+        )
+        .expect("zsh を起動できる");
+
+        // 統合を読み込ませてから、記録したいコマンドを打つ。
+        let mut script = crate::osc::ZSH_INTEGRATION.replace('\n', "\n");
+        script.push_str("\nprint -n ''\n");
+        spawned.handle.write(script.into_bytes());
+        std::thread::sleep(Duration::from_millis(400));
+        spawned.handle.write(b"echo hello-from-zsh\n".to_vec());
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut found = None;
+        while Instant::now() < deadline && found.is_none() {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(UiEvent::Command(id, record)) => {
+                    assert_eq!(id, 11);
+                    if record.command.contains("echo hello-from-zsh") {
+                        found = Some(record);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let record = found.expect("echo の記録が届く");
+        assert_eq!(record.command, "echo hello-from-zsh");
+        assert_eq!(record.exit_code, Some(0));
+        // macOS では /tmp は /private/tmp へ解決される。
+        assert!(
+            record.cwd.ends_with("/tmp"),
+            "OSC 7 から作業ディレクトリを取れる: {}",
+            record.cwd
+        );
+
+        let mut handle = spawned.handle;
+        handle.kill();
+    }
+}
+
+#[cfg(test)]
+mod tracker_tests {
+    use super::*;
+    use crate::term::{EventProxy, TermSize, UiSender};
+    use alacritty_terminal::event::WindowSize;
+    use std::sync::mpsc::channel;
+
+    fn make_term(cols: usize, lines: usize) -> alacritty_terminal::Term<EventProxy> {
+        let (pty_tx, _pty_rx) = channel();
+        let (ui_tx, _ui_rx) = channel();
+        let size = TermSize::new(cols, lines);
+        let ws = Arc::new(FairMutex::new(WindowSize {
+            num_lines: lines as u16,
+            num_cols: cols as u16,
+            cell_width: 8,
+            cell_height: 16,
+        }));
+        let proxy = EventProxy::new(1, pty_tx, UiSender::Channel(ui_tx), ws);
+        crate::term::new_term(size, 100, proxy)
+    }
+
+    fn run(prelude: &[u8], typed: &[u8], cols: usize, lines: usize) -> Option<CommandRecord> {
+        let mut term = make_term(cols, lines);
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        let mut tracker = CommandTracker::default();
+        parser.advance(&mut term, prelude);
+        tracker.on_event(1, &OscEvent::CommandStart, &term);
+        parser.advance(&mut term, typed);
+        tracker.on_event(1, &OscEvent::CommandExecuted, &term);
+        tracker.on_event(1, &OscEvent::CommandFinished(Some(0)), &term)
+    }
+
+    #[test]
+    fn 改行で画面がスクロールしてもコマンドを読み出せる() {
+        // 3 行の画面を埋めてから入力するので、Enter で必ずスクロールする。
+        let rec = run(b"one\r\ntwo\r\n$ ", b"echo hi\r\n", 20, 3).expect("記録が作られる");
+        assert_eq!(rec.command, "echo hi");
+        assert_eq!(rec.exit_code, Some(0));
+    }
+
+    #[test]
+    fn スクロールしない位置でもコマンドを読み出せる() {
+        let rec = run(b"$ ", b"cargo test\r\n", 40, 10).expect("記録が作られる");
+        assert_eq!(rec.command, "cargo test");
+    }
+
+    #[test]
+    fn 画面幅を超える入力を折り返して読み出せる() {
+        // 20 桁の画面に、プロンプトを含めて 2 行ぶんの入力を打つ。
+        let long = "echo 123456789012345678901234567890";
+        let typed = format!("{long}\r\n");
+        let rec = run(b"$ ", typed.as_bytes(), 20, 6).expect("記録が作られる");
+        assert_eq!(rec.command, long);
+    }
+
+    #[test]
+    fn 空の入力は記録しない() {
+        assert!(run(b"$ ", b"\r\n", 40, 10).is_none());
+    }
+
+    #[test]
+    fn 作業ディレクトリと_エージェント_id_を保つ() {
+        let mut term = make_term(40, 10);
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        let mut tracker = CommandTracker::default();
+        tracker.on_event(1, &OscEvent::Cwd("/repo".into()), &term);
+        tracker.on_event(1, &OscEvent::AgentId("abc-123".into()), &term);
+        parser.advance(&mut term, b"$ ");
+        tracker.on_event(1, &OscEvent::CommandStart, &term);
+        parser.advance(&mut term, b"ls\r\n");
+        tracker.on_event(1, &OscEvent::CommandExecuted, &term);
+        let rec = tracker
+            .on_event(1, &OscEvent::CommandFinished(Some(2)), &term)
+            .expect("記録が作られる");
+        assert_eq!(rec.cwd, "/repo");
+        assert_eq!(rec.agent_id.as_deref(), Some("abc-123"));
+        assert_eq!(rec.exit_code, Some(2));
     }
 }

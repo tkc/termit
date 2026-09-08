@@ -607,7 +607,7 @@ args    = ["-l"]
 
 [agent]
 new  = "claude --session-id {new_id}"
-fork = "claude --resume {parent_agent_id} --fork-session"
+fork = "claude --resume {parent_agent_id} --fork-session --session-id {new_id}"
 
 [profile.host]
 

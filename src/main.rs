@@ -39,6 +39,10 @@ fn main() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--shell-integration") {
+        print!("{}", osc::ZSH_INTEGRATION);
+        return;
+    }
     if let Some(i) = args.iter().position(|a| a == "--probe") {
         let out = args.get(i + 1).cloned().unwrap_or_else(|| "probe.rgba".into());
         probe::run(&out);
