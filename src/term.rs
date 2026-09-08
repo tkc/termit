@@ -73,8 +73,8 @@ impl From<EventLoopProxy<UiEvent>> for UiSender {
 #[derive(Clone)]
 #[allow(dead_code)]
 pub enum UiEvent {
-    /// 画面内容が更新された。
-    Wakeup(SessionId),
+    /// 画面内容が更新された。時刻は、その更新を読み取った瞬間である。
+    Wakeup(SessionId, std::time::Instant),
     /// ウィンドウタイトルの変更要求。
     Title(SessionId, String),
     /// 子プロセスが終了した。
@@ -152,7 +152,9 @@ impl EventListener for EventProxy {
                 let _ = self.ui_tx.send_event(UiEvent::ChildExit(self.id, code));
             }
             Event::Wakeup | Event::MouseCursorDirty | Event::Bell => {
-                let _ = self.ui_tx.send_event(UiEvent::Wakeup(self.id));
+                let _ = self
+                    .ui_tx
+                    .send_event(UiEvent::Wakeup(self.id, std::time::Instant::now()));
             }
             Event::CursorBlinkingChange | Event::Exit => {}
         }

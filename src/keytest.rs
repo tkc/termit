@@ -60,6 +60,7 @@ impl ApplicationHandler for App {
             event_loop,
             &self.font,
             self.font_size,
+            true,
         ));
         self.renderer = Some(renderer);
         self.window = Some(window.clone());

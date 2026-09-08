@@ -1,6 +1,8 @@
 //! tex: エージェント向けの軽量ターミナル。
 
+mod bench;
 mod clipboard;
+mod latency;
 mod keytest;
 mod probe;
 mod config;
@@ -75,6 +77,14 @@ fn main() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--latency-test") {
+        latency::run();
+        return;
+    }
+    if args.iter().any(|a| a == "--bench") {
+        bench::run();
+        return;
+    }
     if args.iter().any(|a| a == "--keytest") {
         let c = Config::load().unwrap_or_default();
         keytest::run(&c.window.font, c.window.font_size);
@@ -110,6 +120,7 @@ fn main() {
         cwd,
         proxy,
         state: None,
+        counters: std::env::var("TEX_FRAME_LOG").is_ok().then(Counters::default),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("tex: {e}");
@@ -154,6 +165,8 @@ pub(crate) struct State {
     status: Option<String>,
     recent: Vec<Entry>,
     recent_for: Option<u32>,
+    /// 未表示の更新のうち、最も古いものが読み取られた時刻。
+    pending_since: Option<std::time::Instant>,
     window: Option<Arc<Window>>,
 }
 
@@ -165,11 +178,67 @@ impl State {
     }
 }
 
+/// 描画されない原因を工程ごとに切り分けるための計数。
+/// `TEX_FRAME_LOG` を指定したときだけ動く。
+#[derive(Default)]
+struct Counters {
+    wakeup: u64,
+    osc: u64,
+    other_user_event: u64,
+    redraw_requested: u64,
+    key: u64,
+    drew: u64,
+    /// 更新を読み取ってから画面に出すまでの時間。
+    latency_us: Vec<u64>,
+    last: Option<std::time::Instant>,
+}
+
+impl Counters {
+    fn tick(&mut self) {
+        let now = std::time::Instant::now();
+        let due = match self.last {
+            None => {
+                self.last = Some(now);
+                false
+            }
+            Some(t) => now.duration_since(t).as_millis() >= 1000,
+        };
+        if !due {
+            return;
+        }
+        self.last = Some(now);
+        self.latency_us.sort_unstable();
+        let pct = |v: &Vec<u64>, p: usize| {
+            if v.is_empty() {
+                0.0
+            } else {
+                v[(v.len() - 1) * p / 100] as f64 / 1000.0
+            }
+        };
+        log::info!(
+            "1 秒間: wakeup={} 再描画要求={} 実描画={} キー={} | 読み取り→表示 中央 {:.1}ms p90 {:.1}ms 最大 {:.1}ms",
+            self.wakeup,
+            self.redraw_requested,
+            self.drew,
+            self.key,
+            pct(&self.latency_us, 50),
+            pct(&self.latency_us, 90),
+            pct(&self.latency_us, 100),
+        );
+        let last = self.last;
+        *self = Counters {
+            last,
+            ..Default::default()
+        };
+    }
+}
+
 struct App {
     config: Config,
     cwd: PathBuf,
     proxy: EventLoopProxy<UiEvent>,
     state: Option<State>,
+    counters: Option<Counters>,
 }
 
 /// 画面の割り付け。すべてセル単位で扱う。
@@ -227,6 +296,7 @@ impl ApplicationHandler<UiEvent> for App {
             event_loop,
             &self.config.window.font,
             self.config.window.font_size,
+            self.config.window.vsync,
         ));
 
         let mut state = State {
@@ -242,6 +312,7 @@ impl ApplicationHandler<UiEvent> for App {
             status: None,
             recent: Vec::new(),
             recent_for: None,
+            pending_since: None,
             window: Some(window.clone()),
         };
         if state.history.is_none() {
@@ -267,9 +338,22 @@ impl ApplicationHandler<UiEvent> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UiEvent) {
+        if let Some(c) = &mut self.counters {
+            match &event {
+                UiEvent::Wakeup(_, _) => c.wakeup += 1,
+                UiEvent::Osc(_, _) => c.osc += 1,
+                _ => c.other_user_event += 1,
+            }
+            c.tick();
+        }
         let Some(state) = &mut self.state else { return };
         match event {
-            UiEvent::Wakeup(_) => {}
+            UiEvent::Wakeup(_, at) => {
+                // 最も古い更新の時刻を覚えておき、表示までの時間を測る。
+                if state.pending_since.is_none() {
+                    state.pending_since = Some(at);
+                }
+            }
             UiEvent::Title(_, _) => {}
             UiEvent::ChildExit(id, code) => {
                 state.manager.mark_exited(id, code);
@@ -359,10 +443,19 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 keylog(&event, state.mods);
                 if event.state.is_pressed() {
+                    if let Some(c) = &mut self.counters {
+                        c.key += 1;
+                    }
                     self.on_key(event, event_loop);
                 }
             }
-            WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::RedrawRequested => {
+                if let Some(c) = &mut self.counters {
+                    c.redraw_requested += 1;
+                    c.tick();
+                }
+                self.draw();
+            }
             _ => {}
         }
     }
@@ -862,6 +955,13 @@ impl App {
 
         state.renderer.render(theme.bg);
         state.manager.clear_dirty();
+        let latency = state.pending_since.take().map(|t| t.elapsed());
+        if let Some(c) = &mut self.counters {
+            c.drew += 1;
+            if let Some(d) = latency {
+                c.latency_us.push(d.as_micros() as u64);
+            }
+        }
     }
 
     fn refresh_recent(&mut self) {
@@ -1274,5 +1374,36 @@ mod tests {
     fn 括弧付き貼り付けに印を付ける() {
         let got = bracketed("x", TermMode::BRACKETED_PASTE);
         assert_eq!(got, b"\x1b[200~x\x1b[201~");
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    /// macOS の `dirs::config_dir()` は `~/.config` ではなく
+    /// `~/Library/Application Support` を返す。README に書いた場所と
+    /// 実装がずれないよう、XDG の作法に従っていることを確かめる。
+    #[test]
+    fn 設定と履歴は_xdg_の場所にある() {
+        let config = crate::config::config_path().expect("設定の場所が決まる");
+        let db = crate::history::db_path().expect("履歴の場所が決まる");
+        assert!(
+            config.ends_with(".config/tex/config.toml"),
+            "設定の場所が想定と違う: {}",
+            config.display()
+        );
+        assert!(
+            db.ends_with(".local/share/tex/history.db"),
+            "履歴の場所が想定と違う: {}",
+            db.display()
+        );
+    }
+
+    #[test]
+    fn 環境変数で置き場所を移せる() {
+        // 環境変数を書き換えるテストは並行実行と相性が悪いので、
+        // 変数を読む関数の方を直接確かめる。
+        let d = crate::config::xdg_dir("XDG_CONFIG_HOME_TEX_TEST_UNSET", ".config")
+            .expect("既定へ落ちる");
+        assert!(d.ends_with(".config"));
     }
 }

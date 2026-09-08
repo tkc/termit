@@ -72,6 +72,57 @@ pub struct Renderer {
 
     cell_draws: Vec<CellDraw>,
     rect_draws: Vec<Rect>,
+
+    /// フレームの内訳を測る。`TEX_FRAME_LOG` を指定したときだけ動く。
+    timing: Option<FrameTiming>,
+    /// ベンチで使い回す出力先。
+    bench_target: Option<(wgpu::Texture, wgpu::TextureView)>,
+}
+
+/// 1 フレームの内訳。遅さの原因を工程ごとに切り分けるために取る。
+#[derive(Default)]
+pub struct FrameTiming {
+    pub frames: u64,
+    pub prepare_us: u64,
+    pub acquire_us: u64,
+    pub encode_us: u64,
+    pub present_us: u64,
+    pub cells: u64,
+    pub rects: u64,
+    pub glyph_cache: u64,
+    last_report: Option<std::time::Instant>,
+}
+
+impl FrameTiming {
+    fn report(&mut self, force: bool) {
+        let now = std::time::Instant::now();
+        let due = match self.last_report {
+            None => true,
+            Some(t) => now.duration_since(t).as_millis() >= 1000,
+        };
+        if !(due || force) || self.frames == 0 {
+            return;
+        }
+        self.last_report = Some(now);
+        let n = self.frames as f64;
+        log::info!(
+            "frames={} 平均 prepare={:.2}ms acquire={:.2}ms encode={:.2}ms present={:.2}ms 合計={:.2}ms  cells={:.0} rects={:.0} 字形={}",
+            self.frames,
+            self.prepare_us as f64 / n / 1000.0,
+            self.acquire_us as f64 / n / 1000.0,
+            self.encode_us as f64 / n / 1000.0,
+            self.present_us as f64 / n / 1000.0,
+            (self.prepare_us + self.acquire_us + self.encode_us + self.present_us) as f64 / n / 1000.0,
+            self.cells as f64 / n,
+            self.rects as f64 / n,
+            self.glyph_cache,
+        );
+        *self = FrameTiming {
+            last_report: self.last_report,
+            glyph_cache: self.glyph_cache,
+            ..Default::default()
+        };
+    }
 }
 
 impl Renderer {
@@ -80,6 +131,7 @@ impl Renderer {
         event_loop: &winit::event_loop::ActiveEventLoop,
         font_name: &str,
         font_size: f32,
+        vsync: bool,
     ) -> Renderer {
         let physical_size = window.inner_size();
         let scale = window.scale_factor() as f32;
@@ -100,15 +152,34 @@ impl Renderer {
             .create_surface(window.clone())
             .expect("サーフェスを作れない");
         let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+
+        // 表示待ちが遅さの主因なので、待ちの短い方式を選ぶ。
+        // Mailbox は vsync に合わせつつ、投入したフレームを待たせない。
+        // Fifo はどの環境でも使えるが、行列に並ぶぶん遅れる。
+        let caps = surface.get_capabilities(&adapter);
+        let present_mode = if !vsync && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+            wgpu::PresentMode::Immediate
+        } else if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+        log::info!(
+            "表示方式 {present_mode:?}（使えるもの: {:?}）",
+            caps.present_modes
+        );
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: physical_size.width.max(1),
             height: physical_size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // 1 にすると、投入したフレームが次の走査で必ず出る。
+            // 2 では 1 周期ぶん古いフレームが表示されうる。
+            desired_maximum_frame_latency: 1,
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &surface_config);
@@ -159,6 +230,8 @@ impl Renderer {
             font_size,
             cell_draws: Vec::new(),
             rect_draws: Vec::new(),
+            timing: std::env::var("TEX_FRAME_LOG").is_ok().then(FrameTiming::default),
+            bench_target: None,
         };
         r.recompute_metrics();
         r
@@ -216,6 +289,8 @@ impl Renderer {
             font_size,
             cell_draws: Vec::new(),
             rect_draws: Vec::new(),
+            timing: std::env::var("TEX_FRAME_LOG").is_ok().then(FrameTiming::default),
+            bench_target: None,
         };
         r.recompute_metrics();
         r
@@ -517,7 +592,11 @@ impl Renderer {
     }
 
     pub fn render(&mut self, background: Rgb) {
+        let t0 = std::time::Instant::now();
+        let (n_cells, n_rects) = (self.cell_draws.len(), self.rect_draws.len());
         self.prepare_frame();
+        let t_prepare = t0.elapsed();
+        let t1 = std::time::Instant::now();
         let Some(target) = &self.target else {
             return;
         };
@@ -525,7 +604,8 @@ impl Renderer {
         let frame = match target.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                self.request_redraw();
+                // ここで再描画を要求すると、隠れているあいだ要求と失敗を
+                // 際限なく繰り返して CPU を焼く。次の出来事まで待つ。
                 return;
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
@@ -551,6 +631,8 @@ impl Renderer {
             }
         };
 
+        let t_acquire = t1.elapsed();
+        let t2 = std::time::Instant::now();
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -559,8 +641,66 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.encode_pass(&mut encoder, &view, background);
         self.queue.submit(Some(encoder.finish()));
+        let t_encode = t2.elapsed();
+        let t3 = std::time::Instant::now();
         self.queue.present(frame);
+        let t_present = t3.elapsed();
         self.atlas.trim();
+
+        let glyphs = self.glyphs.len() as u64;
+        if let Some(t) = &mut self.timing {
+            t.frames += 1;
+            t.prepare_us += t_prepare.as_micros() as u64;
+            t.acquire_us += t_acquire.as_micros() as u64;
+            t.encode_us += t_encode.as_micros() as u64;
+            t.present_us += t_present.as_micros() as u64;
+            t.cells += n_cells as u64;
+            t.rects += n_rects as u64;
+            t.glyph_cache = glyphs;
+            t.report(false);
+        }
+    }
+
+    /// 描画の指示だけを組み立てて、CPU 側の費用を測る（ベンチ用）。
+    pub fn bench_prepare(&mut self) -> std::time::Duration {
+        let t = std::time::Instant::now();
+        self.prepare_frame();
+        t.elapsed()
+    }
+
+    /// 読み戻しをせずに 1 フレームを GPU へ投げる（ベンチ用）。
+    ///
+    /// 出力先のテクスチャは使い回す。毎フレーム作ると、
+    /// 画面いっぱいの大きさでは確保だけで数百 MB になる。
+    pub fn bench_submit(&mut self, background: Rgb) -> std::time::Duration {
+        if self.bench_target.is_none() {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("tex-bench"),
+                size: wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.bench_target = Some((texture, view));
+        }
+        let view = &self.bench_target.as_ref().unwrap().1;
+        let t = std::time::Instant::now();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        self.encode_pass(&mut encoder, view, background);
+        self.queue.submit(Some(encoder.finish()));
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.atlas.trim();
+        t.elapsed()
     }
 
     /// 1 フレームをテクスチャへ描き、RGBA のバイト列として取り出す。

@@ -285,11 +285,36 @@ fn spawn_reader(
                 ..CommandTracker::default()
             };
             let mut buf = vec![0u8; 65536];
+            let diag = std::env::var("TEX_FRAME_LOG").is_ok();
+            let mut read_bytes = 0u64;
+            let mut reads = 0u64;
+            let mut sent = 0u64;
+            let mut skipped = 0u64;
+            let mut last = std::time::Instant::now();
             loop {
                 let n = match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        if diag {
+                            log::info!("[read {id}] 読み取り終了 reads={reads} bytes={read_bytes}");
+                        }
+                        break;
+                    }
                     Ok(n) => n,
                 };
+                if diag {
+                    reads += 1;
+                    read_bytes += n as u64;
+                    if last.elapsed().as_millis() >= 1000 {
+                        last = std::time::Instant::now();
+                        log::info!(
+                            "[read {id}] 1 秒: 読み {reads} 回 {read_bytes} B, wakeup 送信 {sent}, 抑制 {skipped}"
+                        );
+                        reads = 0;
+                        read_bytes = 0;
+                        sent = 0;
+                        skipped = 0;
+                    }
+                }
                 let bytes = &buf[..n];
                 let events = scanner.feed(bytes);
                 let mut out: Vec<UiEvent> = Vec::new();
@@ -313,10 +338,19 @@ fn spawn_reader(
                     }
                 }
                 // 直前の通知がまだ描画されていなければ、重ねて送らない。
-                if !dirty.swap(true, Ordering::AcqRel)
-                    && ui_tx.send_event(UiEvent::Wakeup(id)).is_err()
-                {
-                    return;
+                if dirty.swap(true, Ordering::AcqRel) {
+                    skipped += 1;
+                } else {
+                    sent += 1;
+                    if ui_tx
+                        .send_event(UiEvent::Wakeup(id, std::time::Instant::now()))
+                        .is_err()
+                    {
+                        if diag {
+                            log::info!("[read {id}] wakeup の送信に失敗。読み取りを終える");
+                        }
+                        return;
+                    }
                 }
             }
         })

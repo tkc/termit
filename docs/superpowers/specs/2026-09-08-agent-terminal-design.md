@@ -393,6 +393,12 @@ macOS では `Ctrl` と `Shift` の同時押しが端末まで届かないこと
 | 起動から子プロセスの生成まで | 200ms | 224ms（3 回の中央値、199 から 337ms） |
 | 常駐メモリ | 100MB | 84.7MB |
 | バイナリ | 単一ファイル | 9.4MB |
+| 80x24 の全画面書き換え | 16ms | 1.1ms |
+| 入力の往復（PTY の echo からグリッド反映まで） | — | 0.073ms |
+| 更新の読み取りから present まで | — | 0.5〜1.3ms |
+
+工程ごとの内訳と測り方は [performance.md](../../performance.md) に記録した。
+表示までの待ちが支配的で、`desired_maximum_frame_latency` を 1 にしてある。
 
 起動時間は目標をわずかに超えている。
 支配的なのはフォントデータベースの走査であり、字形の代替を効かせるために
@@ -473,6 +479,11 @@ network = "bridge"
 env     = ["ANTHROPIC_API_KEY"]
 args    = ["--dangerously-skip-permissions"]
 ```
+
+設定は `$XDG_CONFIG_HOME`、なければ `~/.config` の下を見る。
+macOS の `dirs::config_dir()` は `~/Library/Application Support` を返すが、
+端末の利用者が設定を探すのはそこではない。
+履歴も同様に `$XDG_DATA_HOME`、なければ `~/.local/share` の下に置く。
 
 設定の誤りは起動時に検出し、該当行を示して終了する。
 不正な値を既定値で補って黙って起動することはしない。

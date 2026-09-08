@@ -114,6 +114,7 @@ pub fn run(out_path: &str) {
         status: None,
         recent: Vec::new(),
         recent_for: None,
+        pending_since: None,
         window: None,
     };
     let id = state.manager.selected().map(|s| s.id).unwrap_or(0);

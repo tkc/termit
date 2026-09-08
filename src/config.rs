@@ -43,6 +43,17 @@ pub struct WindowConfig {
     pub scrollback: usize,
     #[serde(default = "default_sidebar_cols")]
     pub sidebar_cols: usize,
+    /// 表示装置の走査に合わせるか。
+    ///
+    /// 合わせると画面の裂けは起きないが、投入したフレームが出るまで
+    /// 最大で 1 周期（60Hz なら 16.7ms）待つ。切ると待ちが消える代わりに
+    /// 書き換えの途中が見えることがある。
+    #[serde(default = "default_vsync")]
+    pub vsync: bool,
+}
+
+fn default_vsync() -> bool {
+    true
 }
 
 fn default_font() -> String {
@@ -66,6 +77,7 @@ impl Default for WindowConfig {
             font_size: default_font_size(),
             scrollback: default_scrollback(),
             sidebar_cols: default_sidebar_cols(),
+            vsync: default_vsync(),
         }
     }
 }
@@ -159,8 +171,22 @@ impl fmt::Display for ConfigError {
     }
 }
 
+/// 設定の置き場所。
+///
+/// macOS の `dirs::config_dir()` は `~/Library/Application Support` を返すが、
+/// 端末の利用者が設定を探すのは `~/.config` である。XDG の作法に合わせる。
 pub fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("tex").join("config.toml"))
+    Some(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("tex").join("config.toml"))
+}
+
+/// `$XDG_*_HOME` があればそれを、なければ home 直下の既定を返す。
+pub fn xdg_dir(var: &str, fallback: &str) -> Option<PathBuf> {
+    if let Ok(v) = std::env::var(var) {
+        if !v.is_empty() {
+            return Some(PathBuf::from(v));
+        }
+    }
+    Some(dirs::home_dir()?.join(fallback))
 }
 
 impl Config {

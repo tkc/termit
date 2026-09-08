@@ -47,8 +47,13 @@ pub struct History {
     conn: Connection,
 }
 
+/// 履歴の置き場所。設定と同じく XDG の作法に合わせる。
 pub fn db_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("tex").join("history.db"))
+    Some(
+        crate::config::xdg_dir("XDG_DATA_HOME", ".local/share")?
+            .join("tex")
+            .join("history.db"),
+    )
 }
 
 impl History {

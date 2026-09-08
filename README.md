@@ -76,6 +76,7 @@ tex --shell-integration >> ~/.zshrc
 ## 設定
 
 `~/.config/tex/config.toml` を起動時に一度だけ読む。
+`$XDG_CONFIG_HOME` を設定していればそちらを見る。
 ファイルがなければ既定値で動く。
 
 ```toml
@@ -84,6 +85,7 @@ font       = "Menlo"      # 等幅フォント。見つからなければ総称�
 font_size  = 13.0
 scrollback = 10000
 sidebar_cols = 28
+vsync      = true         # false にすると表示待ちが消える代わりに画面が裂けうる
 
 [shell]
 program = "/bin/zsh"
@@ -132,9 +134,23 @@ args    = ["--dangerously-skip-permissions"]
 ## 開発
 
 ```
-cargo test              # 単体テストと PTY の結合テスト
+cargo test                     # 単体テストと PTY の結合テスト
 cargo run -- --probe out.png   # ウィンドウを開かずに 1 フレームを描いて書き出す
+cargo run -- --keytest         # 押したキーが何として届くかを画面に出す
+cargo run -- --bench           # 描画そのものの費用を測る
+cargo run -- --latency-test    # 入力の往復にかかる時間を測る
 ```
 
 `--probe` は実際の描画関数を通してオフスクリーンに 1 フレームを描き、PNG にする。
 画面キャプチャの権限がない環境でも、割り付けと字形の配置を目で確かめられる。
+
+動作中の内訳は次で見られる。
+
+```
+RUST_LOG=info TEX_FRAME_LOG=1 tex
+```
+
+1 秒ごとに、読み取り回数、再描画の通知と抑制、実際に描いた数、
+読み取りから表示までの時間、描画の工程ごとの費用を出す。
+
+応答速度を工程ごとに測った記録は [docs/performance.md](docs/performance.md) にある。
