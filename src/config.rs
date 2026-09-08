@@ -67,7 +67,9 @@ fn default_scrollback() -> usize {
     10_000
 }
 fn default_sidebar_cols() -> usize {
-    28
+    // `~/github/terminal_tex` のようなパスが、⌘ の番号や印を置く
+    // 右端の 8 桁を差し引いても収まる幅にする。
+    32
 }
 
 impl Default for WindowConfig {

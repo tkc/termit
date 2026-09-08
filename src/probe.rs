@@ -109,6 +109,7 @@ pub fn run(out_path: &str) {
         sidebar: true,
         search: None,
         picker: None,
+        rename: None,
         find: None,
         find_cells: Default::default(),
         find_current: Default::default(),
@@ -185,6 +186,18 @@ pub fn run(out_path: &str) {
     }
 
     state.manager.refresh_branches();
+    {
+        let sessions = state.manager.sessions_mut();
+        if let Some(s) = sessions.get_mut(0) {
+            s.window_title = Some("シンプルターミナル仕様書".into());
+        }
+        if let Some(s) = sessions.get_mut(1) {
+            s.window_title = Some("配色の実測".into());
+        }
+        if let Some(s) = sessions.get_mut(2) {
+            s.name = Some("名前を付けた例".into());
+        }
+    }
     state.renderer.begin();
     crate::draw_sidebar(&mut state, &layout, &theme);
     for row in 0..layout.rows {

@@ -41,6 +41,8 @@ pub struct Session {
     pub size: TermSize,
     pub window_size: Arc<FairMutex<WindowSize>>,
     pub dirty: Arc<AtomicBool>,
+    /// 利用者が付けた名前。付けていなければ作業ディレクトリを名前にする。
+    pub name: Option<String>,
     /// 作業ディレクトリのブランチ名。git の下にいなければ `None`。
     pub branch: Option<String>,
     /// ブランチ名を最後に読んだ時刻と、そのときの作業ディレクトリ。
@@ -61,6 +63,17 @@ pub struct Session {
 impl Session {
     pub fn is_running(&self) -> bool {
         matches!(self.state, RunState::Running)
+    }
+
+    /// 左ペインに出す名前。
+    ///
+    /// 付けた名前があればそれを、なければ作業ディレクトリを出す。
+    /// 分岐の系統は字下げで示すので、名前には入れない。
+    pub fn display_name(&self, max_cols: usize) -> String {
+        match &self.name {
+            Some(n) => n.clone(),
+            None => crate::git::short_path(&self.cwd, max_cols),
+        }
     }
 }
 
@@ -372,6 +385,7 @@ impl Manager {
             size: self.size,
             window_size: spawned.window_size,
             dirty: spawned.dirty,
+            name: None,
             branch: None,
             branch_read: None,
             window_title: None,

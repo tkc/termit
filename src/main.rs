@@ -147,6 +147,11 @@ struct MouseState {
     last_click: Option<(std::time::Instant, (usize, usize), u8)>,
 }
 
+/// 名前を付けるための入力。
+pub(crate) struct RenameState {
+    pub(crate) input: String,
+}
+
 /// 重ねて出すプロファイルの一覧。
 pub(crate) struct PickerState {
     pub(crate) names: Vec<String>,
@@ -168,6 +173,8 @@ pub(crate) struct State {
     sidebar: bool,
     search: Option<SearchState>,
     picker: Option<PickerState>,
+    /// 名前を付ける入力。
+    rename: Option<RenameState>,
     /// 画面の中の検索。
     find: Option<search::ScreenSearch>,
     /// 見えている範囲で強調するセル。
@@ -343,6 +350,7 @@ impl ApplicationHandler<UiEvent> for App {
             sidebar: true,
             search: None,
             picker: None,
+            rename: None,
             find: None,
             find_cells: Default::default(),
             find_current: Default::default(),
@@ -516,7 +524,11 @@ impl ApplicationHandler<UiEvent> for App {
                 state.preedit.clear();
                 // 確定した文字列は、開いている入り口へ渡す。
                 // 変換で入れた語も、検索や履歴の絞り込みに使える必要がある。
-                if state.find.is_some() {
+                if state.rename.is_some() {
+                    if let Some(r) = &mut state.rename {
+                        r.input.push_str(&text);
+                    }
+                } else if state.find.is_some() {
                     if let Some(f) = &mut state.find {
                         f.query.push_str(&text);
                         f.rebuild();
@@ -591,6 +603,13 @@ impl App {
         // 重ねた一覧が開いているあいだは、すべてのキーをそちらが受ける。
         if state.picker.is_some() {
             self.on_picker_key(&base, mods);
+            if let Some(s) = &self.state {
+                s.request_redraw();
+            }
+            return;
+        }
+        if state.rename.is_some() {
+            self.on_rename_key(&base, &event);
             if let Some(s) = &self.state {
                 s.request_redraw();
             }
@@ -691,6 +710,18 @@ impl App {
             Action::ToggleSidebar => {
                 state.sidebar = !state.sidebar;
                 self.reflow();
+                return;
+            }
+            Action::RenameSession => {
+                let current = state
+                    .manager
+                    .selected()
+                    .and_then(|s| s.name.clone())
+                    .unwrap_or_default();
+                state.picker = None;
+                state.search = None;
+                state.find = None;
+                state.rename = Some(RenameState { input: current });
                 return;
             }
             Action::FindInScreen => {
@@ -899,9 +930,10 @@ impl App {
         let (col, row, side) = mouse_cell(state);
 
         // 重ねた一覧が開いているときは、まず閉じる。
-        if state.picker.is_some() || state.search.is_some() {
+        if state.picker.is_some() || state.search.is_some() || state.rename.is_some() {
             state.picker = None;
             state.search = None;
+            state.rename = None;
             return;
         }
 
@@ -1096,6 +1128,35 @@ impl App {
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    fn on_rename_key(&mut self, key: &Key, event: &winit::event::KeyEvent) {
+        let Some(state) = &mut self.state else { return };
+        let Some(rename) = &mut state.rename else { return };
+        match key {
+            Key::Named(NamedKey::Escape) => state.rename = None,
+            Key::Named(NamedKey::Enter) => {
+                let name = rename.input.trim().to_string();
+                state.rename = None;
+                let i = state.manager.selected_index();
+                if let Some(s) = state.manager.sessions_mut().get_mut(i) {
+                    // 空にすると、既定の作業ディレクトリ表示へ戻る。
+                    s.name = (!name.is_empty()).then_some(name);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                rename.input.pop();
+            }
+            _ => {
+                let Some(text) = event.text.as_deref() else {
+                    return;
+                };
+                if text.chars().any(|c| c.is_control()) || !state.preedit.is_empty() {
+                    return;
+                }
+                rename.input.push_str(text);
+            }
         }
     }
 
@@ -1394,7 +1455,10 @@ fn sidebar_layout(state: &State, layout: &Layout) -> SidebarLayout {
         let Some(s) = state.manager.sessions().get(tree.index) else {
             continue;
         };
-        let height = if s.branch.is_some() { 3 } else { 2 };
+        // 1 段目は名前。2 段目は名乗った題名、3 段目はブランチ名で、
+        // どちらも無ければその段を作らない。
+        let height =
+            1 + usize::from(s.window_title.is_some()) + usize::from(s.branch.is_some());
         if row + height > limit {
             break;
         }
@@ -1452,21 +1516,25 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
     state.renderer.fill_cells(0, 0, w, layout.rows, theme.chrome_bg);
     state.renderer.put_str(1, 0, "SESSIONS", theme.fg_secondary);
     // 押せる目印。キーが効かない環境でもここから増やせる。
-    state.renderer.put_str(sl.action_col, 0, "[+]", theme.accent);
+    state
+        .renderer
+        .put_char(sl.marker_col, 0, '+', theme.accent, true, false);
 
     let selected = state.manager.selected_index();
     for (n, b) in sl.blocks.iter().enumerate() {
         let s = &state.manager.sessions()[b.index];
         let running = s.is_running();
-        let title = {
-            let mut t = s.title.clone();
-            if !s.inherited && s.parent.is_some() {
-                t.push('*');
-            }
-            t
-        };
+        let indent = b.depth * 2;
+        let name_width = sl.hint_col.saturating_sub(indent + 2);
+        // 会話を引き継いでいない印の分を先に空けておく。
+        // あとで足すと、切り詰めで印そのものが落ちる。
+        let forked = !s.inherited && s.parent.is_some();
+        let mut name = s.display_name(name_width - usize::from(forked));
+        if forked {
+            name.push('*');
+        }
         let profile = (s.profile != HOST_PROFILE).then(|| s.profile.clone());
-        let path = git::short_path(&s.cwd, w.saturating_sub(b.depth * 2 + 3));
+        let osc_title = s.window_title.clone();
         let branch = s.branch.clone();
         let exit = match s.state {
             RunState::Running => None,
@@ -1478,7 +1546,6 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
             state.renderer.fill_cells(0, b.top, w, b.height, theme.surface);
         }
 
-        let indent = b.depth * 2;
         let mut x = 1 + indent;
         if b.depth > 0 {
             state
@@ -1490,10 +1557,9 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         } else {
             theme.fg_tertiary
         };
-        let name_width = sl.hint_col.saturating_sub(x + 1);
         x += state
             .renderer
-            .put_str_clipped(x, b.top, &title, name_width, fg);
+            .put_str_clipped(x, b.top, &name, name_width, fg);
         let _ = x;
 
         // ⌘ の番号。押せることが見えていないと使われない。
@@ -1520,25 +1586,33 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
             }
         }
 
-        // 2 段目は作業ディレクトリ。
-        state.renderer.put_str_clipped(
-            2 + indent,
-            b.top + 1,
-            &path,
-            w.saturating_sub(indent + 3),
-            theme.fg_secondary,
-        );
-
-        // 3 段目はブランチ名。git の下にいなければ段そのものを作らない。
+        let mut line = b.top + 1;
+        // 端末上のプログラムが名乗った題名。何をしているセッションかが分かる。
+        if let Some(title) = osc_title {
+            let mut tx = 2 + indent;
+            state
+                .renderer
+                .put_char(tx, line, '✻', theme.accent, false, false);
+            tx += 2;
+            state.renderer.put_str_clipped(
+                tx,
+                line,
+                &title,
+                w.saturating_sub(tx + 1),
+                theme.fg_secondary,
+            );
+            line += 1;
+        }
+        // ブランチ名。git の下にいなければ段そのものを作らない。
         if let Some(branch) = branch {
             let mut bx = 2 + indent;
             state
                 .renderer
-                .put_char(bx, b.top + 2, '⋔', theme.fg_tertiary, false, false);
+                .put_char(bx, line, '⋔', theme.fg_tertiary, false, false);
             bx += 2;
             let used = state.renderer.put_str_clipped(
                 bx,
-                b.top + 2,
+                line,
                 &branch,
                 w.saturating_sub(bx + 1),
                 theme.fg_tertiary,
@@ -1548,21 +1622,13 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
                 if bx + 4 < w {
                     state.renderer.put_str_clipped(
                         bx + 1,
-                        b.top + 2,
+                        line,
                         p,
                         w.saturating_sub(bx + 2),
                         theme.accent,
                     );
                 }
             }
-        } else if let Some(p) = &profile {
-            state.renderer.put_str_clipped(
-                2 + indent,
-                b.top + 1 + 1,
-                p,
-                w.saturating_sub(indent + 3),
-                theme.accent,
-            );
         }
     }
 
@@ -1753,6 +1819,52 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
 
 pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
     let y = layout.rows.saturating_sub(1);
+    if let Some(rename) = &state.rename {
+        let x0 = layout.term_col;
+        let w = layout.term_cols;
+        state.renderer.fill_cells(x0, y, w, 1, theme.surface);
+        let prompt = format!("名前: {}", rename.input);
+        let mut used = state.renderer.put_str_clipped(
+            x0 + 1,
+            y,
+            &prompt,
+            w.saturating_sub(2),
+            theme.fg_primary,
+        );
+        if !state.preedit.is_empty() {
+            let text = state.preedit.clone();
+            let at = x0 + 1 + used;
+            let avail = w.saturating_sub(used + 2);
+            let cols: usize = text.chars().map(char_cols).sum();
+            state
+                .renderer
+                .fill_cells(at, y, cols.min(avail), 1, theme.chrome_bg);
+            let n = state
+                .renderer
+                .put_str_clipped(at, y, &text, avail, theme.fg_primary);
+            state.renderer.underline_cells(at, y, n, theme.accent);
+            used += n;
+        }
+        let cursor_x = x0 + 1 + used;
+        state.cursor_cell = Some((cursor_x, y));
+        if cursor_x < layout.cols {
+            state
+                .renderer
+                .fill_cells_alpha(cursor_x, y, 1, 1, theme.cursor, 0.55);
+        }
+        let note = "Enter で確定  空にすると作業ディレクトリに戻る  Esc で取消";
+        let nx = layout.cols.saturating_sub(note.chars().map(char_cols).sum::<usize>() + 2);
+        if nx > cursor_x + 2 {
+            state.renderer.put_str_clipped(
+                nx,
+                y,
+                note,
+                layout.cols.saturating_sub(nx + 1),
+                theme.fg_tertiary,
+            );
+        }
+        return;
+    }
     if let Some(find) = &state.find {
         let x0 = layout.term_col;
         let w = layout.term_cols;
@@ -1893,7 +2005,7 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
     }
 
     // 通常時は操作のヒントだけを薄く出す。
-    let hint = "^O 新規  ^\\ fork  ^] 選んで fork  ^^ 次  ⌘F 検索  ^R 履歴  ^B ペイン  ⌘K 消去  ⌘W 終了";
+    let hint = "^O 新規  ^\\ fork  ^] 選んで  ^^ 次  ⌘F 検索  ⌘I 改名  ^R 履歴  ^B ペイン  ⌘K 消去  ⌘W 終了";
     state.renderer.put_str_clipped(
         layout.term_col + 1,
         y,

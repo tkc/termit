@@ -24,6 +24,8 @@ pub enum Action {
     ClearScreen,
     /// 画面とスクロールバックの中を探す。
     FindInScreen,
+    /// セッションに名前を付ける。
+    RenameSession,
     FontBigger,
     FontSmaller,
     ScrollUp,
@@ -79,8 +81,11 @@ fn action_from_char(key: &Key, mods: ModifiersState) -> Option<Action> {
             _ => None,
         };
     }
-    // Cmd 側。
+    // Cmd 側。Shift を併用する組み合わせは ⌘⇧R だけに限る。
     if mods.super_key() && !mods.control_key() && !mods.alt_key() {
+        if mods.shift_key() {
+            return (c.as_str() == "r").then_some(Action::RenameSession);
+        }
         return match c.as_str() {
             "n" => Some(Action::NewSession),
             "d" => Some(Action::Fork),
@@ -92,6 +97,9 @@ fn action_from_char(key: &Key, mods: ModifiersState) -> Option<Action> {
             "v" => Some(Action::Paste),
             "k" => Some(Action::ClearScreen),
             "f" => Some(Action::FindInScreen),
+            // Shift を併用する組み合わせが届かない環境があるため、
+            // Shift の要らない ⌘I も受ける。
+            "i" => Some(Action::RenameSession),
             "[" => Some(Action::SelectPrev),
             "]" => Some(Action::SelectNext),
             "=" | "+" => Some(Action::FontBigger),
@@ -132,6 +140,7 @@ fn action_from_physical(physical: PhysicalKey, mods: ModifiersState) -> Option<A
             KeyCode::KeyV => Some(Action::Paste),
             KeyCode::KeyK => Some(Action::ClearScreen),
             KeyCode::KeyF => Some(Action::FindInScreen),
+            KeyCode::KeyI => Some(Action::RenameSession),
             KeyCode::BracketLeft => Some(Action::SelectPrev),
             KeyCode::BracketRight => Some(Action::SelectNext),
             KeyCode::Equal => Some(Action::FontBigger),
