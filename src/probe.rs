@@ -123,6 +123,8 @@ pub fn run(out_path: &str) {
         recent_for: None,
         pending_since: None,
         needs_redraw: false,
+        state_dirty: false,
+        state_saved_at: None,
         shown_title: String::new(),
         preedit: String::new(),
         ime_area: None,
