@@ -30,6 +30,12 @@ pub struct Theme {
     // --- 強調 ---
     pub accent: Rgb,
     pub warn: Rgb,
+    /// 検索で見つかった箇所。
+    pub search_hit: Rgb,
+    /// そのうち、いま選んでいる箇所。
+    pub search_current: Rgb,
+    /// 強調した箇所の上に載せる文字色。
+    pub search_fg: Rgb,
 }
 
 const fn rgb(r: u8, g: u8, b: u8) -> Rgb {
@@ -68,6 +74,9 @@ impl Default for Theme {
             fg_tertiary: rgb(0x8A, 0x8B, 0x90),
             accent: rgb(0x50, 0xFA, 0x7B),
             warn: rgb(0xFF, 0x55, 0x55),
+            search_hit: rgb(0xF1, 0xFA, 0x8C),
+            search_current: rgb(0xFF, 0xB8, 0x6C),
+            search_fg: rgb(0x28, 0x2A, 0x36),
         }
     }
 }

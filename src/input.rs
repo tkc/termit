@@ -22,6 +22,8 @@ pub enum Action {
     Paste,
     /// 画面とスクロールバックを消し、プロンプトを出し直す。
     ClearScreen,
+    /// 画面とスクロールバックの中を探す。
+    FindInScreen,
     FontBigger,
     FontSmaller,
     ScrollUp,
@@ -89,6 +91,7 @@ fn action_from_char(key: &Key, mods: ModifiersState) -> Option<Action> {
             "c" => Some(Action::Copy),
             "v" => Some(Action::Paste),
             "k" => Some(Action::ClearScreen),
+            "f" => Some(Action::FindInScreen),
             "[" => Some(Action::SelectPrev),
             "]" => Some(Action::SelectNext),
             "=" | "+" => Some(Action::FontBigger),
@@ -128,6 +131,7 @@ fn action_from_physical(physical: PhysicalKey, mods: ModifiersState) -> Option<A
             KeyCode::KeyC => Some(Action::Copy),
             KeyCode::KeyV => Some(Action::Paste),
             KeyCode::KeyK => Some(Action::ClearScreen),
+            KeyCode::KeyF => Some(Action::FindInScreen),
             KeyCode::BracketLeft => Some(Action::SelectPrev),
             KeyCode::BracketRight => Some(Action::SelectNext),
             KeyCode::Equal => Some(Action::FontBigger),
@@ -363,6 +367,7 @@ mod tests {
         assert_eq!(action_for(&ch("n"), phys, cmd), Some(Action::NewSession));
         assert_eq!(action_for(&ch("c"), phys, cmd), Some(Action::Copy));
         assert_eq!(action_for(&ch("k"), phys, cmd), Some(Action::ClearScreen));
+        assert_eq!(action_for(&ch("f"), phys, cmd), Some(Action::FindInScreen));
         assert_eq!(action_for(&ch("["), phys, cmd), Some(Action::SelectPrev));
     }
 

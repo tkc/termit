@@ -109,6 +109,9 @@ pub fn run(out_path: &str) {
         sidebar: true,
         search: None,
         picker: None,
+        find: None,
+        find_cells: Default::default(),
+        find_current: Default::default(),
         mouse: Default::default(),
         mods: Default::default(),
         status: None,
@@ -143,6 +146,17 @@ pub fn run(out_path: &str) {
                 names: vec!["host".into(), "sandbox".into(), "no-network".into()],
                 selected: 1,
             })
+        }
+        Ok("find") => {
+            let mut f = crate::search::ScreenSearch::new();
+            f.query = "terminal_tex".into();
+            f.rebuild();
+            if let Some(session) = state.manager.selected() {
+                let term = session.term.lock();
+                let _ = f.step(&term, alacritty_terminal::index::Direction::Left);
+            }
+            state.find = Some(f);
+            crate::collect_find_cells(&mut state);
         }
         Ok("search") => {
             let results = state

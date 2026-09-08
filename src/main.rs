@@ -13,6 +13,7 @@ mod osc;
 mod pty;
 mod rect;
 mod render;
+mod search;
 mod session;
 mod term;
 mod theme;
@@ -22,7 +23,7 @@ use std::sync::Arc;
 
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Point, Side};
 use alacritty_terminal::term::{viewport_to_point, TermMode};
 use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
@@ -166,6 +167,12 @@ pub(crate) struct State {
     sidebar: bool,
     search: Option<SearchState>,
     picker: Option<PickerState>,
+    /// 画面の中の検索。
+    find: Option<search::ScreenSearch>,
+    /// 見えている範囲で強調するセル。
+    find_cells: std::collections::HashSet<(i32, usize)>,
+    /// そのうち、いま選んでいる一致のセル。
+    find_current: std::collections::HashSet<(i32, usize)>,
     mouse: MouseState,
     mods: ModifiersState,
     status: Option<String>,
@@ -329,6 +336,9 @@ impl ApplicationHandler<UiEvent> for App {
             sidebar: true,
             search: None,
             picker: None,
+            find: None,
+            find_cells: Default::default(),
+            find_current: Default::default(),
             mouse: MouseState::default(),
             mods: ModifiersState::empty(),
             status: None,
@@ -557,6 +567,13 @@ impl App {
             }
             return;
         }
+        if state.find.is_some() {
+            self.on_find_key(&base, &event, mods);
+            if let Some(s) = &self.state {
+                s.request_redraw();
+            }
+            return;
+        }
         if state.search.is_some() {
             self.on_search_key(&base, &event, mods);
             if let Some(s) = &self.state {
@@ -641,8 +658,15 @@ impl App {
                 self.reflow();
                 return;
             }
+            Action::FindInScreen => {
+                state.picker = None;
+                state.search = None;
+                state.find = Some(search::ScreenSearch::new());
+                return;
+            }
             Action::SearchHistory => {
                 state.picker = None;
+                state.find = None;
                 state.search = Some(SearchState {
                     query: String::new(),
                     scope: Scope::All,
@@ -1040,6 +1064,63 @@ impl App {
         }
     }
 
+    fn on_find_key(&mut self, key: &Key, event: &winit::event::KeyEvent, mods: ModifiersState) {
+        let Some(state) = &mut self.state else { return };
+        let Some(find) = &mut state.find else { return };
+        let step: Option<Direction>;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                state.find = None;
+                state.find_cells.clear();
+                state.find_current.clear();
+                return;
+            }
+            // 以降はすべて step を決めてから抜ける。
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowUp) => {
+                // 既定は古い方（上）へ。端末では下ほど新しいので、
+                // 探したいものはたいてい上にある。
+                step = Some(if mods.shift_key() {
+                    Direction::Right
+                } else {
+                    Direction::Left
+                });
+            }
+            Key::Named(NamedKey::ArrowDown) => step = Some(Direction::Right),
+            Key::Named(NamedKey::Backspace) => {
+                find.query.pop();
+                find.rebuild();
+                step = Some(Direction::Left);
+            }
+            Key::Named(NamedKey::Tab) => {
+                find.regex_mode = !find.regex_mode;
+                find.rebuild();
+                step = Some(Direction::Left);
+            }
+            _ => {
+                let Some(text) = event.text.as_deref() else {
+                    return;
+                };
+                if text.chars().any(|c| c.is_control()) {
+                    return;
+                }
+                find.query.push_str(text);
+                find.rebuild();
+                step = Some(Direction::Left);
+            }
+        }
+        let Some(direction) = step else { return };
+        let Some(session) = state.manager.selected() else {
+            return;
+        };
+        let found = {
+            let term = session.term.lock();
+            find.step(&term, direction)
+        };
+        if let Some(m) = found {
+            session.term.lock().scroll_to_point(*m.start());
+        }
+    }
+
     fn on_search_key(
         &mut self,
         key: &Key,
@@ -1132,6 +1213,7 @@ impl App {
         self.refresh_recent();
         let Some(state) = &mut self.state else { return };
         state.manager.drain_pending_clears();
+        collect_find_cells(state);
         // 選んでいるセッションが名乗った題名を、ウィンドウに出す。
         let want_title = state
             .manager
@@ -1419,6 +1501,15 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         if selection.is_some_and(|s| s.contains(indexed.point)) {
             bg = theme.selection;
         }
+        // 検索の強調は選択より優先する。探しているものを見失わないため。
+        let key = (row, col);
+        if state.find_current.contains(&key) {
+            bg = theme.search_current;
+            fg = theme.search_fg;
+        } else if state.find_cells.contains(&key) {
+            bg = theme.search_hit;
+            fg = theme.search_fg;
+        }
         let wide = cell.flags.contains(Flags::WIDE_CHAR);
         if wide && indexed.point == cursor.point {
             cursor_cols = 2;
@@ -1473,6 +1564,45 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
 
 pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
     let y = layout.rows.saturating_sub(1);
+    if let Some(find) = &state.find {
+        let x0 = layout.term_col;
+        let w = layout.term_cols;
+        state.renderer.fill_cells(x0, y, w, 1, theme.surface);
+        let label = if find.regex_mode { "find(正規表現)" } else { "find" };
+        let prompt = format!("{label}: {}", find.query);
+        let fg = if find.invalid {
+            theme.warn
+        } else {
+            theme.fg_primary
+        };
+        let used = state
+            .renderer
+            .put_str_clipped(x0 + 1, y, &prompt, w.saturating_sub(2), fg);
+        let cursor_x = x0 + 1 + used;
+        if cursor_x < layout.cols {
+            state
+                .renderer
+                .fill_cells_alpha(cursor_x, y, 1, 1, theme.cursor, 0.55);
+        }
+        let note = if find.invalid {
+            "正規表現が誤っている"
+        } else if !find.query.is_empty() && find.current.is_none() {
+            "見つからない"
+        } else {
+            "Enter 上へ  ⇧Enter 下へ  Tab 正規表現  Esc 閉じる"
+        };
+        let nx = layout.cols.saturating_sub(note.chars().map(char_cols).sum::<usize>() + 2);
+        if nx > cursor_x + 2 {
+            state.renderer.put_str_clipped(
+                nx,
+                y,
+                note,
+                layout.cols.saturating_sub(nx + 1),
+                theme.fg_tertiary,
+            );
+        }
+        return;
+    }
     if let Some(picker) = &state.picker {
         let n = picker.names.len();
         let top = y.saturating_sub(n);
@@ -1558,7 +1688,7 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
     }
 
     // 通常時は操作のヒントだけを薄く出す。
-    let hint = "^O 新規  ^\\ fork  ^] 選んで fork  ^^ 次  ^R 履歴  ^B ペイン  ⌘K 消去  ⌘W 終了  ⌘C コピー";
+    let hint = "^O 新規  ^\\ fork  ^] 選んで fork  ^^ 次  ⌘F 検索  ^R 履歴  ^B ペイン  ⌘K 消去  ⌘W 終了";
     state.renderer.put_str_clipped(
         layout.term_col + 1,
         y,
@@ -1626,5 +1756,49 @@ mod path_tests {
         let d = crate::config::xdg_dir("XDG_CONFIG_HOME_TEX_TEST_UNSET", ".config")
             .expect("既定へ落ちる");
         assert!(d.ends_with(".config"));
+    }
+}
+
+/// 見えている範囲の一致を、セルの集まりに直す。
+///
+/// 一致は点の範囲で返るが、描くときはセルごとに引きたい。
+/// 見えている範囲だけなので、数は画面の広さで頭打ちになる。
+pub(crate) fn collect_find_cells(state: &mut State) {
+    state.find_cells.clear();
+    state.find_current.clear();
+    let Some(find) = &mut state.find else { return };
+    if !find.is_ready() {
+        return;
+    }
+    let Some(session) = state.manager.selected() else {
+        return;
+    };
+    let term = session.term.lock();
+    let cols = {
+        use alacritty_terminal::grid::Dimensions;
+        term.grid().columns()
+    };
+    let matches = find.visible(&term);
+    let current = find.current.clone();
+    drop(term);
+
+    let push = |set: &mut std::collections::HashSet<(i32, usize)>,
+                    m: &alacritty_terminal::term::search::Match| {
+        let (start, end) = (m.start(), m.end());
+        let mut line = start.line;
+        while line <= end.line {
+            let first = if line == start.line { start.column.0 } else { 0 };
+            let last = if line == end.line { end.column.0 } else { cols - 1 };
+            for c in first..=last.min(cols.saturating_sub(1)) {
+                set.insert((line.0, c));
+            }
+            line = alacritty_terminal::index::Line(line.0 + 1);
+        }
+    };
+    for m in &matches {
+        push(&mut state.find_cells, m);
+    }
+    if let Some(m) = &current {
+        push(&mut state.find_current, m);
     }
 }
