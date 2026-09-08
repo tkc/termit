@@ -47,7 +47,9 @@ code and how long it took.
 termit --shell-integration >> ~/.zshrc
 ```
 
-Without it termit works as a terminal, but the history stays empty.
+Without it termit works as a terminal, but the history stays empty. Everything
+else, including following `cd`, works either way: the working directory is read
+from the OS as well as from OSC 7.
 
 ## Keys
 
@@ -119,7 +121,9 @@ carried over.
 ## Session restore
 
 termit remembers the session list and rebuilds it the next time you start:
-working directory, profile, name, tree shape and which one was selected. It is
+working directory, profile, name, tree shape and which one was selected. The
+working directory is the one you are actually in, not the one the session
+started in, so `cd` is carried across a restart. It is
 written to `~/.local/share/termit/sessions.toml` and rewritten whenever the
 list changes.
 
