@@ -184,6 +184,7 @@ pub fn run(out_path: &str) {
         _ => {}
     }
 
+    state.manager.refresh_branches();
     state.renderer.begin();
     crate::draw_sidebar(&mut state, &layout, &theme);
     for row in 0..layout.rows {

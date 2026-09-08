@@ -7,6 +7,7 @@ mod mouse;
 mod keytest;
 mod probe;
 mod config;
+mod git;
 mod history;
 mod input;
 mod osc;
@@ -1262,6 +1263,7 @@ impl App {
         self.refresh_recent();
         let Some(state) = &mut self.state else { return };
         state.manager.drain_pending_clears();
+        state.manager.refresh_branches();
         collect_find_cells(state);
         // 選んでいるセッションが名乗った題名を、ウィンドウに出す。
         let want_title = state
@@ -1351,31 +1353,66 @@ impl App {
     }
 }
 
-/// 左ペインの中の位置。描画と当たり判定で同じ値を使う。
+/// 左ペインの一行分の割り付け。描画と当たり判定で同じ値を使う。
+///
+/// Warp に合わせ、1 セッションを 2 段から 3 段で表す。
+/// 1 段目が名前、2 段目が作業ディレクトリ、3 段目がブランチ名（あれば）。
+/// 段のあいだに 1 行の余白を置く。
+struct Block {
+    index: usize,
+    depth: usize,
+    /// 段の先頭の行。
+    top: usize,
+    /// 余白を含まない段の高さ。
+    height: usize,
+}
+
 struct SidebarLayout {
     width: usize,
-    tree_top: usize,
-    shown: usize,
+    blocks: Vec<Block>,
     /// [+] と × を置く桁。
     action_col: usize,
     /// 実行状態の印を置く桁。
     marker_col: usize,
+    /// ⌘ の番号を置く桁。
+    hint_col: usize,
     sep_row: usize,
     list_top: usize,
 }
 
+const SIDEBAR_TOP: usize = 2;
+/// 段のあいだに置く余白の行数。
+const BLOCK_GAP: usize = 1;
+
 fn sidebar_layout(state: &State, layout: &Layout) -> SidebarLayout {
     let width = layout.sidebar_cols;
-    let tree_top = 1;
-    let max_tree = layout.rows.saturating_sub(6).max(1);
-    let shown = state.manager.tree_rows().len().min(max_tree);
-    let sep_row = tree_top + shown;
+    // 下段に「直近のコマンド」を出す余地を残す。
+    let limit = layout.rows.saturating_sub(8).max(1);
+    let mut blocks = Vec::new();
+    let mut row = SIDEBAR_TOP;
+    for tree in state.manager.tree_rows() {
+        let Some(s) = state.manager.sessions().get(tree.index) else {
+            continue;
+        };
+        let height = if s.branch.is_some() { 3 } else { 2 };
+        if row + height > limit {
+            break;
+        }
+        blocks.push(Block {
+            index: tree.index,
+            depth: tree.depth,
+            top: row,
+            height,
+        });
+        row += height + BLOCK_GAP;
+    }
+    let sep_row = row.saturating_sub(BLOCK_GAP);
     SidebarLayout {
         width,
-        tree_top,
-        shown,
+        blocks,
         action_col: width.saturating_sub(4),
         marker_col: width.saturating_sub(2),
+        hint_col: width.saturating_sub(8),
         sep_row,
         list_top: sep_row + 2,
     }
@@ -1396,13 +1433,15 @@ fn sidebar_hit(state: &State, layout: &Layout, col: usize, row: usize) -> Option
     if row == 0 {
         return (col >= sl.action_col && col < sl.action_col + 3).then_some(SidebarHit::NewSession);
     }
-    if row >= sl.tree_top && row < sl.tree_top + sl.shown {
-        let i = row - sl.tree_top;
-        let index = state.manager.tree_rows().get(i)?.index;
-        if col >= sl.action_col && col < sl.action_col + 1 {
-            return Some(SidebarHit::Close(index));
+    for b in &sl.blocks {
+        if row < b.top || row >= b.top + b.height {
+            continue;
         }
-        return Some(SidebarHit::Select(index));
+        // × は名前の段だけで受ける。取り違えて閉じないようにする。
+        if row == b.top && col >= sl.action_col && col < sl.action_col + 1 {
+            return Some(SidebarHit::Close(b.index));
+        }
+        return Some(SidebarHit::Select(b.index));
     }
     None
 }
@@ -1415,55 +1454,115 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
     // 押せる目印。キーが効かない環境でもここから増やせる。
     state.renderer.put_str(sl.action_col, 0, "[+]", theme.accent);
 
-    let rows = state.manager.tree_rows();
     let selected = state.manager.selected_index();
+    for (n, b) in sl.blocks.iter().enumerate() {
+        let s = &state.manager.sessions()[b.index];
+        let running = s.is_running();
+        let title = {
+            let mut t = s.title.clone();
+            if !s.inherited && s.parent.is_some() {
+                t.push('*');
+            }
+            t
+        };
+        let profile = (s.profile != HOST_PROFILE).then(|| s.profile.clone());
+        let path = git::short_path(&s.cwd, w.saturating_sub(b.depth * 2 + 3));
+        let branch = s.branch.clone();
+        let exit = match s.state {
+            RunState::Running => None,
+            RunState::Exited(code) => Some(code),
+        };
 
-    for (i, row) in rows.iter().take(sl.shown).enumerate() {
-        let y = sl.tree_top + i;
-        let s = &state.manager.sessions()[row.index];
-        let is_selected = row.index == selected;
-        if is_selected {
-            state.renderer.fill_cells(0, y, w, 1, theme.surface);
+        // 選んでいる段は、余白を除いた高さ全体を塗る。
+        if b.index == selected {
+            state.renderer.fill_cells(0, b.top, w, b.height, theme.surface);
         }
-        let indent = row.depth * 2;
+
+        let indent = b.depth * 2;
         let mut x = 1 + indent;
-        if row.depth > 0 {
+        if b.depth > 0 {
             state
                 .renderer
-                .put_char(x - 1, y, '└', theme.fg_tertiary, false, false);
+                .put_char(x - 1, b.top, '└', theme.fg_tertiary, false, false);
         }
-        let fg = if s.is_running() {
+        let fg = if running {
             theme.fg_primary
         } else {
             theme.fg_tertiary
         };
-        let mut label = s.title.clone();
-        if !s.inherited && s.parent.is_some() {
-            label.push('*');
-        }
-        if s.profile != HOST_PROFILE {
-            label.push_str(" box");
-        }
-        let name_width = w.saturating_sub(indent + 6);
+        let name_width = sl.hint_col.saturating_sub(x + 1);
         x += state
             .renderer
-            .put_str_clipped(x, y, &label, name_width, fg);
+            .put_str_clipped(x, b.top, &title, name_width, fg);
         let _ = x;
+
+        // ⌘ の番号。押せることが見えていないと使われない。
+        if n < 9 {
+            state.renderer.put_str(
+                sl.hint_col,
+                b.top,
+                &format!("⌘{}", n + 1),
+                theme.fg_tertiary,
+            );
+        }
         state
             .renderer
-            .put_char(sl.action_col, y, '×', theme.fg_tertiary, false, false);
-        match s.state {
-            RunState::Running => {
-                state
-                    .renderer
-                    .put_char(sl.marker_col, y, '●', theme.accent, false, false);
-            }
-            RunState::Exited(code) => {
+            .put_char(sl.action_col, b.top, '×', theme.fg_tertiary, false, false);
+        match exit {
+            None => state
+                .renderer
+                .put_char(sl.marker_col, b.top, '●', theme.accent, false, false),
+            Some(code) => {
                 let c = if code == 0 { theme.fg_tertiary } else { theme.warn };
                 state
                     .renderer
-                    .put_char(sl.marker_col, y, '○', c, false, false);
+                    .put_char(sl.marker_col, b.top, '○', c, false, false);
             }
+        }
+
+        // 2 段目は作業ディレクトリ。
+        state.renderer.put_str_clipped(
+            2 + indent,
+            b.top + 1,
+            &path,
+            w.saturating_sub(indent + 3),
+            theme.fg_secondary,
+        );
+
+        // 3 段目はブランチ名。git の下にいなければ段そのものを作らない。
+        if let Some(branch) = branch {
+            let mut bx = 2 + indent;
+            state
+                .renderer
+                .put_char(bx, b.top + 2, '⋔', theme.fg_tertiary, false, false);
+            bx += 2;
+            let used = state.renderer.put_str_clipped(
+                bx,
+                b.top + 2,
+                &branch,
+                w.saturating_sub(bx + 1),
+                theme.fg_tertiary,
+            );
+            bx += used;
+            if let Some(p) = &profile {
+                if bx + 4 < w {
+                    state.renderer.put_str_clipped(
+                        bx + 1,
+                        b.top + 2,
+                        p,
+                        w.saturating_sub(bx + 2),
+                        theme.accent,
+                    );
+                }
+            }
+        } else if let Some(p) = &profile {
+            state.renderer.put_str_clipped(
+                2 + indent,
+                b.top + 1 + 1,
+                p,
+                w.saturating_sub(indent + 3),
+                theme.accent,
+            );
         }
     }
 

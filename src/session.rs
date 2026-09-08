@@ -41,6 +41,10 @@ pub struct Session {
     pub size: TermSize,
     pub window_size: Arc<FairMutex<WindowSize>>,
     pub dirty: Arc<AtomicBool>,
+    /// 作業ディレクトリのブランチ名。git の下にいなければ `None`。
+    pub branch: Option<String>,
+    /// ブランチ名を最後に読んだ時刻と、そのときの作業ディレクトリ。
+    branch_read: Option<(std::time::Instant, PathBuf)>,
     /// 端末上のプログラムが OSC 0 や OSC 2 で名乗った題名。
     ///
     /// 左ペインの名前はセッションの識別なので置き換えない。
@@ -120,6 +124,26 @@ impl Manager {
     }
     pub fn sessions_mut(&mut self) -> &mut [Session] {
         &mut self.sessions
+    }
+
+    /// 左ペインに出すブランチ名を読み直す。
+    ///
+    /// 作業ディレクトリが変わったときと、しばらく経ったときだけ読む。
+    /// 描くたびにファイルを開くほどの情報ではない。
+    pub fn refresh_branches(&mut self) {
+        let now = std::time::Instant::now();
+        for s in &mut self.sessions {
+            let stale = match &s.branch_read {
+                None => true,
+                Some((at, dir)) => {
+                    dir != &s.cwd || now.duration_since(*at).as_secs() >= 2
+                }
+            };
+            if stale {
+                s.branch = crate::git::branch_for(&s.cwd);
+                s.branch_read = Some((now, s.cwd.clone()));
+            }
+        }
     }
 
     /// 画面消去を頼まれたセッションの履歴を、期限まで捨て続ける。
@@ -348,6 +372,8 @@ impl Manager {
             size: self.size,
             window_size: spawned.window_size,
             dirty: spawned.dirty,
+            branch: None,
+            branch_read: None,
             window_title: None,
             clear_scrollback_until: None,
         });
