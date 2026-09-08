@@ -103,10 +103,10 @@ pub enum SessionError {
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SessionError::Template(e) => write!(f, "コマンドを組み立てられない: {e}"),
+            SessionError::Template(e) => write!(f, "cannot build command: {e}"),
             SessionError::Spawn(e) => write!(f, "{e}"),
             SessionError::NoDocker(p) => {
-                write!(f, "profile.{p} は docker を使うが、docker が見つからない")
+                write!(f, "profile.{p} needs docker, but docker was not found")
             }
         }
     }

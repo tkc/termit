@@ -166,9 +166,9 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::Read(p, e) => write!(f, "{} を読めない: {e}", p.display()),
-            ConfigError::Parse(p, e) => write!(f, "{} の書式が不正:\n{e}", p.display()),
-            ConfigError::Invalid(m) => write!(f, "設定が不正: {m}"),
+            ConfigError::Read(p, e) => write!(f, "cannot read {}: {e}", p.display()),
+            ConfigError::Parse(p, e) => write!(f, "invalid syntax in {}:\n{e}", p.display()),
+            ConfigError::Invalid(m) => write!(f, "invalid config: {m}"),
         }
     }
 }
@@ -216,13 +216,13 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.window.font_size < 4.0 || self.window.font_size > 200.0 {
             return Err(ConfigError::Invalid(format!(
-                "window.font_size は 4.0 から 200.0 のあいだ（現在 {}）",
+                "window.font_size must be between 4.0 and 200.0 (got {})",
                 self.window.font_size
             )));
         }
         if self.window.sidebar_width < 80.0 || self.window.sidebar_width > 800.0 {
             return Err(ConfigError::Invalid(format!(
-                "window.sidebar_width は 80 から 800 のあいだ（現在 {}）",
+                "window.sidebar_width must be between 80 and 800 (got {})",
                 self.window.sidebar_width
             )));
         }
@@ -230,27 +230,27 @@ impl Config {
             let p = &self.profile[HOST_PROFILE];
             if p.image.is_some() {
                 return Err(ConfigError::Invalid(
-                    "profile.host に image は書けない。ホスト実行を表す予約名である".into(),
+                    "profile.host cannot set image; it is the reserved name for running on the host".into(),
                 ));
             }
         }
         for (name, p) in &self.profile {
             if p.image.is_some() && p.mount.is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "profile.{name} に mount がない。コンテナから作業ディレクトリが見えない"
+                    "profile.{name} has no mount; the container cannot see the working directory"
                 )));
             }
             for m in &p.mount {
                 if !m.contains(':') {
                     return Err(ConfigError::Invalid(format!(
-                        "profile.{name}.mount の \"{m}\" は <ホスト>:<コンテナ> の形ではない"
+                        "profile.{name}.mount \"{m}\" is not in <host>:<container> form"
                     )));
                 }
             }
             for e in &p.env {
                 if e.contains('=') {
                     return Err(ConfigError::Invalid(format!(
-                        "profile.{name}.env の \"{e}\" には値ではなく変数名だけを書く"
+                        "profile.{name}.env \"{e}\" must name a variable, not set a value"
                     )));
                 }
             }
@@ -263,7 +263,7 @@ impl Config {
                 for name in template_vars(t) {
                     if !KNOWN_VARS.contains(&name.as_str()) {
                         return Err(ConfigError::Invalid(format!(
-                            "{field}: 未知の変数 {{{name}}}。使えるのは {}",
+                            "{field}: unknown variable {{{name}}}; available: {}",
                             KNOWN_VARS.join(", ")
                         )));
                     }
@@ -329,10 +329,10 @@ pub enum ExpandError {
 impl fmt::Display for ExpandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExpandError::MissingValue(v) => write!(f, "{{{v}}} の値がない"),
-            ExpandError::UnknownVar(v) => write!(f, "未知の変数 {{{v}}}"),
-            ExpandError::UnclosedQuote => write!(f, "引用符が閉じていない"),
-            ExpandError::Empty => write!(f, "コマンドが空である"),
+            ExpandError::MissingValue(v) => write!(f, "{{{v}}} has no value"),
+            ExpandError::UnknownVar(v) => write!(f, "unknown variable {{{v}}}"),
+            ExpandError::UnclosedQuote => write!(f, "unclosed quote"),
+            ExpandError::Empty => write!(f, "command is empty"),
         }
     }
 }

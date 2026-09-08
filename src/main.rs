@@ -139,6 +139,8 @@ struct MouseState {
     y: f32,
     /// 端末領域でドラッグ中か（端末側の選択）。
     dragging: bool,
+    /// 左ペインの幅を変えている最中か。
+    resizing: bool,
     /// 端末上のプログラムへ報告中の釦。
     reporting: Option<mouse::Button>,
     /// 直前に報告したセル。同じセルの中の動きは送らない。
@@ -175,6 +177,8 @@ pub(crate) struct State {
     picker: Option<PickerState>,
     /// 名前を付ける入力。
     rename: Option<RenameState>,
+    /// 左ペインの幅（pt）。境目を掴んで変えられる。
+    sidebar_width: f32,
     /// 画面の中の検索。
     find: Option<search::ScreenSearch>,
     /// 見えている範囲で強調するセル。
@@ -196,8 +200,8 @@ pub(crate) struct State {
     preedit: String,
     /// いま知らせてある候補窓の位置。変わったときだけ設定し直す。
     ime_area: Option<(i32, i32)>,
-    /// 変換中の文字列を出す位置。候補窓もここへ寄せる。
-    cursor_cell: Option<(usize, usize)>,
+    /// 変換中の文字列を出す位置（画素）。候補窓もここへ寄せる。
+    cursor_px: Option<(f32, f32)>,
     window: Option<Arc<Window>>,
 }
 
@@ -247,7 +251,7 @@ impl Counters {
             }
         };
         log::info!(
-            "1 秒間: wakeup={} 再描画要求={} 実描画={} キー={} | 読み取り→表示 中央 {:.1}ms p90 {:.1}ms 最大 {:.1}ms",
+            "1s: wakeup={} redraw_req={} drawn={} keys={} | read→present p50 {:.1}ms p90 {:.1}ms max {:.1}ms",
             self.wakeup,
             self.redraw_requested,
             self.drew,
@@ -336,6 +340,7 @@ impl ApplicationHandler<UiEvent> for App {
             search: None,
             picker: None,
             rename: None,
+            sidebar_width: self.config.window.sidebar_width,
             find: None,
             find_cells: Default::default(),
             find_current: Default::default(),
@@ -349,11 +354,11 @@ impl ApplicationHandler<UiEvent> for App {
             shown_title: String::new(),
             preedit: String::new(),
             ime_area: None,
-            cursor_cell: None,
+            cursor_px: None,
             window: Some(window.clone()),
         };
         if state.history.is_none() {
-            state.status = Some("履歴 DB を開けないため履歴機能を無効にした".into());
+            state.status = Some("history database unavailable; history disabled".into());
         }
 
         let layout = self.layout(&state);
@@ -414,7 +419,7 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::Command(_, record) => {
                 if let Some(h) = &state.history {
                     if let Err(e) = h.record(&record) {
-                        log::warn!("履歴を書けない: {e}");
+                        log::warn!("cannot write history: {e}");
                     }
                 }
                 state.recent_for = None;
@@ -443,8 +448,27 @@ impl ApplicationHandler<UiEvent> for App {
                 state.mouse.x = position.x as f32;
                 state.mouse.y = position.y as f32;
                 let dragging = state.mouse.dragging;
+                if state.mouse.resizing {
+                    // 掴んでいるあいだは、その位置を幅にする。
+                    let w = (state.mouse.x / state.renderer.scale()).clamp(80.0, 800.0);
+                    if (w - state.sidebar_width).abs() > 0.5 {
+                        state.sidebar_width = w;
+                        self.reflow();
+                    }
+                    return;
+                }
+                let layout = layout_of(&self.config, state);
+                // 境目の上では、掴めることを形で示す。
+                let over = on_divider(state, &layout, state.mouse.x);
+                if let Some(win) = &state.window {
+                    win.set_cursor(if over {
+                        winit::window::CursorIcon::ColResize
+                    } else {
+                        winit::window::CursorIcon::Default
+                    });
+                }
                 // 左ペインの上では、乗っている行の見た目が変わる。
-                if (position.x as f32) < layout_of(&self.config, state).sidebar_px {
+                if (position.x as f32) < layout.sidebar_px {
                     state.request_redraw();
                 }
                 if self.report_mouse_motion() {
@@ -668,7 +692,7 @@ impl App {
                 let names = config.profile_names();
                 if names.len() < 2 {
                     state.status =
-                        Some("設定に host 以外のプロファイルがない".into());
+                        Some("no profile other than host is configured".into());
                 } else {
                     state.search = None;
                     state.picker = Some(PickerState { names, selected: 1 });
@@ -919,6 +943,11 @@ impl App {
             return;
         }
 
+        // 境目を掴んだら、幅を変える操作に入る。
+        if on_divider(state, &layout, state.mouse.x) {
+            state.mouse.resizing = true;
+            return;
+        }
         if let Some(hit) = sidebar_hit(state, &layout, state.mouse.x, state.mouse.y) {
             match hit {
                 SidebarHit::NewSession => {
@@ -983,6 +1012,10 @@ impl App {
 
     fn on_release(&mut self) {
         let Some(state) = &mut self.state else { return };
+        if state.mouse.resizing {
+            state.mouse.resizing = false;
+            return;
+        }
         state.mouse.dragging = false;
         // 動かさずに離したときは選択を消す。
         if let Some(session) = state.manager.selected() {
@@ -1057,8 +1090,9 @@ fn layout_of(config: &Config, state: &State) -> Layout {
     let cell = state.renderer.cell();
     // 左ペインは画素で幅を決める。端末はその次の桁から始まるので、
     // 端数の 1 桁ぶんだけ隙間ができる。
+    let _ = config;
     let sidebar_px = if state.sidebar {
-        (config.window.sidebar_width * state.renderer.scale())
+        (state.sidebar_width * state.renderer.scale())
             .min((cols as f32 - 20.0) * cell.width)
             .max(0.0)
     } else {
@@ -1346,12 +1380,9 @@ impl App {
         draw_bottom(state, &layout, &theme);
 
         // 候補窓を、いま文字が入る位置へ寄せる。
-        if let (Some((cx, cy)), Some(window)) = (state.cursor_cell, state.window.clone()) {
+        if let (Some((cx, cy)), Some(window)) = (state.cursor_px, state.window.clone()) {
             let cell = state.renderer.cell();
-            let pos = (
-                (cx as f32 * cell.width) as i32,
-                (cy as f32 * cell.height) as i32,
-            );
+            let pos = (cx as i32, cy as i32);
             if state.ime_area != Some(pos) {
                 state.ime_area = Some(pos);
                 window.set_ime_cursor_area(
@@ -1437,6 +1468,14 @@ mod sidebar {
     pub const SIZE_BRANCH: f32 = 10.0;
     /// 直近のコマンド。
     pub const SIZE_RECENT: f32 = 11.0;
+}
+
+/// 左ペインと端末の境目を掴める幅（pt）。
+const DIVIDER_GRAB: f32 = 4.0;
+
+/// 境目の上にカーソルがあるか。
+fn on_divider(state: &State, layout: &Layout, px: f32) -> bool {
+    layout.sidebar_px > 0.0 && (px - layout.sidebar_px).abs() <= DIVIDER_GRAB * state.renderer.scale()
 }
 
 /// 左ペインの文字の体裁。桁に縛られないので、等幅でない書体で組む。
@@ -1840,7 +1879,8 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         if row >= 0 && (row as usize) < layout.term_rows {
             let x = layout.term_col + cursor_point.column.0.min(layout.term_cols - 1);
             let y = row as usize;
-            state.cursor_cell = Some((x, y));
+            let cell = state.renderer.cell();
+            state.cursor_px = Some((x as f32 * cell.width, y as f32 * cell.height));
             // 変換中の文字列は、確定するまで子プロセスへ渡さない。
             // 見えないと何を打っているか分からないので、カーソルの位置に出す。
             let preedit = (state.find.is_none() && state.search.is_none())
@@ -1860,7 +1900,7 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
                 // 文字が入る位置は変換中の文字列の末尾なので、細い棒で示す。
                 let caret = (x + used).min(layout.cols.saturating_sub(1));
                 state.renderer.cursor_beam(caret, y, theme.cursor);
-                state.cursor_cell = Some((caret, y));
+                state.cursor_px = Some((caret as f32 * cell.width, y as f32 * cell.height));
             } else {
                 match cursor_shape {
                     CursorShape::Beam => state.renderer.cursor_beam(x, y, theme.cursor),
@@ -1876,202 +1916,197 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
     }
 }
 
+/// 最下段の帯。端末の文字より小さく、別の書体で組む。
+///
+/// 端末の中身ではなく端末についての表示なので、桁に揃える必要がない。
+/// 同じ大きさで並べると、本文より目立ってしまう。
+const BAR_SIZE: f32 = 11.0;
+
 pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
-    let y = layout.rows.saturating_sub(1);
-    if let Some(rename) = &state.rename {
-        let x0 = layout.term_col;
-        let w = layout.term_cols;
-        state.renderer.fill_cells(x0, y, w, 1, theme.surface);
-        let prompt = format!("名前: {}", rename.input);
-        let mut used = state.renderer.put_str_clipped(
-            x0 + 1,
-            y,
-            &prompt,
-            w.saturating_sub(2),
-            theme.fg_primary,
-        );
-        if !state.preedit.is_empty() {
-            let text = state.preedit.clone();
-            let at = x0 + 1 + used;
-            let avail = w.saturating_sub(used + 2);
-            let cols: usize = text.chars().map(char_cols).sum();
-            state
-                .renderer
-                .fill_cells(at, y, cols.min(avail), 1, theme.chrome_bg);
-            let n = state
-                .renderer
-                .put_str_clipped(at, y, &text, avail, theme.fg_primary);
-            state.renderer.underline_cells(at, y, n, theme.accent);
-            used += n;
-        }
-        let cursor_x = x0 + 1 + used;
-        state.cursor_cell = Some((cursor_x, y));
-        if cursor_x < layout.cols {
-            state
-                .renderer
-                .fill_cells_alpha(cursor_x, y, 1, 1, theme.cursor, 0.55);
-        }
-        let note = "Enter で確定  空にすると作業ディレクトリに戻る  Esc で取消";
-        let nx = layout.cols.saturating_sub(note.chars().map(char_cols).sum::<usize>() + 2);
-        if nx > cursor_x + 2 {
-            state.renderer.put_str_clipped(
-                nx,
-                y,
-                note,
-                layout.cols.saturating_sub(nx + 1),
-                theme.fg_tertiary,
-            );
-        }
-        return;
-    }
-    if let Some(find) = &state.find {
-        let x0 = layout.term_col;
-        let w = layout.term_cols;
-        state.renderer.fill_cells(x0, y, w, 1, theme.surface);
-        let label = if find.regex_mode { "find(正規表現)" } else { "find" };
-        let prompt = format!("{label}: {}", find.query);
-        let fg = if find.invalid {
-            theme.warn
-        } else {
-            theme.fg_primary
-        };
-        let mut used = state
+    let sc = state.renderer.scale();
+    let cell = state.renderer.cell();
+    let bar_h = cell.height;
+    let bar_y = (layout.rows.saturating_sub(1)) as f32 * bar_h;
+    let x0 = layout.term_col as f32 * cell.width;
+    let w = (layout.cols.saturating_sub(layout.term_col)) as f32 * cell.width;
+    let st = style(BAR_SIZE, false);
+    let line_h = state.renderer.line_height_px(BAR_SIZE);
+    let ty = bar_y + (bar_h - line_h) / 2.0;
+    let pad = 8.0 * sc;
+
+    // 重ねた一覧は、帯の上へ同じ高さの行で積む。
+    let overlay = |state: &mut State, rows: usize| -> f32 {
+        let top = bar_y - rows as f32 * line_h;
+        state
             .renderer
-            .put_str_clipped(x0 + 1, y, &prompt, w.saturating_sub(2), fg);
-        // 変換中の文字列は確定前なので、検索には使わずここに出すだけ。
-        if !state.preedit.is_empty() {
-            let text = state.preedit.clone();
-            let at = x0 + 1 + used;
-            let avail = w.saturating_sub(used + 2);
-            let cols: usize = text.chars().map(char_cols).sum();
+            .fill_px(x0, top, w, rows as f32 * line_h + bar_h, theme.chrome_bg, 0.0);
+        top
+    };
+
+    if let Some(rename) = &state.rename {
+        let input = rename.input.clone();
+        state.renderer.fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
+        let mut x = x0 + pad;
+        x += state
+            .renderer
+            .put_text_px(x, ty, "name: ", st, theme.fg_secondary);
+        x += state.renderer.put_text_px(x, ty, &input, st, theme.fg_primary);
+        x += draw_preedit_px(state, x, ty, st, theme);
+        state.renderer.fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
+        state.cursor_px = Some((x, ty));
+        let note = "Enter to set   empty resets to path   Esc to cancel";
+        let nw = state.renderer.measure_px(note, st);
+        if x0 + w - pad - nw > x + pad {
             state
                 .renderer
-                .fill_cells(at, y, cols.min(avail), 1, theme.chrome_bg);
-            let n = state
-                .renderer
-                .put_str_clipped(at, y, &text, avail, theme.fg_primary);
-            state.renderer.underline_cells(at, y, n, theme.accent);
-            used += n;
-        }
-        let cursor_x = x0 + 1 + used;
-        state.cursor_cell = Some((cursor_x, y));
-        if cursor_x < layout.cols {
-            state
-                .renderer
-                .fill_cells_alpha(cursor_x, y, 1, 1, theme.cursor, 0.55);
-        }
-        let note = if find.invalid {
-            "正規表現が誤っている"
-        } else if !find.query.is_empty() && find.current.is_none() {
-            "見つからない"
-        } else {
-            "Enter 上へ  ⇧Enter 下へ  Tab 正規表現  Esc 閉じる"
-        };
-        let nx = layout.cols.saturating_sub(note.chars().map(char_cols).sum::<usize>() + 2);
-        if nx > cursor_x + 2 {
-            state.renderer.put_str_clipped(
-                nx,
-                y,
-                note,
-                layout.cols.saturating_sub(nx + 1),
-                theme.fg_tertiary,
-            );
+                .put_text_px(x0 + w - pad - nw, ty, note, st, theme.fg_tertiary);
         }
         return;
     }
+
+    if let Some(find) = &state.find {
+        let (query, regex_mode, invalid, has_match) = (
+            find.query.clone(),
+            find.regex_mode,
+            find.invalid,
+            find.current.is_some(),
+        );
+        state.renderer.fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
+        let label = if regex_mode { "find (regex): " } else { "find: " };
+        let mut x = x0 + pad;
+        x += state
+            .renderer
+            .put_text_px(x, ty, label, st, theme.fg_secondary);
+        let fg = if invalid { theme.warn } else { theme.fg_primary };
+        x += state.renderer.put_text_px(x, ty, &query, st, fg);
+        x += draw_preedit_px(state, x, ty, st, theme);
+        state.renderer.fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
+        state.cursor_px = Some((x, ty));
+        let note = if invalid {
+            "invalid regex"
+        } else if !query.is_empty() && !has_match {
+            "no match"
+        } else {
+            "Enter prev   ⇧Enter next   Tab regex   Esc close"
+        };
+        let nw = state.renderer.measure_px(note, st);
+        if x0 + w - pad - nw > x + pad {
+            state
+                .renderer
+                .put_text_px(x0 + w - pad - nw, ty, note, st, theme.fg_tertiary);
+        }
+        return;
+    }
+
     if let Some(picker) = &state.picker {
-        let n = picker.names.len();
-        let top = y.saturating_sub(n);
-        let x0 = layout.term_col;
-        let w = layout.term_cols;
-        state.renderer.fill_cells(x0, top, w, n + 1, theme.chrome_bg);
         let names = picker.names.clone();
         let sel = picker.selected;
+        let top = overlay(state, names.len());
         for (i, name) in names.iter().enumerate() {
-            let row = top + i;
+            let ry = top + i as f32 * line_h;
             if i == sel {
-                state.renderer.fill_cells(x0, row, w, 1, theme.surface);
+                state.renderer.fill_px(x0, ry, w, line_h, theme.surface, 0.0);
             }
             let fg = if i == sel {
                 theme.fg_primary
             } else {
                 theme.fg_secondary
             };
-            let label = format!("{}  {}", i + 1, name);
-            state
-                .renderer
-                .put_str_clipped(x0 + 2, row, &label, w.saturating_sub(3), fg);
+            state.renderer.put_text_px(
+                x0 + pad,
+                ry,
+                &format!("{}  {}", i + 1, name),
+                st,
+                fg,
+            );
         }
-        state.renderer.fill_cells(x0, y, w, 1, theme.surface);
-        state.renderer.put_str_clipped(
-            x0 + 1,
-            y,
-            "分岐先のプロファイル: j/k または数字で選び Enter、Esc で取り消し",
-            w.saturating_sub(2),
+        state.renderer.fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
+        state.renderer.put_text_px(
+            x0 + pad,
+            ty,
+            "fork profile: j/k or number, Enter to confirm, Esc to cancel",
+            st,
             theme.fg_primary,
         );
         return;
     }
+
     if let Some(search) = &state.search {
-        let n = search.results.len().min(SEARCH_ROWS);
-        let top = y.saturating_sub(n);
-        let x0 = layout.term_col;
-        let w = layout.term_cols;
-        state
-            .renderer
-            .fill_cells(x0, top, w, n + 1, theme.chrome_bg);
-        for (i, entry) in search.results.iter().take(n).enumerate() {
-            let row = top + i;
-            if i == search.selected {
-                state.renderer.fill_cells(x0, row, w, 1, theme.surface);
+        let results: Vec<crate::history::Entry> =
+            search.results.iter().take(SEARCH_ROWS).cloned().collect();
+        let sel = search.selected;
+        let scope = search.scope.label().to_string();
+        let query = search.query.clone();
+        let top = overlay(state, results.len());
+        for (i, entry) in results.iter().enumerate() {
+            let ry = top + i as f32 * line_h;
+            if i == sel {
+                state.renderer.fill_px(x0, ry, w, line_h, theme.surface, 0.0);
             }
-            let fg = if i == search.selected {
+            let fg = if i == sel {
                 theme.fg_primary
             } else {
                 theme.fg_secondary
             };
-            state
+            let text = state
                 .renderer
-                .put_str_clipped(x0 + 2, row, &entry.command, w.saturating_sub(3), fg);
+                .fit_tail(&entry.command, st, w - pad * 3.0);
+            state.renderer.put_text_px(x0 + pad * 2.0, ry, &text, st, fg);
         }
-        let prompt = format!("history[{}]: {}", search.scope.label(), search.query);
-        state.renderer.fill_cells(x0, y, w, 1, theme.surface);
-        state
-            .renderer
-            .put_str_clipped(x0 + 1, y, &prompt, w.saturating_sub(2), theme.fg_primary);
-        let cursor_x = x0 + 1 + prompt.chars().map(char_cols).sum::<usize>();
-        if cursor_x < layout.cols {
-            state
-                .renderer
-                .fill_cells_alpha(cursor_x, y, 1, 1, theme.cursor, 0.55);
-        }
+        state.renderer.fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
+        let mut x = x0 + pad;
+        x += state.renderer.put_text_px(
+            x,
+            ty,
+            &format!("history [{scope}]: "),
+            st,
+            theme.fg_secondary,
+        );
+        x += state.renderer.put_text_px(x, ty, &query, st, theme.fg_primary);
+        x += draw_preedit_px(state, x, ty, st, theme);
+        state.renderer.fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
+        state.cursor_px = Some((x, ty));
         return;
     }
 
     if let Some(msg) = &state.status {
         let msg = msg.clone();
+        state.renderer.fill_px(x0, bar_y, w, bar_h, theme.chrome_bg, 0.0);
+        let text = state.renderer.fit_tail(&msg, st, w - pad * 2.0);
         state
             .renderer
-            .fill_cells(layout.term_col, y, layout.term_cols, 1, theme.chrome_bg);
-        state.renderer.put_str_clipped(
-            layout.term_col + 1,
-            y,
-            &msg,
-            layout.term_cols.saturating_sub(2),
-            theme.warn,
-        );
+            .put_text_px(x0 + pad, ty, &text, st, theme.warn);
         return;
     }
 
-    // 通常時は操作のヒントだけを薄く出す。
-    let hint = "^O 新規  ^\\ fork  ^] 選んで  ^^ 次  ⌘F 検索  ⌘I 改名  ^R 履歴  ^B ペイン  ⌘K 消去  ⌘W 終了";
-    state.renderer.put_str_clipped(
-        layout.term_col + 1,
-        y,
-        hint,
-        layout.term_cols.saturating_sub(2),
-        theme.fg_tertiary,
-    );
+    // ふだんは操作のヒントだけを薄く出す。
+    let hint = "^O new   ^\\ fork   ^] fork as…   ^^ next   ⌘F find   ⌘I rename   ^R history   ^B pane   ⌘K clear   ⌘W close";
+    let text = state.renderer.fit_tail(hint, st, w - pad * 2.0);
+    state
+        .renderer
+        .put_text_px(x0 + pad, ty, &text, st, theme.fg_tertiary);
+}
+
+/// 変換中の文字列を帯の中に出す。返す値は描いた幅。
+fn draw_preedit_px(
+    state: &mut State,
+    x: f32,
+    y: f32,
+    st: TextStyle,
+    theme: &Theme,
+) -> f32 {
+    if state.preedit.is_empty() {
+        return 0.0;
+    }
+    let text = state.preedit.clone();
+    let w = state.renderer.measure_px(&text, st);
+    let h = state.renderer.line_height_px(st.size);
+    state.renderer.fill_px(x, y, w, h, theme.chrome_bg, 0.0);
+    state.renderer.put_text_px(x, y, &text, st, theme.fg_primary);
+    // 未確定であることを下線で示す。
+    let t = (state.renderer.scale()).max(1.0);
+    state.renderer.fill_px(x, y + h - t, w, t, theme.accent, 0.0);
+    w
 }
 
 /// 括弧付き貼り付けに対応している端末には印を付けて送る。

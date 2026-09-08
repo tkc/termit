@@ -51,12 +51,12 @@ pub fn action_for(key: &Key, physical: PhysicalKey, mods: ModifiersState) -> Opt
 
 /// この端末が奪う Ctrl の組み合わせ。
 pub const STOLEN_CTRL_KEYS: &[(&str, &str)] = &[
-    ("^O", "新規セッション"),
+    ("^O", "new session"),
     ("^\\", "fork"),
-    ("^]", "fork（プロファイルを選ぶ）"),
-    ("^^", "左ペインの選択を進める"),
-    ("^B", "左ペインの表示"),
-    ("^R", "履歴検索"),
+    ("^]", "fork with a chosen profile"),
+    ("^^", "select next session"),
+    ("^B", "toggle the left pane"),
+    ("^R", "search command history"),
 ];
 
 fn action_from_char(key: &Key, mods: ModifiersState) -> Option<Action> {

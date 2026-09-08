@@ -67,8 +67,8 @@ pub enum SpawnError {
 impl std::fmt::Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpawnError::OpenPty(e) => write!(f, "PTY を開けない: {e}"),
-            SpawnError::Spawn(prog, e) => write!(f, "{prog} を起動できない: {e}"),
+            SpawnError::OpenPty(e) => write!(f, "cannot open pty: {e}"),
+            SpawnError::Spawn(prog, e) => write!(f, "cannot spawn {prog}: {e}"),
         }
     }
 }
@@ -295,7 +295,7 @@ fn spawn_reader(
                 let n = match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
                         if diag {
-                            log::info!("[read {id}] 読み取り終了 reads={reads} bytes={read_bytes}");
+                            log::info!("[read {id}] eof reads={reads} bytes={read_bytes}");
                         }
                         break;
                     }
@@ -307,7 +307,7 @@ fn spawn_reader(
                     if last.elapsed().as_millis() >= 1000 {
                         last = std::time::Instant::now();
                         log::info!(
-                            "[read {id}] 1 秒: 読み {reads} 回 {read_bytes} B, wakeup 送信 {sent}, 抑制 {skipped}"
+                            "[read {id}] 1s: reads={reads} bytes={read_bytes} wakeup_sent={sent} coalesced={skipped}"
                         );
                         reads = 0;
                         read_bytes = 0;
@@ -347,7 +347,7 @@ fn spawn_reader(
                         .is_err()
                     {
                         if diag {
-                            log::info!("[read {id}] wakeup の送信に失敗。読み取りを終える");
+                            log::info!("[read {id}] wakeup send failed; stopping reader");
                         }
                         return;
                     }

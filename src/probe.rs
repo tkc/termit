@@ -112,6 +112,7 @@ pub fn run(out_path: &str) {
         search: None,
         picker: None,
         rename: None,
+        sidebar_width: config.window.sidebar_width,
         find: None,
         find_cells: Default::default(),
         find_current: Default::default(),
@@ -125,7 +126,7 @@ pub fn run(out_path: &str) {
         shown_title: String::new(),
         preedit: String::new(),
         ime_area: None,
-        cursor_cell: None,
+        cursor_px: None,
         window: None,
     };
     let id = state.manager.selected().map(|s| s.id).unwrap_or(0);
