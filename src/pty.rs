@@ -28,6 +28,22 @@ pub struct PtyHandle {
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     writer_tx: Sender<Vec<u8>>,
+    /// 直接起動した子の pid。前面のプロセス群が分からないときに使う。
+    child_pid: Option<u32>,
+}
+
+impl PtyHandle {
+    /// いま前面にいるプロセスの pid。
+    ///
+    /// シェルが別のプログラムを起動していれば、そちらの pid になる。
+    /// 作業ディレクトリを尋ねる相手として、これが最も実態に近い。
+    pub fn foreground_pid(&self) -> Option<i32> {
+        #[cfg(unix)]
+        if let Some(pid) = self.master.process_group_leader() {
+            return Some(pid);
+        }
+        self.child_pid.map(|p| p as i32)
+    }
 }
 
 impl PtyHandle {
@@ -147,6 +163,7 @@ pub fn spawn(
     );
 
     let mut killer = child.clone_killer();
+    let child_pid = child.process_id();
     spawn_waiter(id, child, ui_tx);
     let _ = &mut killer;
 
@@ -155,6 +172,7 @@ pub fn spawn(
             master: pair.master,
             killer,
             writer_tx,
+            child_pid,
         },
         term,
         window_size,

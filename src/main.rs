@@ -3,6 +3,7 @@
 mod bench;
 mod clipboard;
 mod config;
+mod cwd;
 mod git;
 mod history;
 mod input;
@@ -1402,7 +1403,10 @@ impl App {
         self.refresh_recent();
         let Some(state) = &mut self.state else { return };
         state.manager.drain_pending_clears();
-        state.manager.refresh_branches();
+        if state.manager.refresh_metadata() {
+            // cd で動いたら、覚えている並びも書き直す。
+            state.mark_state_dirty();
+        }
         state.save_state(false);
         collect_find_cells(state);
         // 選んでいるセッションが名乗った題名を、ウィンドウに出す。

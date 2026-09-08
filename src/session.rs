@@ -47,6 +47,8 @@ pub struct Session {
     pub branch: Option<String>,
     /// ブランチ名を最後に読んだ時刻と、そのときの作業ディレクトリ。
     branch_read: Option<(std::time::Instant, PathBuf)>,
+    /// 作業ディレクトリを最後に OS へ尋ねた時刻。
+    cwd_polled: Option<std::time::Instant>,
     /// 端末上のプログラムが OSC 0 や OSC 2 で名乗った題名。
     ///
     /// 左ペインの名前はセッションの識別なので置き換えない。
@@ -140,13 +142,34 @@ impl Manager {
         &mut self.sessions
     }
 
-    /// 左ペインに出すブランチ名を読み直す。
+    /// 左ペインに出す作業ディレクトリとブランチ名を読み直す。
     ///
-    /// 作業ディレクトリが変わったときと、しばらく経ったときだけ読む。
-    /// 描くたびにファイルを開くほどの情報ではない。
-    pub fn refresh_branches(&mut self) {
+    /// 作業ディレクトリは OS に尋ねる。OSC 7 だけに頼ると、シェル統合を
+    /// 入れていない利用者では起動時の位置から動かない。
+    /// どちらかが先に変化を捉えれば、そこで更新される。
+    ///
+    /// 作業ディレクトリが変わったら `true` を返す。覚えている並びの
+    /// 書き直しに使う。
+    pub fn refresh_metadata(&mut self) -> bool {
         let now = std::time::Instant::now();
+        let mut moved = false;
         for s in &mut self.sessions {
+            // 走っているセッションだけ尋ねる。終わったものは動かない。
+            let due = match s.cwd_polled {
+                None => true,
+                Some(at) => now.duration_since(at).as_millis() >= 400,
+            };
+            if s.is_running() && due {
+                s.cwd_polled = Some(now);
+                if let Some(pid) = s.pty.foreground_pid() {
+                    if let Some(dir) = crate::cwd::of_pid(pid) {
+                        if dir != s.cwd {
+                            s.cwd = dir;
+                            moved = true;
+                        }
+                    }
+                }
+            }
             let stale = match &s.branch_read {
                 None => true,
                 Some((at, dir)) => dir != &s.cwd || now.duration_since(*at).as_secs() >= 2,
@@ -156,6 +179,7 @@ impl Manager {
                 s.branch_read = Some((now, s.cwd.clone()));
             }
         }
+        moved
     }
 
     /// 画面消去を頼まれたセッションの履歴を、期限まで捨て続ける。
@@ -387,6 +411,7 @@ impl Manager {
             name: None,
             branch: None,
             branch_read: None,
+            cwd_polled: None,
             window_title: None,
             clear_scrollback_until: None,
         });
@@ -737,5 +762,125 @@ mod tests {
         c.shell.program = Some("/bin/zsh".into());
         c.shell.args = vec!["-i".into()];
         assert_eq!(shell_argv(&c), vec!["/bin/zsh", "-i"]);
+    }
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+    use crate::config::Config;
+    use std::time::{Duration, Instant};
+
+    fn manager() -> Manager {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Manager::new(
+            TermSize::new(60, 12),
+            (8, 16),
+            crate::term::UiSender::Channel(tx),
+        )
+    }
+
+    /// シェル統合を入れていなくても、cd に追従することを確かめる。
+    ///
+    /// OSC 7 は出さないシェルを使う。作業ディレクトリは OS へ尋ねて得る。
+    #[test]
+    fn シェル統合が無くても_cd_に追従する() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let mut config = Config::default();
+        config.shell.program = Some("/bin/sh".into());
+        config.shell.args = vec!["-i".into()];
+        let start = std::env::current_dir().unwrap();
+        let mut m = manager();
+        m.spawn_new(&config, "host", &start).expect("起動できる");
+        assert_eq!(m.sessions()[0].cwd, start);
+
+        // OSC 7 を出さないまま cd する。
+        m.sessions()[0].pty.write(b"cd /usr/lib\n".to_vec());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut moved = false;
+        while Instant::now() < deadline && !moved {
+            std::thread::sleep(Duration::from_millis(100));
+            // 実際の描画と同じく、間隔を空けて尋ね直す。
+            m.sessions_mut()[0].cwd_polled = None;
+            moved = m.refresh_metadata();
+        }
+        assert!(moved, "cd を捉えられる");
+        assert_eq!(m.sessions()[0].cwd, std::path::PathBuf::from("/usr/lib"));
+
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// 移動したあとの位置が、覚える並びにも入ることを確かめる。
+    #[test]
+    fn 移動したあとの位置を覚える() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let mut config = Config::default();
+        config.shell.program = Some("/bin/sh".into());
+        config.shell.args = vec!["-i".into()];
+        let start = std::env::current_dir().unwrap();
+        let mut m = manager();
+        m.spawn_new(&config, "host", &start).expect("起動できる");
+        m.sessions()[0].pty.write(b"cd /usr/share\n".to_vec());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            m.sessions_mut()[0].cwd_polled = None;
+            if m.refresh_metadata() {
+                break;
+            }
+        }
+        let saved = m.snapshot();
+        assert_eq!(saved.sessions[0].cwd, "/usr/share", "移動先が覚えられる");
+
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// git の下へ移ると、ブランチ名も付いてくることを確かめる。
+    #[test]
+    fn 移動先が_git_ならブランチ名も出る() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let repo = std::env::current_dir().unwrap();
+        if crate::git::branch_for(&repo).is_none() {
+            return;
+        }
+        let mut config = Config::default();
+        config.shell.program = Some("/bin/sh".into());
+        config.shell.args = vec!["-i".into()];
+        let mut m = manager();
+        // git の外から始める。
+        m.spawn_new(&config, "host", std::path::Path::new("/usr/lib"))
+            .expect("起動できる");
+        m.refresh_metadata();
+        assert!(m.sessions()[0].branch.is_none(), "はじめは枝が無い");
+
+        m.sessions()[0]
+            .pty
+            .write(format!("cd {}\n", repo.display()).into_bytes());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && m.sessions()[0].branch.is_none() {
+            std::thread::sleep(Duration::from_millis(100));
+            m.sessions_mut()[0].cwd_polled = None;
+            m.refresh_metadata();
+        }
+        assert!(
+            m.sessions()[0].branch.is_some(),
+            "移動先が git なら枝が出る"
+        );
+
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
     }
 }

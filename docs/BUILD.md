@@ -119,6 +119,7 @@ cargo clippy --all-targets -- -D warnings
 | `src/history.rs` | the SQLite command history |
 | `src/config.rs` | config parsing, command templates, docker argv |
 | `src/git.rs` | reading the branch from `.git/HEAD` |
+| `src/cwd.rs` | asking the OS for a child's working directory |
 | `src/theme.rs` | colors |
 | `src/probe.rs`, `src/bench.rs`, `src/latency.rs`, `src/keytest.rs` | the diagnostics above |
 

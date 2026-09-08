@@ -2379,6 +2379,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "glyphon",
+ "libc",
  "log",
  "pollster",
  "portable-pty",

@@ -191,7 +191,7 @@ pub fn run(out_path: &str) {
         _ => {}
     }
 
-    state.manager.refresh_branches();
+    state.manager.refresh_metadata();
     {
         let sessions = state.manager.sessions_mut();
         if let Some(s) = sessions.get_mut(0) {
