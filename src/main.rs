@@ -23,6 +23,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::index::{Column, Point, Side};
 use alacritty_terminal::term::{viewport_to_point, TermMode};
+use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -612,6 +613,26 @@ impl App {
                     s.pty.write(bracketed(&text, mode));
                 }
             }
+            Action::ClearScreen => {
+                // 画面の消去とプロンプトの出し直しはシェルに任せる。端末が
+                // 画面を消すだけでは、プロンプトが消えたまま戻らない。
+                // \x0c は Ctrl+L で、シェルも全画面のプログラムも
+                // 「描き直せ」と解釈する。
+                //
+                // ただしシェルは画面を消すのではなく上へ押し出すため、
+                // 押し出されたぶんが履歴に積まれる。少しのあいだ捨て続ける。
+                let i = state.manager.selected_index();
+                if let Some(s) = state.manager.sessions_mut().get_mut(i) {
+                    {
+                        let mut term = s.term.lock();
+                        term.clear_screen(ClearMode::Saved);
+                        term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+                    }
+                    s.pty.write(vec![0x0c]);
+                    s.clear_scrollback_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+                }
+            }
             Action::FontBigger => {
                 let size = state.renderer.font_size() + 1.0;
                 state.renderer.set_font_size(size);
@@ -933,6 +954,7 @@ impl App {
 
         self.refresh_recent();
         let Some(state) = &mut self.state else { return };
+        state.manager.drain_pending_clears();
         let theme = state.theme;
         state.renderer.begin();
 
@@ -1337,7 +1359,7 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
     }
 
     // 通常時は操作のヒントだけを薄く出す。
-    let hint = "^O 新規  ^\\ fork  ^] 選んで fork  ^^ 次のセッション  ^R 履歴  ^B ペイン  ⌘W 終了  ⌘C コピー";
+    let hint = "^O 新規  ^\\ fork  ^] 選んで fork  ^^ 次  ^R 履歴  ^B ペイン  ⌘K 消去  ⌘W 終了  ⌘C コピー";
     state.renderer.put_str_clipped(
         layout.term_col + 1,
         y,

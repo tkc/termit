@@ -41,6 +41,12 @@ pub struct Session {
     pub size: TermSize,
     pub window_size: Arc<FairMutex<WindowSize>>,
     pub dirty: Arc<AtomicBool>,
+    /// この時刻まで、描くたびにスクロールバックを捨てる。
+    ///
+    /// 画面消去でシェルへ Ctrl+L を送ると、シェルは画面を消すのではなく
+    /// 上へ押し出す。押し出されたぶんが履歴に積まれるので、
+    /// 押し出しが終わるまでのあいだ捨て続ける。
+    pub clear_scrollback_until: Option<std::time::Instant>,
 }
 
 impl Session {
@@ -106,6 +112,25 @@ impl Manager {
     }
     pub fn sessions(&self) -> &[Session] {
         &self.sessions
+    }
+    pub fn sessions_mut(&mut self) -> &mut [Session] {
+        &mut self.sessions
+    }
+
+    /// 画面消去を頼まれたセッションの履歴を、期限まで捨て続ける。
+    pub fn drain_pending_clears(&mut self) {
+        use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
+        let now = std::time::Instant::now();
+        for s in &mut self.sessions {
+            let Some(until) = s.clear_scrollback_until else {
+                continue;
+            };
+            if now >= until {
+                s.clear_scrollback_until = None;
+                continue;
+            }
+            s.term.lock().clear_screen(ClearMode::Saved);
+        }
     }
     pub fn get_mut(&mut self, id: SessionId) -> Option<&mut Session> {
         self.sessions.iter_mut().find(|s| s.id == id)
@@ -318,6 +343,7 @@ impl Manager {
             size: self.size,
             window_size: spawned.window_size,
             dirty: spawned.dirty,
+            clear_scrollback_until: None,
         });
         self.selected = self.sessions.len() - 1;
         Ok(id)

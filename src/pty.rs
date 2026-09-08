@@ -580,3 +580,113 @@ mod tracker_tests {
         assert_eq!(rec.exit_code, Some(2));
     }
 }
+
+#[cfg(test)]
+mod clear_tests {
+    use super::*;
+    use crate::term::TermSize;
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
+
+    fn grid_text(term: &alacritty_terminal::Term<EventProxy>) -> String {
+        let grid = term.grid();
+        let mut out = String::new();
+        for l in 0..grid.screen_lines() {
+            for c in 0..grid.columns() {
+                out.push(grid[Line(l as i32)][Column(c)].c);
+            }
+        }
+        out
+    }
+
+    fn wait_for(
+        spawned: &crate::pty::Spawned,
+        needle: &str,
+        present: bool,
+        secs: u64,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            {
+                let term = spawned.term.lock();
+                if grid_text(&term).contains(needle) == present {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// 画面消去が、スクロールバックと表示中の内容の両方を片付けることを確かめる。
+    #[test]
+    fn 画面消去で内容とスクロールバックが消える() {
+        if !Path::new("/bin/zsh").exists() {
+            eprintln!("zsh がないため飛ばす");
+            return;
+        }
+        let (tx, _rx) = channel();
+        let spawned = spawn(
+            21,
+            &["/bin/zsh".to_string(), "-f".to_string(), "-i".to_string()],
+            Path::new("/tmp"),
+            TermSize::new(80, 10),
+            (8, 16),
+            500,
+            crate::term::UiSender::Channel(tx),
+        )
+        .expect("zsh を起動できる");
+        std::thread::sleep(Duration::from_millis(400));
+
+        // 画面の高さを超える量を出し、スクロールバックにも積む。
+        spawned
+            .handle
+            .write(b"for i in $(seq 1 40); do echo MARKER-$i; done\n".to_vec());
+        assert!(
+            wait_for(&spawned, "MARKER-40", true, 10),
+            "出力が画面に現れる"
+        );
+
+        // 端末側でスクロールバックを捨て、シェルへ Ctrl+L を送る。
+        {
+            let mut term = spawned.term.lock();
+            term.clear_screen(ClearMode::Saved);
+            assert_eq!(term.grid().history_size(), 0, "スクロールバックが空になる");
+        }
+        spawned.handle.write(vec![0x0c]);
+
+        // 本体と同じく、押し出しが終わるまで履歴を捨て続ける。
+        let until = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < until {
+            spawned.term.lock().clear_screen(ClearMode::Saved);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            wait_for(&spawned, "MARKER-", false, 10),
+            "画面から古い内容が消える"
+        );
+        {
+            let term = spawned.term.lock();
+            let grid = term.grid();
+            let hist = grid.history_size();
+            let mut back = String::new();
+            for l in 1..=hist {
+                for c in 0..grid.columns() {
+                    back.push(grid[Line(-(l as i32))][Column(c)].c);
+                }
+            }
+            assert!(
+                !back.contains("MARKER-"),
+                "スクロールバックに古い出力が残っている: {}",
+                back.trim()
+            );
+        }
+
+        let mut handle = spawned.handle;
+        handle.kill();
+    }
+}

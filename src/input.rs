@@ -20,6 +20,8 @@ pub enum Action {
     ToggleSidebar,
     Copy,
     Paste,
+    /// 画面とスクロールバックを消し、プロンプトを出し直す。
+    ClearScreen,
     FontBigger,
     FontSmaller,
     ScrollUp,
@@ -86,6 +88,7 @@ fn action_from_char(key: &Key, mods: ModifiersState) -> Option<Action> {
             "b" => Some(Action::ToggleSidebar),
             "c" => Some(Action::Copy),
             "v" => Some(Action::Paste),
+            "k" => Some(Action::ClearScreen),
             "[" => Some(Action::SelectPrev),
             "]" => Some(Action::SelectNext),
             "=" | "+" => Some(Action::FontBigger),
@@ -124,6 +127,7 @@ fn action_from_physical(physical: PhysicalKey, mods: ModifiersState) -> Option<A
             KeyCode::KeyB => Some(Action::ToggleSidebar),
             KeyCode::KeyC => Some(Action::Copy),
             KeyCode::KeyV => Some(Action::Paste),
+            KeyCode::KeyK => Some(Action::ClearScreen),
             KeyCode::BracketLeft => Some(Action::SelectPrev),
             KeyCode::BracketRight => Some(Action::SelectNext),
             KeyCode::Equal => Some(Action::FontBigger),
@@ -358,6 +362,7 @@ mod tests {
         let cmd = ModifiersState::SUPER;
         assert_eq!(action_for(&ch("n"), phys, cmd), Some(Action::NewSession));
         assert_eq!(action_for(&ch("c"), phys, cmd), Some(Action::Copy));
+        assert_eq!(action_for(&ch("k"), phys, cmd), Some(Action::ClearScreen));
         assert_eq!(action_for(&ch("["), phys, cmd), Some(Action::SelectPrev));
     }
 
@@ -408,6 +413,17 @@ mod tests {
                 "{c} は Shift の有無で結果が変わらない"
             );
         }
+    }
+
+    #[test]
+    fn 画面消去は_cmd_側だけに置く() {
+        // Ctrl+K はシェルが「行末まで削除」に使う。奪わない。
+        let phys = PhysicalKey::Code(KeyCode::F35);
+        assert_eq!(action_for(&ch("k"), phys, ModifiersState::CONTROL), None);
+        assert_eq!(
+            action_for(&ch("k"), phys, ModifiersState::SUPER),
+            Some(Action::ClearScreen)
+        );
     }
 
     #[test]

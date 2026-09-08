@@ -161,7 +161,7 @@ impl App {
             y += 1;
         }
         y += 1;
-        renderer.put_str(1, y, "Cmd 側: ⌘N 新規 ⌘D fork ⌘E 選んで fork ⌘W 終了 ⌘[ ⌘] 選択 ⌘C ⌘V", theme.fg_secondary);
+        renderer.put_str(1, y, "Cmd 側: ⌘N 新規 ⌘D fork ⌘E 選んで fork ⌘K 画面消去 ⌘W 終了 ⌘[ ⌘] 選択 ⌘C ⌘V", theme.fg_secondary);
         y += 2;
 
         if self.rows.is_empty() {
