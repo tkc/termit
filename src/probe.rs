@@ -120,6 +120,9 @@ pub fn run(out_path: &str) {
         pending_since: None,
         needs_redraw: false,
         shown_title: String::new(),
+        preedit: String::new(),
+        ime_area: None,
+        cursor_cell: None,
         window: None,
     };
     let id = state.manager.selected().map(|s| s.id).unwrap_or(0);
@@ -156,6 +159,7 @@ pub fn run(out_path: &str) {
                 let _ = f.step(&term, alacritty_terminal::index::Direction::Left);
             }
             state.find = Some(f);
+            state.preedit = "けんさく".into();
             crate::collect_find_cells(&mut state);
         }
         Ok("search") => {

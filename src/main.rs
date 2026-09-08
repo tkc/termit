@@ -184,6 +184,12 @@ pub(crate) struct State {
     needs_redraw: bool,
     /// いまウィンドウに出している題名。変わったときだけ設定し直す。
     shown_title: String,
+    /// 変換中の文字列。確定するまでは入力にも検索にも渡さない。
+    preedit: String,
+    /// いま知らせてある候補窓の位置。変わったときだけ設定し直す。
+    ime_area: Option<(i32, i32)>,
+    /// 変換中の文字列を出す位置。候補窓もここへ寄せる。
+    cursor_cell: Option<(usize, usize)>,
     window: Option<Arc<Window>>,
 }
 
@@ -347,6 +353,9 @@ impl ApplicationHandler<UiEvent> for App {
             pending_since: None,
             needs_redraw: false,
             shown_title: String::new(),
+            preedit: String::new(),
+            ime_area: None,
+            cursor_cell: None,
             window: Some(window.clone()),
         };
         if state.history.is_none() {
@@ -494,12 +503,31 @@ impl ApplicationHandler<UiEvent> for App {
                     s.request_redraw();
                 }
             }
+            WindowEvent::Ime(Ime::Preedit(text, _)) => {
+                state.preedit = text;
+                state.request_redraw();
+            }
+            WindowEvent::Ime(Ime::Disabled) => {
+                state.preedit.clear();
+                state.request_redraw();
+            }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                if state.search.is_some() {
+                state.preedit.clear();
+                // 確定した文字列は、開いている入り口へ渡す。
+                // 変換で入れた語も、検索や履歴の絞り込みに使える必要がある。
+                if state.find.is_some() {
+                    if let Some(f) = &mut state.find {
+                        f.query.push_str(&text);
+                        f.rebuild();
+                    }
+                    self.find_step(Direction::Left);
+                } else if state.search.is_some() {
                     if let Some(s) = &mut state.search {
                         s.query.push_str(&text);
                     }
                     self.refresh_search();
+                } else if state.picker.is_some() {
+                    // 一覧は数字と j/k で選ぶ。文字は受けない。
                 } else if let Some(s) = state.manager.selected() {
                     s.pty.write(text.into_bytes());
                 }
@@ -594,7 +622,13 @@ impl App {
             return;
         };
         let mode = *session.term.lock().mode();
-        if let Some(bytes) = input::encode(&key, &base, event.text.as_deref(), mods, mode) {
+        // 変換中の文字は確定するまで渡さない。Ime::Commit で受ける。
+        let text = if state.preedit.is_empty() {
+            event.text.as_deref()
+        } else {
+            None
+        };
+        if let Some(bytes) = input::encode(&key, &base, text, mods, mode) {
             // 入力があったら最下部へ戻す。
             session
                 .term
@@ -1103,12 +1137,24 @@ impl App {
                 if text.chars().any(|c| c.is_control()) {
                     return;
                 }
+                // 変換中は、確定した文字列だけを Ime::Commit から受ける。
+                // ここでも入れると同じ文字が二度入る。
+                if !state.preedit.is_empty() {
+                    return;
+                }
                 find.query.push_str(text);
                 find.rebuild();
                 step = Some(Direction::Left);
             }
         }
         let Some(direction) = step else { return };
+        self.find_step(direction);
+    }
+
+    /// 検索を一歩進め、見つかった位置まで画面を送る。
+    fn find_step(&mut self, direction: Direction) {
+        let Some(state) = &mut self.state else { return };
+        let Some(find) = &mut state.find else { return };
         let Some(session) = state.manager.selected() else {
             return;
         };
@@ -1173,6 +1219,9 @@ impl App {
                     return;
                 };
                 if text.chars().any(|c| c.is_control()) {
+                    return;
+                }
+                if !state.preedit.is_empty() {
                     return;
                 }
                 search.query.push_str(text);
@@ -1246,6 +1295,24 @@ impl App {
         draw_terminal(state, &layout, &theme);
         draw_bottom(state, &layout, &theme);
 
+        // 候補窓を、いま文字が入る位置へ寄せる。
+        if let (Some((cx, cy)), Some(window)) = (state.cursor_cell, state.window.clone()) {
+            let cell = state.renderer.cell();
+            let pos = (
+                (cx as f32 * cell.width) as i32,
+                (cy as f32 * cell.height) as i32,
+            );
+            if state.ime_area != Some(pos) {
+                state.ime_area = Some(pos);
+                window.set_ime_cursor_area(
+                    winit::dpi::PhysicalPosition::new(pos.0, pos.1),
+                    winit::dpi::PhysicalSize::new(
+                        cell.width.ceil() as u32,
+                        cell.height.ceil() as u32,
+                    ),
+                );
+            }
+        }
         let drew = state.renderer.render(theme.bg);
         if drew {
             state.needs_redraw = false;
@@ -1549,6 +1616,7 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         if row >= 0 && (row as usize) < layout.term_rows {
             let x = layout.term_col + cursor_point.column.0.min(layout.term_cols - 1);
             let y = row as usize;
+            state.cursor_cell = Some((x, y));
             match cursor_shape {
                 CursorShape::Beam => state.renderer.cursor_beam(x, y, theme.cursor),
                 CursorShape::Underline => {
@@ -1557,6 +1625,16 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
                 _ => state
                     .renderer
                     .fill_cells_alpha(x, y, cursor_cols, 1, theme.cursor, 0.55),
+            }
+            // 変換中の文字列は、確定するまで子プロセスへ渡さない。
+            // 見えないと何を打っているか分からないので、カーソルの位置に出す。
+            if state.find.is_none() && state.search.is_none() && !state.preedit.is_empty() {
+                let text = state.preedit.clone();
+                let width = layout.term_cols.saturating_sub(x - layout.term_col);
+                let used = state
+                    .renderer
+                    .put_str_clipped(x, y, &text, width, theme.fg_primary);
+                state.renderer.underline_cells(x, y, used, theme.accent);
             }
         }
     }
@@ -1575,10 +1653,25 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
         } else {
             theme.fg_primary
         };
-        let used = state
+        let mut used = state
             .renderer
             .put_str_clipped(x0 + 1, y, &prompt, w.saturating_sub(2), fg);
+        // 変換中の文字列は確定前なので、検索には使わずここに出すだけ。
+        if !state.preedit.is_empty() {
+            let text = state.preedit.clone();
+            let at = x0 + 1 + used;
+            let n = state.renderer.put_str_clipped(
+                at,
+                y,
+                &text,
+                w.saturating_sub(used + 2),
+                theme.fg_primary,
+            );
+            state.renderer.underline_cells(at, y, n, theme.accent);
+            used += n;
+        }
         let cursor_x = x0 + 1 + used;
+        state.cursor_cell = Some((cursor_x, y));
         if cursor_x < layout.cols {
             state
                 .renderer
