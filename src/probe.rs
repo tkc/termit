@@ -56,7 +56,9 @@ pub fn run(out_path: &str) {
     config.shell.program = Some("/bin/sh".into());
     config.shell.args = vec!["-c".into(), SCRIPT.into()];
 
-    let sidebar_cols = config.window.sidebar_cols.min(cols.saturating_sub(20));
+    // 本体と同じ割り付けを使う。左ペインの幅は画素で決まる。
+    let sidebar_px = (config.window.sidebar_width * 1.0).min((cols as f32 - 20.0) * cell.width);
+    let sidebar_cols = (sidebar_px / cell.width).ceil() as usize;
     let term_col = sidebar_cols + 1;
     let term_cols = cols.saturating_sub(term_col).max(2);
     let term_rows = rows.saturating_sub(1).max(1);
@@ -137,6 +139,7 @@ pub fn run(out_path: &str) {
     let layout = crate::Layout {
         cols,
         rows,
+        sidebar_px,
         sidebar_cols,
         term_col,
         term_cols,

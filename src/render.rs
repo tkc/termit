@@ -33,6 +33,58 @@ struct CellDraw {
     color: GColor,
 }
 
+/// 画素の位置に置く文字列の体裁。
+#[derive(Clone, Copy, Debug)]
+pub struct TextStyle {
+    /// 倍率を掛ける前の大きさ（pt）。
+    pub size: f32,
+    pub bold: bool,
+    /// 等幅ではなく、字ごとに幅の違う書体で組むか。
+    ///
+    /// 左ペインは桁に縛られないので、こちらのほうが同じ幅に多く入る。
+    /// Warp も一覧には等幅でない書体を使っている。
+    pub sans: bool,
+}
+
+impl TextStyle {
+    pub fn sans(size: f32) -> Self {
+        Self {
+            size,
+            bold: false,
+            sans: true,
+        }
+    }
+    #[allow(dead_code)]
+    pub fn mono(size: f32) -> Self {
+        Self {
+            size,
+            bold: false,
+            sans: false,
+        }
+    }
+    pub fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+}
+
+/// 画素の位置に置く文字列。左ペインのように、桁に縛られない配置で使う。
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct StringKey {
+    text: String,
+    /// 文字サイズ（画素）を整数化したもの。浮動小数のままでは鍵にできない。
+    size_bits: u32,
+    bold: bool,
+    sans: bool,
+}
+
+struct TextDraw {
+    x: f32,
+    y: f32,
+    key: StringKey,
+    color: GColor,
+}
+
 /// 1 セルの寸法（物理ピクセル）。
 #[derive(Clone, Copy, Debug)]
 pub struct CellMetrics {
@@ -71,7 +123,10 @@ pub struct Renderer {
     font_size: f32,
 
     cell_draws: Vec<CellDraw>,
+    text_draws: Vec<TextDraw>,
     rect_draws: Vec<Rect>,
+    /// 画素指定で置く文字列の整形結果。
+    strings: HashMap<StringKey, Buffer>,
 
     /// フレームの内訳を測る。`TEX_FRAME_LOG` を指定したときだけ動く。
     timing: Option<FrameTiming>,
@@ -229,7 +284,9 @@ impl Renderer {
             scale,
             font_size,
             cell_draws: Vec::new(),
+            text_draws: Vec::new(),
             rect_draws: Vec::new(),
+            strings: HashMap::new(),
             timing: std::env::var("TEX_FRAME_LOG").is_ok().then(FrameTiming::default),
             bench_target: None,
         };
@@ -288,7 +345,9 @@ impl Renderer {
             scale: 1.0,
             font_size,
             cell_draws: Vec::new(),
+            text_draws: Vec::new(),
             rect_draws: Vec::new(),
+            strings: HashMap::new(),
             timing: std::env::var("TEX_FRAME_LOG").is_ok().then(FrameTiming::default),
             bench_target: None,
         };
@@ -364,7 +423,138 @@ impl Renderer {
 
     pub fn begin(&mut self) {
         self.cell_draws.clear();
+        self.text_draws.clear();
         self.rect_draws.clear();
+        // 出てこなくなった文字列を溜め込まないよう、時々捨てる。
+        if self.strings.len() > 512 {
+            self.strings.clear();
+        }
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    // ---------------------------------------------- 画素の位置で置く
+
+    /// 画素の位置に矩形を置く。`radius` は角を丸める半径。
+    pub fn fill_px(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgb, radius: f32) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        self.rect_draws
+            .push(Rect::new([x, y], [w, h], rgba(color, 1.0)).rounded(radius));
+    }
+
+    /// 画素の位置に文字列を置く。返す値は描いた幅。
+    ///
+    /// `size_pt` は倍率を掛ける前の大きさ。表示の倍率はここで掛ける。
+    pub fn put_text_px(&mut self, x: f32, y: f32, text: &str, style: TextStyle, color: Rgb) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let key = self.string_key(text, style);
+        let width = self.ensure_string(&key);
+        self.text_draws.push(TextDraw {
+            x,
+            y,
+            key,
+            color: GColor::rgba(color.r, color.g, color.b, 0xff),
+        });
+        width
+    }
+
+    /// 描かずに幅だけを測る。右寄せの位置決めに使う。
+    pub fn measure_px(&mut self, text: &str, style: TextStyle) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let key = self.string_key(text, style);
+        self.ensure_string(&key)
+    }
+
+    /// 幅に収まるよう末尾を落とし、省略記号を付ける。
+    ///
+    /// 文字数の見当ではなく、実際に整形した幅で判断する。
+    /// 等幅でない字が混ざると、見当では大きく外れる。
+    pub fn fit_tail(&mut self, text: &str, style: TextStyle, max_px: f32) -> String {
+        self.fit(text, style, max_px, true)
+    }
+
+    /// 幅に収まるよう先頭を落とし、省略記号を付ける。パスに使う。
+    pub fn fit_head(&mut self, text: &str, style: TextStyle, max_px: f32) -> String {
+        self.fit(text, style, max_px, false)
+    }
+
+    fn fit(&mut self, text: &str, style: TextStyle, max_px: f32, drop_tail: bool) -> String {
+        if max_px <= 0.0 || text.is_empty() {
+            return String::new();
+        }
+        let full = self.measure_px(text, style);
+        if full <= max_px {
+            return text.to_string();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        // 比から当たりを付け、そこから微調整する。1 文字ずつ試すと
+        // そのたびに整形が要る。
+        let mut keep = ((chars.len() as f32) * (max_px / full)).floor() as usize;
+        keep = keep.min(chars.len().saturating_sub(1));
+        loop {
+            let candidate = build(&chars, keep, drop_tail);
+            if self.measure_px(&candidate, style) <= max_px || keep == 0 {
+                // もう 1 文字入るなら入れる。
+                let more = build(&chars, keep + 1, drop_tail);
+                if keep + 1 < chars.len()
+                    && self.measure_px(&more, style) <= max_px
+                {
+                    keep += 1;
+                    continue;
+                }
+                return candidate;
+            }
+            keep -= 1;
+        }
+    }
+
+    /// その大きさの 1 行の高さ。
+    pub fn line_height_px(&self, size_pt: f32) -> f32 {
+        (size_pt * self.scale * 1.30).round()
+    }
+
+    fn string_key(&self, text: &str, style: TextStyle) -> StringKey {
+        StringKey {
+            text: text.to_string(),
+            size_bits: (style.size * self.scale * 100.0).round() as u32,
+            bold: style.bold,
+            sans: style.sans,
+        }
+    }
+
+    /// 未整形なら整形して覚え、幅を返す。
+    fn ensure_string(&mut self, key: &StringKey) -> f32 {
+        if let Some(b) = self.strings.get(key) {
+            return b.layout_runs().next().map(|r| r.line_w).unwrap_or(0.0);
+        }
+        let px = key.size_bits as f32 / 100.0;
+        let metrics = Metrics::new(px, (px * 1.30).round().max(px + 1.0));
+        let mut attrs = if key.sans {
+            Attrs::new().family(Family::SansSerif)
+        } else {
+            match &self.family {
+                Some(name) => Attrs::new().family(Family::Name(name)),
+                None => Attrs::new().family(Family::Monospace),
+            }
+        };
+        if key.bold {
+            attrs = attrs.weight(Weight::BOLD);
+        }
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        buffer.set_size(None, None);
+        buffer.set_text(&key.text, &attrs, Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        let width = buffer.layout_runs().next().map(|r| r.line_w).unwrap_or(0.0);
+        self.strings.insert(key.clone(), buffer);
+        width
     }
 
     /// セル座標に矩形を置く。
@@ -372,14 +562,14 @@ impl Renderer {
         if cols == 0 || rows == 0 {
             return;
         }
-        self.rect_draws.push(Rect {
-            pos: [col as f32 * self.cell.width, row as f32 * self.cell.height],
-            size: [
+        self.rect_draws.push(Rect::new(
+            [col as f32 * self.cell.width, row as f32 * self.cell.height],
+            [
                 cols as f32 * self.cell.width,
                 rows as f32 * self.cell.height,
             ],
-            color: rgba(color, 1.0),
-        });
+            rgba(color, 1.0),
+        ));
     }
 
     pub fn fill_cells_alpha(
@@ -391,37 +581,37 @@ impl Renderer {
         color: Rgb,
         alpha: f32,
     ) {
-        self.rect_draws.push(Rect {
-            pos: [col as f32 * self.cell.width, row as f32 * self.cell.height],
-            size: [
+        self.rect_draws.push(Rect::new(
+            [col as f32 * self.cell.width, row as f32 * self.cell.height],
+            [
                 cols as f32 * self.cell.width,
                 rows as f32 * self.cell.height,
             ],
-            color: rgba(color, alpha),
-        });
+            rgba(color, alpha),
+        ));
     }
 
     /// セルの下端に下線を引く。
     pub fn underline_cells(&mut self, col: usize, row: usize, cols: usize, color: Rgb) {
         let thickness = (self.cell.height / 14.0).max(1.0).round();
-        self.rect_draws.push(Rect {
-            pos: [
+        self.rect_draws.push(Rect::new(
+            [
                 col as f32 * self.cell.width,
                 (row + 1) as f32 * self.cell.height - thickness,
             ],
-            size: [cols as f32 * self.cell.width, thickness],
-            color: rgba(color, 1.0),
-        });
+            [cols as f32 * self.cell.width, thickness],
+            rgba(color, 1.0),
+        ));
     }
 
     /// 縦棒のカーソル。
     pub fn cursor_beam(&mut self, col: usize, row: usize, color: Rgb) {
         let thickness = (self.cell.width / 6.0).max(1.0).round();
-        self.rect_draws.push(Rect {
-            pos: [col as f32 * self.cell.width, row as f32 * self.cell.height],
-            size: [thickness, self.cell.height],
-            color: rgba(color, 1.0),
-        });
+        self.rect_draws.push(Rect::new(
+            [col as f32 * self.cell.width, row as f32 * self.cell.height],
+            [thickness, self.cell.height],
+            rgba(color, 1.0),
+        ));
     }
 
     /// 1 セルに 1 文字を置く。
@@ -525,6 +715,12 @@ impl Renderer {
         self.rects
             .prepare(&self.device, &self.queue, (w, h), &self.rect_draws);
 
+        let bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: w as i32,
+            bottom: h as i32,
+        };
         let areas: Vec<TextArea<'_>> = self
             .cell_draws
             .iter()
@@ -534,16 +730,22 @@ impl Renderer {
                     left: d.x,
                     top: d.y,
                     scale: 1.0,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: w as i32,
-                        bottom: h as i32,
-                    },
+                    bounds,
                     default_color: d.color,
                     custom_glyphs: &[],
                 })
             })
+            .chain(self.text_draws.iter().filter_map(|d| {
+                self.strings.get(&d.key).map(|buffer| TextArea {
+                    buffer,
+                    left: d.x,
+                    top: d.y,
+                    scale: 1.0,
+                    bounds,
+                    default_color: d.color,
+                    custom_glyphs: &[],
+                })
+            }))
             .collect();
 
         if let Err(e) = self.text_renderer.prepare(
@@ -778,6 +980,19 @@ impl Renderer {
         buffer.unmap();
         self.atlas.trim();
         out
+    }
+}
+
+/// 省略記号を付けた文字列を作る。`drop_tail` なら末尾を、そうでなければ先頭を落とす。
+fn build(chars: &[char], keep: usize, drop_tail: bool) -> String {
+    if drop_tail {
+        let mut s: String = chars.iter().take(keep).collect();
+        s.push('…');
+        s
+    } else {
+        let mut s = String::from('…');
+        s.extend(chars.iter().skip(chars.len() - keep));
+        s
     }
 }
 

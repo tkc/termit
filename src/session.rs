@@ -65,14 +65,15 @@ impl Session {
         matches!(self.state, RunState::Running)
     }
 
-    /// 左ペインに出す名前。
+    /// 左ペインに出す名前と、それがパスかどうか。
     ///
     /// 付けた名前があればそれを、なければ作業ディレクトリを出す。
+    /// パスは末尾のほうが手がかりになるので、切るときは先頭を落とす。
     /// 分岐の系統は字下げで示すので、名前には入れない。
-    pub fn display_name(&self, max_cols: usize) -> String {
+    pub fn display_name(&self) -> (String, bool) {
         match &self.name {
-            Some(n) => n.clone(),
-            None => crate::git::short_path(&self.cwd, max_cols),
+            Some(n) => (n.clone(), false),
+            None => (crate::git::short_path(&self.cwd, usize::MAX), true),
         }
     }
 }

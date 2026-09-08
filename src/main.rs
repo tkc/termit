@@ -38,7 +38,7 @@ use winit::window::{Window, WindowId};
 use crate::config::{Config, HOST_PROFILE};
 use crate::history::{Entry, History, Scope};
 use crate::input::Action;
-use crate::render::{char_cols, Renderer};
+use crate::render::{char_cols, Renderer, TextStyle};
 use crate::session::{Manager, RunState};
 use crate::term::{TermSize, UiEvent};
 use crate::theme::Theme;
@@ -277,6 +277,9 @@ struct App {
 pub(crate) struct Layout {
     cols: usize,
     rows: usize,
+    /// 左ペインの幅（画素）。0 なら出さない。
+    sidebar_px: f32,
+    /// 左ペインが占める桁数。端末はその次の桁から始まる。
     sidebar_cols: usize,
     term_col: usize,
     term_cols: usize,
@@ -285,25 +288,7 @@ pub(crate) struct Layout {
 
 impl App {
     fn layout(&self, s: &State) -> Layout {
-        let (cols, rows) = s.renderer.grid_size();
-        let sidebar_cols = if s.sidebar {
-            self.config.window.sidebar_cols.min(cols.saturating_sub(20))
-        } else {
-            0
-        };
-        let sep = usize::from(sidebar_cols > 0);
-        let term_col = sidebar_cols + sep;
-        let term_cols = cols.saturating_sub(term_col).max(2);
-        // 最下行は検索欄と状態表示のために空けておく。
-        let term_rows = rows.saturating_sub(1).max(1);
-        Layout {
-            cols,
-            rows,
-            sidebar_cols,
-            term_col,
-            term_cols,
-            term_rows,
-        }
+        layout_of(&self.config, s)
     }
 }
 
@@ -458,6 +443,10 @@ impl ApplicationHandler<UiEvent> for App {
                 state.mouse.x = position.x as f32;
                 state.mouse.y = position.y as f32;
                 let dragging = state.mouse.dragging;
+                // 左ペインの上では、乗っている行の見た目が変わる。
+                if (position.x as f32) < layout_of(&self.config, state).sidebar_px {
+                    state.request_redraw();
+                }
                 if self.report_mouse_motion() {
                     return;
                 }
@@ -573,15 +562,8 @@ impl App {
     /// セル寸法や窓の大きさが変わったとき、全ペインへ伝える。
     fn reflow(&mut self) {
         let Some(state) = &mut self.state else { return };
-        let (cols, rows) = state.renderer.grid_size();
-        let sidebar_cols = if state.sidebar {
-            self.config.window.sidebar_cols.min(cols.saturating_sub(20))
-        } else {
-            0
-        };
-        let sep = usize::from(sidebar_cols > 0);
-        let term_cols = cols.saturating_sub(sidebar_cols + sep).max(2);
-        let term_rows = rows.saturating_sub(1).max(1);
+        let layout = layout_of(&self.config, state);
+        let (term_cols, term_rows) = (layout.term_cols, layout.term_rows);
         let cell = state.renderer.cell();
         state
             .manager
@@ -937,7 +919,7 @@ impl App {
             return;
         }
 
-        if let Some(hit) = sidebar_hit(state, &layout, col, row) {
+        if let Some(hit) = sidebar_hit(state, &layout, state.mouse.x, state.mouse.y) {
             match hit {
                 SidebarHit::NewSession => {
                     let dir = state
@@ -1071,23 +1053,28 @@ impl App {
 }
 
 fn layout_of(config: &Config, state: &State) -> Layout {
-    {
-        let (cols, rows) = state.renderer.grid_size();
-        let sidebar_cols = if state.sidebar {
-            config.window.sidebar_cols.min(cols.saturating_sub(20))
-        } else {
-            0
-        };
-        let sep = usize::from(sidebar_cols > 0);
-        let term_col = sidebar_cols + sep;
-        Layout {
-            cols,
-            rows,
-            sidebar_cols,
-            term_col,
-            term_cols: cols.saturating_sub(term_col).max(2),
-            term_rows: rows.saturating_sub(1).max(1),
-        }
+    let (cols, rows) = state.renderer.grid_size();
+    let cell = state.renderer.cell();
+    // 左ペインは画素で幅を決める。端末はその次の桁から始まるので、
+    // 端数の 1 桁ぶんだけ隙間ができる。
+    let sidebar_px = if state.sidebar {
+        (config.window.sidebar_width * state.renderer.scale())
+            .min((cols as f32 - 20.0) * cell.width)
+            .max(0.0)
+    } else {
+        0.0
+    };
+    let sidebar_cols = (sidebar_px / cell.width).ceil() as usize;
+    let sep = usize::from(sidebar_cols > 0);
+    let term_col = sidebar_cols + sep;
+    Layout {
+        cols,
+        rows,
+        sidebar_px,
+        sidebar_cols,
+        term_col,
+        term_cols: cols.saturating_sub(term_col).max(2),
+        term_rows: rows.saturating_sub(1).max(1),
     }
 }
 
@@ -1414,69 +1401,118 @@ impl App {
     }
 }
 
-/// 左ペインの一行分の割り付け。描画と当たり判定で同じ値を使う。
+/// 左ペインの寸法。単位は pt で、描くときに表示の倍率を掛ける。
 ///
-/// Warp に合わせ、1 セッションを 2 段から 3 段で表す。
-/// 1 段目が名前、2 段目が作業ディレクトリ、3 段目がブランチ名（あれば）。
-/// 段のあいだに 1 行の余白を置く。
+/// Warp の一覧を画素から測った値に合わせてある。
+/// 実測は docs/warp-metrics.md に記録した。
+mod sidebar {
+    /// 行の矩形の左余白（ペインの左端から）。
+    pub const MARGIN_L: f32 = 6.0;
+    /// 行の矩形の右余白（ペインの右端まで）。
+    pub const MARGIN_R: f32 = 8.0;
+    /// 矩形と矩形のあいだ。
+    pub const GAP: f32 = 4.0;
+    /// 矩形の上端から 1 段目まで。
+    pub const PAD_TOP: f32 = 9.0;
+    /// 最後の段から矩形の下端まで。
+    pub const PAD_BOTTOM: f32 = 10.0;
+    /// 実行状態の印の左端（矩形の左端から）。
+    pub const MARK_INSET: f32 = 7.0;
+    /// 文字の左端（矩形の左端から）。印のぶん右へ寄せる。
+    pub const TEXT_INSET: f32 = 20.0;
+    /// 分岐 1 段ぶんの字下げ。
+    pub const INDENT: f32 = 12.0;
+    /// 矩形の角を丸める半径。
+    pub const RADIUS: f32 = 6.0;
+    /// 上端に `+` を置く帯の高さ。
+    pub const HEADER: f32 = 34.0;
+    /// 区切り線の上下の余白。
+    pub const SEP_PAD: f32 = 8.0;
+
+    /// 1 段目（名前）。
+    pub const SIZE_TITLE: f32 = 13.0;
+    /// 2 段目（名乗った題名）。
+    pub const SIZE_SUB: f32 = 12.0;
+    /// 3 段目（ブランチ名）。
+    pub const SIZE_BRANCH: f32 = 10.0;
+    /// 直近のコマンド。
+    pub const SIZE_RECENT: f32 = 11.0;
+}
+
+/// 左ペインの文字の体裁。桁に縛られないので、等幅でない書体で組む。
+///
+/// 同じ幅に多く入り、Warp の一覧の見え方に近くなる。
+fn style(size: f32, bold: bool) -> TextStyle {
+    let s = TextStyle::sans(size);
+    if bold {
+        s.bold()
+    } else {
+        s
+    }
+}
+
+/// 左ペインの 1 セッションぶんの領域。描画と当たり判定で同じ値を使う。
 struct Block {
     index: usize,
     depth: usize,
-    /// 段の先頭の行。
-    top: usize,
-    /// 余白を含まない段の高さ。
-    height: usize,
+    /// 矩形の上端（画素）。
+    top: f32,
+    /// 矩形の高さ（画素）。
+    height: f32,
 }
 
 struct SidebarLayout {
-    width: usize,
+    /// ペインの幅（画素）。
+    width: f32,
+    /// 行の矩形の左端と幅（画素）。
+    rect_x: f32,
+    rect_w: f32,
     blocks: Vec<Block>,
-    /// [+] と × を置く桁。
-    action_col: usize,
-    /// 実行状態の印を置く桁。
-    marker_col: usize,
-    /// ⌘ の番号を置く桁。
-    hint_col: usize,
-    sep_row: usize,
+    /// 区切り線の位置（画素）。
+    sep_y: f32,
 }
 
-const SIDEBAR_TOP: usize = 2;
-/// 段のあいだに置く余白の行数。
-const BLOCK_GAP: usize = 1;
-
 fn sidebar_layout(state: &State, layout: &Layout) -> SidebarLayout {
-    let width = layout.sidebar_cols;
-    // 下段に「直近のコマンド」を出す余地を残す。
-    let limit = layout.rows.saturating_sub(8).max(1);
+    let sc = state.renderer.scale();
+    let width = layout.sidebar_px;
+    let rect_x = sidebar::MARGIN_L * sc;
+    let rect_w = (width - (sidebar::MARGIN_L + sidebar::MARGIN_R) * sc).max(0.0);
+    let height_px = layout.rows as f32 * state.renderer.cell().height;
+    // 下段に直近のコマンドを出す余地を残す。
+    let limit = height_px - 120.0 * sc;
+
     let mut blocks = Vec::new();
-    let mut row = SIDEBAR_TOP;
+    let mut y = sidebar::HEADER * sc;
     for tree in state.manager.tree_rows() {
         let Some(s) = state.manager.sessions().get(tree.index) else {
             continue;
         };
-        // 1 段目は名前。2 段目は名乗った題名、3 段目はブランチ名で、
-        // どちらも無ければその段を作らない。
-        let height =
-            1 + usize::from(s.window_title.is_some()) + usize::from(s.branch.is_some());
-        if row + height > limit {
+        let mut content = state.renderer.line_height_px(sidebar::SIZE_TITLE);
+        if s.window_title.is_some() {
+            content += state.renderer.line_height_px(sidebar::SIZE_SUB);
+        }
+        if s.branch.is_some() {
+            content += state.renderer.line_height_px(sidebar::SIZE_BRANCH);
+        }
+        let height = (sidebar::PAD_TOP + sidebar::PAD_BOTTOM) * sc + content;
+        if y + height > limit {
             break;
         }
         blocks.push(Block {
             index: tree.index,
             depth: tree.depth,
-            top: row,
+            top: y,
             height,
         });
-        row += height + BLOCK_GAP;
+        y += height + sidebar::GAP * sc;
     }
-    let sep_row = row.saturating_sub(BLOCK_GAP);
+    let sep_y = y - sidebar::GAP * sc + sidebar::SEP_PAD * sc;
     SidebarLayout {
         width,
+        rect_x,
+        rect_w,
         blocks,
-        action_col: width.saturating_sub(4),
-        marker_col: width.saturating_sub(2),
-        hint_col: width.saturating_sub(8),
-        sep_row,
+        sep_y,
     }
 }
 
@@ -1487,20 +1523,31 @@ enum SidebarHit {
     Close(usize),
 }
 
-fn sidebar_hit(state: &State, layout: &Layout, col: usize, row: usize) -> Option<SidebarHit> {
-    if layout.sidebar_cols == 0 || col >= layout.sidebar_cols {
+/// 画素の位置で当たりを見る。
+fn sidebar_hit(state: &State, layout: &Layout, px: f32, py: f32) -> Option<SidebarHit> {
+    if layout.sidebar_px <= 0.0 || px >= layout.sidebar_px {
         return None;
     }
+    let sc = state.renderer.scale();
     let sl = sidebar_layout(state, layout);
-    if row == 0 {
-        return (col >= sl.action_col && col < sl.action_col + 3).then_some(SidebarHit::NewSession);
+    if py < sidebar::HEADER * sc {
+        // 見出しの帯の右端に `+` を置いている。
+        let plus_right = sl.rect_x + sl.rect_w;
+        return (px > plus_right - 24.0 * sc).then_some(SidebarHit::NewSession);
     }
     for b in &sl.blocks {
-        if row < b.top || row >= b.top + b.height {
+        if py < b.top || py >= b.top + b.height {
             continue;
         }
-        // × は名前の段だけで受ける。取り違えて閉じないようにする。
-        if row == b.top && col >= sl.action_col && col < sl.action_col + 1 {
+        // × は、カーソルが乗っているときだけ 1 段目の右端に出る。
+        // 出ていない位置で閉じないよう、同じ範囲でだけ受ける。
+        let first_line = state.renderer.line_height_px(sidebar::SIZE_TITLE);
+        let close_right = sl.rect_x + sl.rect_w - 6.0 * sc;
+        let close_left = close_right - 18.0 * sc;
+        if py < b.top + sidebar::PAD_TOP * sc + first_line
+            && px >= close_left
+            && px < close_right
+        {
             return Some(SidebarHit::Close(b.index));
         }
         return Some(SidebarHit::Select(b.index));
@@ -1509,28 +1556,29 @@ fn sidebar_hit(state: &State, layout: &Layout, col: usize, row: usize) -> Option
 }
 
 pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
+    let sc = state.renderer.scale();
     let sl = sidebar_layout(state, layout);
-    let w = sl.width;
-    state.renderer.fill_cells(0, 0, w, layout.rows, theme.chrome_bg);
-    // 押せる目印。キーが効かない環境でもここから増やせる。
+    let height_px = layout.rows as f32 * state.renderer.cell().height;
     state
         .renderer
-        .put_char(sl.marker_col, 0, '+', theme.accent, true, false);
+        .fill_px(0.0, 0.0, sl.width, height_px, theme.chrome_bg, 0.0);
+
+    // 押せる目印。キーが効かない環境でもここから増やせる。
+    let plus_w = state.renderer.measure_px("+", style(sidebar::SIZE_TITLE, true));
+    let plus_x = sl.rect_x + sl.rect_w - plus_w - 6.0 * sc;
+    let plus_y = (sidebar::HEADER * sc - state.renderer.line_height_px(sidebar::SIZE_TITLE)) / 2.0;
+    state
+        .renderer
+        .put_text_px(plus_x, plus_y, "+", style(sidebar::SIZE_TITLE, true), theme.accent);
 
     let selected = state.manager.selected_index();
     for (n, b) in sl.blocks.iter().enumerate() {
         let s = &state.manager.sessions()[b.index];
         let running = s.is_running();
-        let indent = b.depth * 2;
-        let name_width = sl.hint_col.saturating_sub(indent + 2);
-        // 会話を引き継いでいない印の分を先に空けておく。
-        // あとで足すと、切り詰めで印そのものが落ちる。
+        let indent = b.depth as f32 * sidebar::INDENT * sc;
+        let text_x = sl.rect_x + sidebar::TEXT_INSET * sc + indent;
         let forked = !s.inherited && s.parent.is_some();
-        let mut name = s.display_name(name_width - usize::from(forked));
-        if forked {
-            name.push('*');
-        }
-        let profile = (s.profile != HOST_PROFILE).then(|| s.profile.clone());
+        let (raw_name, is_path) = s.display_name();
         let osc_title = s.window_title.clone();
         let branch = s.branch.clone();
         let exit = match s.state {
@@ -1538,123 +1586,160 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
             RunState::Exited(code) => Some(code),
         };
 
-        // 選んでいる段は、余白を除いた高さ全体を塗る。
+        let hovered = state.mouse.x < sl.width
+            && state.mouse.y >= b.top
+            && state.mouse.y < b.top + b.height;
         if b.index == selected {
-            state.renderer.fill_cells(0, b.top, w, b.height, theme.surface);
+            state.renderer.fill_px(
+                sl.rect_x,
+                b.top,
+                sl.rect_w,
+                b.height,
+                theme.surface,
+                sidebar::RADIUS * sc,
+            );
         }
 
-        let mut x = 1 + indent;
-        if b.depth > 0 {
+        let mut y = b.top + sidebar::PAD_TOP * sc;
+        let title_h = state.renderer.line_height_px(sidebar::SIZE_TITLE);
+        // 右端に並べる印の左端。名前はここまでで切る。
+        let right = sl.rect_x + sl.rect_w;
+        let hint_w = state.renderer.measure_px("⌘9", style(sidebar::SIZE_BRANCH, false));
+        let name_limit = right - 12.0 * sc - hint_w - text_x;
+        let mark_w = state.renderer.measure_px("*", style(sidebar::SIZE_TITLE, false));
+        let avail = (name_limit - if forked { mark_w } else { 0.0 }).max(0.0);
+        let mut name = if is_path {
             state
                 .renderer
-                .put_char(x - 1, b.top, '└', theme.fg_tertiary, false, false);
+                .fit_head(&raw_name, style(sidebar::SIZE_TITLE, false), avail)
+        } else {
+            state
+                .renderer
+                .fit_tail(&raw_name, style(sidebar::SIZE_TITLE, false), avail)
+        };
+        if forked {
+            name.push('*');
+        }
+
+        // 分岐の系統は字下げで示す。つなぎの印は、状態の印に重ならない
+        // 位置へ寄せる。
+        if b.depth > 0 {
+            state.renderer.put_text_px(
+                sl.rect_x + indent - 5.0 * sc,
+                y + (title_h - state.renderer.line_height_px(sidebar::SIZE_BRANCH)) / 2.0,
+                "└",
+                style(sidebar::SIZE_BRANCH, false),
+                theme.fg_tertiary,
+            );
         }
         let fg = if running {
             theme.fg_primary
         } else {
             theme.fg_tertiary
         };
-        x += state
-            .renderer
-            .put_str_clipped(x, b.top, &name, name_width, fg);
-        let _ = x;
-
-        // ⌘ の番号。押せることが見えていないと使われない。
-        if n < 9 {
-            state.renderer.put_str(
-                sl.hint_col,
-                b.top,
-                &format!("⌘{}", n + 1),
-                theme.fg_tertiary,
-            );
-        }
         state
             .renderer
-            .put_char(sl.action_col, b.top, '×', theme.fg_tertiary, false, false);
-        match exit {
-            None => state
-                .renderer
-                .put_char(sl.marker_col, b.top, '●', theme.accent, false, false),
-            Some(code) => {
-                let c = if code == 0 { theme.fg_tertiary } else { theme.warn };
-                state
-                    .renderer
-                    .put_char(sl.marker_col, b.top, '○', c, false, false);
-            }
-        }
+            .put_text_px(text_x, y, &name, style(sidebar::SIZE_TITLE, false), fg);
 
-        let mut line = b.top + 1;
-        // 端末上のプログラムが名乗った題名。何をしているセッションかが分かる。
-        if let Some(title) = osc_title {
-            let mut tx = 2 + indent;
-            state
-                .renderer
-                .put_char(tx, line, '✻', theme.accent, false, false);
-            tx += 2;
-            state.renderer.put_str_clipped(
-                tx,
-                line,
-                &title,
-                w.saturating_sub(tx + 1),
+        // 実行状態は左端に置く。Warp がアバターを置いている位置にあたる。
+        let mark = if exit.is_none() { "●" } else { "○" };
+        let mark_color = match exit {
+            None => theme.accent,
+            Some(0) => theme.fg_tertiary,
+            Some(_) => theme.warn,
+        };
+        let small_h = state.renderer.line_height_px(sidebar::SIZE_BRANCH);
+        state.renderer.put_text_px(
+            sl.rect_x + sidebar::MARK_INSET * sc + indent,
+            y + (title_h - small_h) / 2.0,
+            mark,
+            style(sidebar::SIZE_BRANCH, false),
+            mark_color,
+        );
+        // 右端は、ふだんは ⌘ の番号、カーソルが乗っているときは閉じる印。
+        // 両方を常に置くと名前の幅が足りない。
+        if hovered {
+            let xw = state.renderer.measure_px("×", style(sidebar::SIZE_SUB, false));
+            state.renderer.put_text_px(
+                right - 6.0 * sc - xw,
+                y + (title_h - state.renderer.line_height_px(sidebar::SIZE_SUB)) / 2.0,
+                "×",
+                style(sidebar::SIZE_SUB, false),
                 theme.fg_secondary,
             );
-            line += 1;
-        }
-        // ブランチ名。git の下にいなければ段そのものを作らない。
-        if let Some(branch) = branch {
-            let mut bx = 2 + indent;
-            state
-                .renderer
-                .put_char(bx, line, '⋔', theme.fg_tertiary, false, false);
-            bx += 2;
-            let used = state.renderer.put_str_clipped(
-                bx,
-                line,
-                &branch,
-                w.saturating_sub(bx + 1),
+        } else if n < 9 {
+            let hint = format!("⌘{}", n + 1);
+            let hw = state.renderer.measure_px(&hint, style(sidebar::SIZE_BRANCH, false));
+            state.renderer.put_text_px(
+                right - 6.0 * sc - hw,
+                y + (title_h - small_h) / 2.0,
+                &hint,
+                style(sidebar::SIZE_BRANCH, false),
                 theme.fg_tertiary,
             );
-            bx += used;
-            if let Some(p) = &profile {
-                if bx + 4 < w {
-                    state.renderer.put_str_clipped(
-                        bx + 1,
-                        line,
-                        p,
-                        w.saturating_sub(bx + 2),
-                        theme.accent,
-                    );
-                }
-            }
+        }
+        y += title_h;
+
+        // 2 段目は端末上のプログラムが名乗った題名。
+        if let Some(title) = osc_title {
+            let w = state
+                .renderer
+                .put_text_px(text_x, y, "✻ ", style(sidebar::SIZE_SUB, false), theme.accent);
+            let limit = (right - 8.0 * sc - (text_x + w)).max(0.0);
+            let clipped = state
+                .renderer
+                .fit_tail(&title, style(sidebar::SIZE_SUB, false), limit);
+            state.renderer.put_text_px(text_x + w, y, &clipped, style(sidebar::SIZE_SUB, false), theme.fg_secondary);
+            y += state.renderer.line_height_px(sidebar::SIZE_SUB);
+        }
+
+        // 3 段目はブランチ名。
+        if let Some(branch) = branch {
+            let w = state.renderer.put_text_px(text_x, y, "⋔ ", style(sidebar::SIZE_BRANCH, false), theme.fg_tertiary);
+            let limit = (right - 8.0 * sc - (text_x + w)).max(0.0);
+            let clipped = state
+                .renderer
+                .fit_tail(&branch, style(sidebar::SIZE_BRANCH, false), limit);
+            state.renderer.put_text_px(text_x + w, y, &clipped, style(sidebar::SIZE_BRANCH, false), theme.fg_tertiary);
         }
     }
 
     // 直近のコマンド。何もなければ区切りごと出さない。
-    // 見出しを置かなくても、区切りの下にあることで何の一覧かは分かる。
-    if state.recent.is_empty() || sl.sep_row + 1 >= layout.rows {
+    if state.recent.is_empty() {
         return;
     }
-    for x in 0..w {
-        state
-            .renderer
-            .put_char(x, sl.sep_row, '─', theme.fg_tertiary, false, false);
+    let line_h = state.renderer.line_height_px(sidebar::SIZE_RECENT);
+    if sl.sep_y + line_h > height_px {
+        return;
     }
-    let list_top = sl.sep_row + 1;
-    let avail = layout.rows.saturating_sub(list_top + 1);
-    for (i, entry) in state.recent.iter().take(avail).enumerate() {
-        let y = list_top + i;
+    state.renderer.fill_px(
+        sl.rect_x,
+        sl.sep_y,
+        sl.rect_w,
+        (1.0 * sc).max(1.0),
+        theme.fg_tertiary,
+        0.0,
+    );
+    let mut y = sl.sep_y + sidebar::SEP_PAD * sc;
+    let recent: Vec<crate::history::Entry> = state.recent.clone();
+    for entry in recent {
+        if y + line_h > height_px {
+            break;
+        }
         let code = entry.exit_code.unwrap_or(0);
-        let marker_color = if code == 0 { theme.fg_tertiary } else { theme.warn };
-        state
-            .renderer
-            .put_str(1, y, &format!("{code:>3}"), marker_color);
-        state.renderer.put_str_clipped(
-            5,
-            y,
-            &entry.command,
-            w.saturating_sub(6),
-            theme.fg_secondary,
-        );
+        let color = if code == 0 {
+            theme.fg_tertiary
+        } else {
+            theme.warn
+        };
+        let w = state.renderer.put_text_px(sl.rect_x + 4.0 * sc, y, &format!("{code:>3} "), style(sidebar::SIZE_RECENT, false), color);
+        let limit = (sl.rect_w - 8.0 * sc - w).max(0.0);
+        let clipped =
+            state
+                .renderer
+                .fit_tail(&entry.command, style(sidebar::SIZE_RECENT, false), limit);
+        state.renderer.put_text_px(sl.rect_x + 4.0 * sc + w, y, &clipped, style(sidebar::SIZE_RECENT, false), theme.fg_secondary);
+        y += line_h;
     }
 }
 

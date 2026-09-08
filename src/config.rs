@@ -41,8 +41,9 @@ pub struct WindowConfig {
     pub font_size: f32,
     #[serde(default = "default_scrollback")]
     pub scrollback: usize,
-    #[serde(default = "default_sidebar_cols")]
-    pub sidebar_cols: usize,
+    /// 左ペインの幅（pt）。端末の桁数とは独立に決める。
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
     /// 表示装置の走査に合わせるか。
     ///
     /// 合わせると画面の裂けは起きないが、投入したフレームが出るまで
@@ -66,10 +67,9 @@ fn default_font_size() -> f32 {
 fn default_scrollback() -> usize {
     10_000
 }
-fn default_sidebar_cols() -> usize {
-    // `~/github/terminal_tex` のようなパスが、⌘ の番号や印を置く
-    // 右端の 8 桁を差し引いても収まる幅にする。
-    32
+fn default_sidebar_width() -> f32 {
+    // Warp の左ペインは 198pt から 220pt だった。
+    200.0
 }
 
 impl Default for WindowConfig {
@@ -78,7 +78,7 @@ impl Default for WindowConfig {
             font: default_font(),
             font_size: default_font_size(),
             scrollback: default_scrollback(),
-            sidebar_cols: default_sidebar_cols(),
+            sidebar_width: default_sidebar_width(),
             vsync: default_vsync(),
         }
     }
@@ -220,10 +220,10 @@ impl Config {
                 self.window.font_size
             )));
         }
-        if self.window.sidebar_cols < 10 || self.window.sidebar_cols > 120 {
+        if self.window.sidebar_width < 80.0 || self.window.sidebar_width > 800.0 {
             return Err(ConfigError::Invalid(format!(
-                "window.sidebar_cols は 10 から 120 のあいだ（現在 {}）",
-                self.window.sidebar_cols
+                "window.sidebar_width は 80 から 800 のあいだ（現在 {}）",
+                self.window.sidebar_width
             )));
         }
         if self.profile.contains_key(HOST_PROFILE) {

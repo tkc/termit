@@ -11,6 +11,26 @@ pub struct Rect {
     pub pos: [f32; 2],
     pub size: [f32; 2],
     pub color: [f32; 4],
+    /// 角を丸める半径（画素）。0 なら角のまま。
+    pub radius: f32,
+    pub _pad: [f32; 3],
+}
+
+impl Rect {
+    pub fn new(pos: [f32; 2], size: [f32; 2], color: [f32; 4]) -> Self {
+        Self {
+            pos,
+            size,
+            color,
+            radius: 0.0,
+            _pad: [0.0; 3],
+        }
+    }
+
+    pub fn rounded(mut self, radius: f32) -> Self {
+        self.radius = radius;
+        self
+    }
 }
 
 #[repr(C)]
@@ -28,11 +48,15 @@ struct Inst {
   @location(0) pos: vec2<f32>,
   @location(1) size: vec2<f32>,
   @location(2) color: vec4<f32>,
+  @location(3) radius: f32,
 };
 
 struct VsOut {
   @builtin(position) clip: vec4<f32>,
   @location(0) color: vec4<f32>,
+  @location(1) local: vec2<f32>,
+  @location(2) half_size: vec2<f32>,
+  @location(3) radius: f32,
 };
 
 @vertex
@@ -42,6 +66,10 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
   var out: VsOut;
   out.clip = vec4<f32>(p.x / u.screen.x * 2.0 - 1.0, 1.0 - p.y / u.screen.y * 2.0, 0.0, 1.0);
   out.color = inst.color;
+  // 角を丸めるため、矩形の中心を原点とした位置を渡す。
+  out.half_size = inst.size * 0.5;
+  out.local = (corner - vec2<f32>(0.5, 0.5)) * inst.size;
+  out.radius = inst.radius;
   return out;
 }
 
@@ -50,13 +78,26 @@ fn srgb_to_linear(c: f32) -> f32 {
   return pow((c + 0.055) / 1.055, 2.4);
 }
 
+// 角を丸めた矩形までの符号付き距離。
+fn rounded_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
+  let q = abs(p) - b + vec2<f32>(r, r);
+  return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+  var a = in.color.a;
+  if (in.radius > 0.0) {
+    let d = rounded_box(in.local, in.half_size, in.radius);
+    // 端を 1 画素ぶんぼかして、階段状にならないようにする。
+    a = a * (1.0 - smoothstep(-0.75, 0.75, d));
+    if (a <= 0.0) { discard; }
+  }
   return vec4<f32>(
     srgb_to_linear(in.color.r),
     srgb_to_linear(in.color.g),
     srgb_to_linear(in.color.b),
-    in.color.a,
+    a,
   );
 }
 "#;
@@ -135,6 +176,11 @@ impl RectRenderer {
                             offset: 16,
                             shader_location: 2,
                             format: wgpu::VertexFormat::Float32x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 32,
+                            shader_location: 3,
+                            format: wgpu::VertexFormat::Float32,
                         },
                     ],
                 })],
