@@ -51,6 +51,14 @@ Without it termit works as a terminal, but the history stays empty. Everything
 else, including following `cd`, works either way: the working directory is read
 from the OS as well as from OSC 7.
 
+`^R` opens the history. It starts scoped to the current session and goes back
+up to 500 commands; press `^R` again to widen to the current directory and then
+to everything. Move with the arrow keys, a page at a time with PageUp and
+PageDown, and Enter puts the command on the prompt without running it.
+
+History is keyed to the session rather than to the process, so a session that
+comes back after a restart still has its own history.
+
 ## Keys
 
 Two sets. The Ctrl set is termit's own and takes exactly six keys away from the

@@ -41,6 +41,8 @@ pub struct Session {
     pub size: TermSize,
     pub window_size: Arc<FairMutex<WindowSize>>,
     pub dirty: Arc<AtomicBool>,
+    /// 再起動をまたいで残る鍵。コマンド履歴をこの単位で辿る。
+    pub key: String,
     /// 利用者が付けた名前。付けていなければ作業ディレクトリを名前にする。
     pub name: Option<String>,
     /// 作業ディレクトリのブランチ名。git の下にいなければ `None`。
@@ -300,7 +302,17 @@ impl Manager {
         } else {
             format!("s-{}", self.next_id)
         };
-        self.launch(config, profile_name, cwd, base, None, agent_id, title, true)
+        self.launch(
+            config,
+            profile_name,
+            cwd,
+            base,
+            None,
+            agent_id,
+            title,
+            true,
+            None,
+        )
     }
 
     /// 選択中のセッションから分岐する。
@@ -360,6 +372,7 @@ impl Manager {
             agent_id,
             title,
             inherited,
+            None,
         )
     }
 
@@ -374,6 +387,7 @@ impl Manager {
         agent_id: Option<String>,
         title: String,
         inherited: bool,
+        key: Option<String>,
     ) -> Result<SessionId, SessionError> {
         let profile = config.profile(profile_name);
         if !profile.is_host() && !docker_available() {
@@ -381,13 +395,17 @@ impl Manager {
         }
         let argv = config::build_argv(&profile, cwd, &base);
         let id = self.next_id;
+        let key = key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let spawned = pty::spawn(
-            id,
-            &argv,
-            cwd,
-            self.size,
-            self.cell,
-            config.window.scrollback,
+            pty::SpawnOptions {
+                id,
+                argv: &argv,
+                cwd,
+                size: self.size,
+                cell: self.cell,
+                scrollback: config.window.scrollback,
+                session_key: key.clone(),
+            },
             self.ui_tx.clone(),
         )
         .map_err(SessionError::Spawn)?;
@@ -395,6 +413,7 @@ impl Manager {
 
         self.sessions.push(Session {
             id,
+            key,
             parent,
             title,
             cwd: cwd.to_path_buf(),
@@ -434,6 +453,7 @@ impl Manager {
                 .sessions
                 .iter()
                 .map(|s| crate::state::SavedSession {
+                    key: Some(s.key.clone()),
                     name: s.name.clone(),
                     cwd: s.cwd.to_string_lossy().to_string(),
                     profile: s.profile.clone(),
@@ -514,6 +534,7 @@ impl Manager {
             agent_id,
             title,
             true,
+            saved.key.clone(),
         )?;
         if let Some(s) = self.sessions.last_mut() {
             s.name = saved.name.clone();
@@ -582,6 +603,8 @@ fn docker_available() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRecord {
     pub session_id: SessionId,
+    /// 再起動をまたいで残るセッションの鍵。履歴を辿るのに使う。
+    pub session_key: String,
     pub agent_id: Option<String>,
     pub cwd: String,
     pub command: String,
@@ -741,6 +764,7 @@ mod tests {
             version: crate::state::VERSION,
             selected: 0,
             sessions: vec![crate::state::SavedSession {
+                key: None,
                 name: None,
                 cwd: "/no/such/directory/at/all".into(),
                 profile: "host".into(),

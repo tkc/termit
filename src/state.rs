@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 /// 覚えている 1 セッションぶん。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedSession {
+    /// 再起動をまたいで残る鍵。コマンド履歴をこの単位で辿る。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     /// 利用者が付けた名前。付けていなければ空。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -121,6 +124,7 @@ mod tests {
             selected: 1,
             sessions: vec![
                 SavedSession {
+                    key: Some("k1".into()),
                     name: None,
                     cwd: "/repo".into(),
                     profile: "host".into(),
@@ -129,6 +133,7 @@ mod tests {
                     command: vec!["claude".into()],
                 },
                 SavedSession {
+                    key: Some("k2".into()),
                     name: Some("review".into()),
                     cwd: "/repo".into(),
                     profile: "sandbox".into(),

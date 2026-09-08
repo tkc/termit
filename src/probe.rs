@@ -131,11 +131,15 @@ pub fn run(out_path: &str) {
         cursor_px: None,
         window: None,
     };
-    let id = state.manager.selected().map(|s| s.id).unwrap_or(0);
+    let (id, key) = state
+        .manager
+        .selected()
+        .map(|s| (s.id, s.key.clone()))
+        .unwrap_or((0, String::new()));
     state.recent = state
         .history
         .as_ref()
-        .map(|h| h.recent(id, 10).unwrap_or_default())
+        .map(|h| h.recent(&key, 10).unwrap_or_default())
         .unwrap_or_default();
     state.recent_for = Some(id);
 
@@ -174,7 +178,7 @@ pub fn run(out_path: &str) {
                 .history
                 .as_ref()
                 .map(|h| {
-                    h.search("", crate::history::Scope::All, 1, "", 10)
+                    h.search("", crate::history::Scope::All, "", "", 10)
                         .unwrap_or_default()
                 })
                 .unwrap_or_default();
@@ -183,6 +187,7 @@ pub fn run(out_path: &str) {
                 scope: crate::history::Scope::All,
                 results,
                 selected: 0,
+                offset: 0,
             });
         }
         Ok("preedit") => {
