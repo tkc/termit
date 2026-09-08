@@ -176,10 +176,10 @@ Claude Code 側では、同梱する `SessionStart` フックがこのシーケ�
 
 ```toml
 [profile.sandbox]
-image   = "node:22"
+image   = "tex-agent:latest"   # claude をインストール済みのイメージ
 workdir = "/work"
 mount   = ["{cwd}:/work"]
-network = "none"
+network = "bridge"
 env     = ["ANTHROPIC_API_KEY"]
 args    = ["--dangerously-skip-permissions"]
 ```
@@ -192,7 +192,7 @@ args    = ["--dangerously-skip-permissions"]
 
 **mount**：`docker run -v` に渡すマウント指定。`{cwd}` を展開する。
 
-**network**：`docker run --network` に渡す値。既定は `none`。
+**network**：`docker run --network` に渡す値。既定は `bridge`。
 
 **env**：ホストから引き継ぐ環境変数名。値ではなく名前だけを書く。
 
@@ -205,18 +205,21 @@ args    = ["--dangerously-skip-permissions"]
 ```
 docker run --rm -it \
   -v /Users/tkc/repo:/work -w /work \
-  --network none \
+  --network bridge \
   -e ANTHROPIC_API_KEY \
-  node:22 \
+  tex-agent:latest \
   claude --session-id <uuid> --dangerously-skip-permissions
 ```
 
-`--network none` の下では、エージェントは外部へ接続できない。
-権限確認を省く `--dangerously-skip-permissions` を安全に使えるのは、この隔離が効いているときに限る。
-逆に、`network` を `none` 以外にしたプロファイルで `args` に同フラグを書くと隔離は成立しない。
-tex はこの組み合わせを検出したとき、起動前に警告を一行出す。
-禁止はしない。
-外部 API への接続が必要なエージェントを隔離下で使う構成には正当な用途があり、その判断は利用者に属する。
+隔離の根拠は、ネットワークの遮断ではなくマウント範囲とプロセス名前空間にある。
+コンテナから見えるファイルは `mount` に書いた範囲だけであり、ホストの他のディレクトリ、ホストのプロセス、ホストにインストールされたコマンドには届かない。
+権限確認を省く `--dangerously-skip-permissions` を使えるのは、この範囲の限定が効いているときに限る。
+
+`network` の既定を `bridge` とするのは、モデル API への接続が切れるとエージェントが動かないためである。
+外部へ出る必要のないプロセスには `network = "none"` を明示的に指定する。
+
+tex は `network` と `args` の組み合わせを検査しない。
+どの隔離が必要かはエージェントと作業の性質で決まり、端末が判定できる事柄ではない。
 
 ### 8.3 fork との関係
 
@@ -346,6 +349,9 @@ RECENT  fork-1
 ### 12.3 フォント
 
 等幅フォントのみを扱う。
+既定は `Menlo` とする。
+macOS に同梱される SF Mono はアプリケーションバンドルの中にあり、フォントデータベースから名前で引けないため既定にしない。
+設定されたフォント名が見つからない場合は総称の等幅フォントへ落とす。
 セル幅はフォントの advance から一度だけ決め、以後は全セルで同じ値を使う。
 East Asian Width が Wide の文字は 2 セルを占める。
 合字と可変幅は扱わない。
@@ -358,7 +364,7 @@ East Asian Width が Wide の文字は 2 セルを占める。
 
 ```toml
 [window]
-font        = "SF Mono"
+font        = "Menlo"
 font_size   = 13.0
 scrollback  = 10000
 
@@ -374,10 +380,10 @@ fork = "claude --resume {parent_agent_id} --fork-session"
 # 既定。docker を使わない
 
 [profile.sandbox]
-image   = "node:22"
+image   = "tex-agent:latest"
 workdir = "/work"
 mount   = ["{cwd}:/work"]
-network = "none"
+network = "bridge"
 env     = ["ANTHROPIC_API_KEY"]
 args    = ["--dangerously-skip-permissions"]
 ```
