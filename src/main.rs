@@ -1363,18 +1363,8 @@ impl App {
         state.renderer.begin();
 
         if layout.sidebar_cols > 0 {
+            // 縦の区切り線は引かない。地の色が違うので境目は分かる。
             draw_sidebar(state, &layout, &theme);
-            // 区切りの縦線。
-            for row in 0..layout.rows {
-                state.renderer.put_char(
-                    layout.sidebar_cols,
-                    row,
-                    '│',
-                    theme.fg_tertiary,
-                    false,
-                    false,
-                );
-            }
         }
         draw_terminal(state, &layout, &theme);
         draw_bottom(state, &layout, &theme);

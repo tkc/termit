@@ -204,11 +204,6 @@ pub fn run(out_path: &str) {
     }
     state.renderer.begin();
     crate::draw_sidebar(&mut state, &layout, &theme);
-    for row in 0..layout.rows {
-        state
-            .renderer
-            .put_char(layout.sidebar_cols, row, '│', theme.fg_tertiary, false, false);
-    }
     crate::draw_terminal(&mut state, &layout, &theme);
     crate::draw_bottom(&mut state, &layout, &theme);
     let pixels = state.renderer.render_to_pixels(theme.bg);
