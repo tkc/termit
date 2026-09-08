@@ -89,16 +89,30 @@ impl std::fmt::Display for SpawnError {
     }
 }
 
+/// 起動に必要なもの一式。
+pub struct SpawnOptions<'a> {
+    pub id: SessionId,
+    pub argv: &'a [String],
+    pub cwd: &'a Path,
+    pub size: TermSize,
+    /// 1 セルの幅と高さ（画素）。PTY へ窓の大きさとして伝える。
+    pub cell: (u16, u16),
+    pub scrollback: usize,
+    /// 再起動をまたいで残るセッションの鍵。記録に付ける。
+    pub session_key: String,
+}
+
 /// 引数列を PTY 上で起動し、読み書きのスレッドを立てる。
-pub fn spawn(
-    id: SessionId,
-    argv: &[String],
-    cwd: &Path,
-    size: TermSize,
-    cell: (u16, u16),
-    scrollback: usize,
-    ui_tx: UiSender,
-) -> Result<Spawned, SpawnError> {
+pub fn spawn(opts: SpawnOptions<'_>, ui_tx: UiSender) -> Result<Spawned, SpawnError> {
+    let SpawnOptions {
+        id,
+        argv,
+        cwd,
+        size,
+        cell,
+        scrollback,
+        session_key,
+    } = opts;
     let pty_size = PtySize {
         rows: size.lines as u16,
         cols: size.cols as u16,
@@ -160,6 +174,7 @@ pub fn spawn(
         ui_tx.clone(),
         dirty.clone(),
         cwd.to_string_lossy().to_string(),
+        session_key,
     );
 
     let mut killer = child.clone_killer();
@@ -203,6 +218,7 @@ fn spawn_writer(mut writer: Box<dyn Write + Send>, rx: Receiver<Vec<u8>>) {
 #[derive(Default)]
 struct CommandTracker {
     cwd: String,
+    session_key: String,
     agent_id: Option<String>,
     /// 入力の開始位置と、その時点のスクロールバック行数。
     ///
@@ -273,6 +289,7 @@ impl CommandTracker {
                     .map(|d| d.as_millis() as i64);
                 Some(CommandRecord {
                     session_id,
+                    session_key: self.session_key.clone(),
                     agent_id: self.agent_id.clone(),
                     cwd: self.cwd.clone(),
                     command,
@@ -292,14 +309,16 @@ fn spawn_reader(
     ui_tx: UiSender,
     dirty: Arc<AtomicBool>,
     cwd: String,
+    session_key: String,
 ) {
     thread::Builder::new()
-        .name("tex-pty-read".into())
+        .name("termit-pty-read".into())
         .spawn(move || {
             let mut parser: Processor<StdSyncHandler> = Processor::new();
             let mut scanner = OscScanner::new();
             let mut tracker = CommandTracker {
                 cwd,
+                session_key,
                 ..CommandTracker::default()
             };
             let mut buf = vec![0u8; 65536];
@@ -405,14 +424,16 @@ mod tests {
     #[test]
     fn 子プロセスの出力がグリッドに現れる() {
         let (tx, rx) = channel();
-        let size = TermSize::new(40, 8);
         let spawned = spawn(
-            7,
-            &["/bin/echo".to_string(), "hello".to_string()],
-            Path::new("/"),
-            size,
-            (8, 16),
-            100,
+            SpawnOptions {
+                id: 7,
+                argv: &["/bin/echo".to_string(), "hello".to_string()],
+                cwd: Path::new("/"),
+                size: TermSize::new(40, 8),
+                cell: (8, 16),
+                scrollback: 100,
+                session_key: "test-key".to_string(),
+            },
             crate::term::UiSender::Channel(tx),
         )
         .expect("PTY を起動できる");
@@ -470,12 +491,15 @@ mod shell_integration_tests {
         }
         let (tx, rx) = channel();
         let spawned = spawn(
-            11,
-            &["/bin/zsh".to_string(), "-f".to_string(), "-i".to_string()],
-            Path::new("/tmp"),
-            TermSize::new(80, 24),
-            (8, 16),
-            200,
+            SpawnOptions {
+                id: 11,
+                argv: &["/bin/zsh".to_string(), "-f".to_string(), "-i".to_string()],
+                cwd: Path::new("/tmp"),
+                size: TermSize::new(80, 24),
+                cell: (8, 16),
+                scrollback: 200,
+                session_key: "test-key".to_string(),
+            },
             crate::term::UiSender::Channel(tx),
         )
         .expect("zsh を起動できる");
@@ -636,12 +660,15 @@ mod clear_tests {
         }
         let (tx, _rx) = channel();
         let spawned = spawn(
-            21,
-            &["/bin/zsh".to_string(), "-f".to_string(), "-i".to_string()],
-            Path::new("/tmp"),
-            TermSize::new(80, 10),
-            (8, 16),
-            500,
+            SpawnOptions {
+                id: 21,
+                argv: &["/bin/zsh".to_string(), "-f".to_string(), "-i".to_string()],
+                cwd: Path::new("/tmp"),
+                size: TermSize::new(80, 10),
+                cell: (8, 16),
+                scrollback: 500,
+                session_key: "test-key".to_string(),
+            },
             crate::term::UiSender::Channel(tx),
         )
         .expect("zsh を起動できる");
@@ -727,17 +754,20 @@ mod mode_tests {
         }
         let (tx, _rx) = channel();
         let spawned = spawn(
-            31,
-            &[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "printf '\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1004h\\033[?1006h'; sleep 5"
-                    .to_string(),
-            ],
-            Path::new("/tmp"),
-            TermSize::new(80, 24),
-            (8, 16),
-            100,
+            SpawnOptions {
+                id: 31,
+                argv: &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf '\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1004h\\033[?1006h'; sleep 5"
+                        .to_string(),
+                ],
+                cwd: Path::new("/tmp"),
+                size: TermSize::new(80, 24),
+                cell: (8, 16),
+                scrollback: 100,
+                session_key: "test-key".to_string(),
+            },
             crate::term::UiSender::Channel(tx),
         )
         .expect("起動できる");
@@ -777,16 +807,19 @@ mod mode_tests {
         }
         let (tx, _rx) = channel();
         let spawned = spawn(
-            33,
-            &[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "printf '\\033[?1000h\\033[?1006h'; sleep 5".to_string(),
-            ],
-            Path::new("/tmp"),
-            TermSize::new(80, 24),
-            (8, 16),
-            100,
+            SpawnOptions {
+                id: 33,
+                argv: &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf '\\033[?1000h\\033[?1006h'; sleep 5".to_string(),
+                ],
+                cwd: Path::new("/tmp"),
+                size: TermSize::new(80, 24),
+                cell: (8, 16),
+                scrollback: 100,
+                session_key: "test-key".to_string(),
+            },
             crate::term::UiSender::Channel(tx),
         )
         .expect("起動できる");
@@ -819,16 +852,19 @@ mod mode_tests {
         }
         let (tx, _rx) = channel();
         let spawned = spawn(
-            32,
-            &[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "printf '\\033[?1049h'; sleep 5".to_string(),
-            ],
-            Path::new("/tmp"),
-            TermSize::new(80, 24),
-            (8, 16),
-            100,
+            SpawnOptions {
+                id: 32,
+                argv: &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf '\\033[?1049h'; sleep 5".to_string(),
+                ],
+                cwd: Path::new("/tmp"),
+                size: TermSize::new(80, 24),
+                cell: (8, 16),
+                scrollback: 100,
+                session_key: "test-key".to_string(),
+            },
             crate::term::UiSender::Channel(tx),
         )
         .expect("起動できる");

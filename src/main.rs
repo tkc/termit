@@ -45,7 +45,10 @@ use crate::session::{Manager, RunState};
 use crate::term::{TermSize, UiEvent};
 use crate::theme::Theme;
 
+/// 履歴の一覧で一度に見える行数。
 const SEARCH_ROWS: usize = 10;
+/// 履歴を遡れる件数。これを超えた分は出さない。
+const SEARCH_LIMIT: usize = 500;
 
 /// 押したキーを記録する。キーバインドが届かないときの切り分けに使う。
 /// `TEX_KEYLOG` に書き出し先を指定したときだけ動く。
@@ -172,6 +175,19 @@ pub(crate) struct SearchState {
     pub(crate) scope: Scope,
     pub(crate) results: Vec<Entry>,
     pub(crate) selected: usize,
+    /// 一覧の先頭に出している位置。選んでいる行が外へ出ないよう追う。
+    pub(crate) offset: usize,
+}
+
+impl SearchState {
+    /// 選んでいる行が見える範囲に入るよう、出す位置を合わせる。
+    fn follow(&mut self) {
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + SEARCH_ROWS {
+            self.offset = self.selected + 1 - SEARCH_ROWS;
+        }
+    }
 }
 
 pub(crate) struct State {
@@ -804,9 +820,11 @@ impl App {
                 state.find = None;
                 state.search = Some(SearchState {
                     query: String::new(),
-                    scope: Scope::All,
+                    // まずはこのセッションの中を遡る。他へ広げるのは ^R の押し直し。
+                    scope: Scope::Session,
                     results: Vec::new(),
                     selected: 0,
+                    offset: 0,
                 });
                 self.refresh_search();
             }
@@ -1338,6 +1356,7 @@ impl App {
             Key::Named(NamedKey::ArrowDown) => {
                 if !search.results.is_empty() {
                     search.selected = (search.selected + 1) % search.results.len();
+                    search.follow();
                 }
                 return;
             }
@@ -1345,6 +1364,22 @@ impl App {
                 if !search.results.is_empty() {
                     let n = search.results.len();
                     search.selected = (search.selected + n - 1) % n;
+                    search.follow();
+                }
+                return;
+            }
+            Key::Named(NamedKey::PageDown) => {
+                if !search.results.is_empty() {
+                    let n = search.results.len();
+                    search.selected = (search.selected + SEARCH_ROWS).min(n - 1);
+                    search.follow();
+                }
+                return;
+            }
+            Key::Named(NamedKey::PageUp) => {
+                if !search.results.is_empty() {
+                    search.selected = search.selected.saturating_sub(SEARCH_ROWS);
+                    search.follow();
                 }
                 return;
             }
@@ -1373,20 +1408,21 @@ impl App {
 
     fn refresh_search(&mut self) {
         let Some(state) = &mut self.state else { return };
-        let (session_id, cwd) = match state.manager.selected() {
-            Some(s) => (s.id, s.cwd.to_string_lossy().to_string()),
-            None => (0, String::new()),
+        let (key, cwd) = match state.manager.selected() {
+            Some(s) => (s.key.clone(), s.cwd.to_string_lossy().to_string()),
+            None => (String::new(), String::new()),
         };
         let Some(search) = &mut state.search else {
             return;
         };
         search.results = match &state.history {
             Some(h) => h
-                .search(&search.query, search.scope, session_id, &cwd, SEARCH_ROWS)
+                .search(&search.query, search.scope, &key, &cwd, SEARCH_LIMIT)
                 .unwrap_or_default(),
             None => Vec::new(),
         };
         search.selected = 0;
+        search.offset = 0;
     }
 
     // ---------------------------------------------------------------- 描画
@@ -1469,7 +1505,7 @@ impl App {
 
     fn refresh_recent(&mut self) {
         let Some(state) = &mut self.state else { return };
-        let Some(id) = state.manager.selected().map(|s| s.id) else {
+        let Some((id, key)) = state.manager.selected().map(|s| (s.id, s.key.clone())) else {
             state.recent.clear();
             return;
         };
@@ -1477,7 +1513,7 @@ impl App {
             return;
         }
         state.recent = match &state.history {
-            Some(h) => h.recent(id, 10).unwrap_or_default(),
+            Some(h) => h.recent(&key, 10).unwrap_or_default(),
             None => Vec::new(),
         };
         state.recent_for = Some(id);
@@ -2157,11 +2193,22 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
     }
 
     if let Some(search) = &state.search {
-        let results: Vec<crate::history::Entry> =
-            search.results.iter().take(SEARCH_ROWS).cloned().collect();
-        let sel = search.selected;
+        // 見えるのは一部で、選択を動かすと窓が付いてくる。
+        let results: Vec<crate::history::Entry> = search
+            .results
+            .iter()
+            .skip(search.offset)
+            .take(SEARCH_ROWS)
+            .cloned()
+            .collect();
+        let sel = search.selected.saturating_sub(search.offset);
         let scope = search.scope.label().to_string();
         let query = search.query.clone();
+        let position = if search.results.is_empty() {
+            String::new()
+        } else {
+            format!("{}/{}", search.selected + 1, search.results.len())
+        };
         let top = overlay(state, results.len());
         for (i, entry) in results.iter().enumerate() {
             let ry = top + i as f32 * line_h;
@@ -2199,6 +2246,18 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
             .renderer
             .fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
         state.cursor_px = Some((x, ty));
+        // 何件目を見ているかと、範囲の切り替え方を右端に出す。
+        let note = if position.is_empty() {
+            "^R scope   Esc close".to_string()
+        } else {
+            format!("{position}   ↑↓ move   ⇞⇟ page   ^R scope   Esc close")
+        };
+        let nw = state.renderer.measure_px(&note, st);
+        if x0 + w - pad - nw > x + pad {
+            state
+                .renderer
+                .put_text_px(x0 + w - pad - nw, ty, &note, st, theme.fg_tertiary);
+        }
         return;
     }
 
@@ -2269,6 +2328,61 @@ mod tests {
     fn 括弧付き貼り付けに印を付ける() {
         let got = bracketed("x", TermMode::BRACKETED_PASTE);
         assert_eq!(got, b"\x1b[200~x\x1b[201~");
+    }
+}
+
+#[cfg(test)]
+mod search_view_tests {
+    use super::*;
+
+    fn view(selected: usize, offset: usize) -> SearchState {
+        SearchState {
+            query: String::new(),
+            scope: Scope::Session,
+            results: Vec::new(),
+            selected,
+            offset,
+        }
+    }
+
+    #[test]
+    fn 見える範囲の中なら位置を動かさない() {
+        let mut v = view(3, 0);
+        v.follow();
+        assert_eq!(v.offset, 0);
+    }
+
+    #[test]
+    fn 下へ出たら窓が付いてくる() {
+        let mut v = view(SEARCH_ROWS, 0);
+        v.follow();
+        assert_eq!(v.offset, 1, "1 行ぶんだけ送る");
+
+        let mut v = view(499, 0);
+        v.follow();
+        assert_eq!(v.offset, 499 + 1 - SEARCH_ROWS);
+    }
+
+    #[test]
+    fn 上へ出たら窓が戻る() {
+        let mut v = view(2, 10);
+        v.follow();
+        assert_eq!(v.offset, 2);
+    }
+
+    #[test]
+    fn 選んだ行はつねに見える範囲に入る() {
+        for selected in 0..600usize {
+            for offset in [0usize, 5, 100, 590] {
+                let mut v = view(selected, offset);
+                v.follow();
+                assert!(
+                    v.offset <= selected && selected < v.offset + SEARCH_ROWS,
+                    "selected={selected} offset={offset} -> {}",
+                    v.offset
+                );
+            }
+        }
     }
 }
 

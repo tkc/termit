@@ -23,12 +23,15 @@ pub fn run() {
     let (tx, rx) = channel();
     let size = TermSize::new(80, 24);
     let spawned = match pty::spawn(
-        1,
-        &["/bin/cat".to_string()],
-        Path::new("/"),
-        size,
-        (8, 16),
-        1000,
+        pty::SpawnOptions {
+            id: 1,
+            argv: &["/bin/cat".to_string()],
+            cwd: Path::new("/"),
+            size,
+            cell: (8, 16),
+            scrollback: 1000,
+            session_key: "latency-test".to_string(),
+        },
         UiSender::Channel(tx),
     ) {
         Ok(s) => s,

@@ -7,7 +7,7 @@ use std::time::UNIX_EPOCH;
 
 use rusqlite::{params, Connection};
 
-use crate::session::{CommandRecord, SessionId};
+use crate::session::CommandRecord;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -82,6 +82,7 @@ impl History {
             "CREATE TABLE IF NOT EXISTS command (
                id          INTEGER PRIMARY KEY,
                session_id  INTEGER NOT NULL,
+               session_key TEXT,
                agent_id    TEXT,
                cwd         TEXT NOT NULL,
                command     TEXT NOT NULL,
@@ -91,6 +92,20 @@ impl History {
              );
              CREATE INDEX IF NOT EXISTS idx_command_started ON command(started_at DESC);
              CREATE INDEX IF NOT EXISTS idx_command_session ON command(session_id, started_at DESC);",
+        )?;
+        // 先に作られた表には session_key が無い。あとから足す。
+        // セッションの鍵は再起動をまたいで残るので、以前の並びも辿れる。
+        let has_key = self
+            .conn
+            .prepare("SELECT session_key FROM command LIMIT 1")
+            .is_ok();
+        if !has_key {
+            self.conn
+                .execute("ALTER TABLE command ADD COLUMN session_key TEXT", [])?;
+        }
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_command_key
+               ON command(session_key, started_at DESC);",
         )
     }
 
@@ -101,10 +116,12 @@ impl History {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         self.conn.execute(
-            "INSERT INTO command (session_id, agent_id, cwd, command, exit_code, started_at, duration_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO command
+               (session_id, session_key, agent_id, cwd, command, exit_code, started_at, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 r.session_id,
+                r.session_key,
                 r.agent_id,
                 r.cwd,
                 r.command,
@@ -121,14 +138,14 @@ impl History {
         &self,
         query: &str,
         scope: Scope,
-        session_id: SessionId,
+        session_key: &str,
         cwd: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<Entry>> {
         let pattern = format!("%{}%", escape_like(query));
         let (cond, extra): (&str, Vec<&dyn rusqlite::ToSql>) = match scope {
             Scope::All => ("", vec![]),
-            Scope::Session => ("AND session_id = ?4", vec![&session_id]),
+            Scope::Session => ("AND session_key = ?4", vec![&session_key]),
             Scope::Cwd => ("AND cwd = ?4", vec![&cwd]),
         };
         let sql = format!(
@@ -157,13 +174,13 @@ impl History {
     }
 
     /// 左ペインの下段に出す、そのセッションの直近のコマンド。
-    pub fn recent(&self, session_id: SessionId, limit: usize) -> rusqlite::Result<Vec<Entry>> {
+    pub fn recent(&self, session_key: &str, limit: usize) -> rusqlite::Result<Vec<Entry>> {
         let mut stmt = self.conn.prepare(
             "SELECT command, cwd, exit_code, duration_ms, started_at
-             FROM command WHERE session_id = ?1
+             FROM command WHERE session_key = ?1
              ORDER BY started_at DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+        let rows = stmt.query_map(params![session_key, limit as i64], |row| {
             Ok(Entry {
                 command: row.get(0)?,
                 cwd: row.get(1)?,
@@ -185,11 +202,13 @@ fn escape_like(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionId;
     use std::time::Duration;
 
     fn rec(session: SessionId, cwd: &str, cmd: &str, code: i32, at: u64) -> CommandRecord {
         CommandRecord {
             session_id: session,
+            session_key: format!("key-{session}"),
             agent_id: None,
             cwd: cwd.into(),
             command: cmd.into(),
@@ -211,7 +230,7 @@ mod tests {
     #[test]
     fn 部分一致で絞り込む() {
         let h = seeded();
-        let got = h.search("cargo", Scope::All, 1, "/a", 10).unwrap();
+        let got = h.search("cargo", Scope::All, "key-1", "/a", 10).unwrap();
         let cmds: Vec<_> = got.iter().map(|e| e.command.as_str()).collect();
         assert_eq!(cmds, vec!["cargo clippy", "cargo test", "cargo build"]);
     }
@@ -219,7 +238,7 @@ mod tests {
     #[test]
     fn 新しい順に返す() {
         let h = seeded();
-        let got = h.search("", Scope::All, 1, "/a", 10).unwrap();
+        let got = h.search("", Scope::All, "key-1", "/a", 10).unwrap();
         assert_eq!(got[0].command, "cargo clippy");
         assert_eq!(got.last().unwrap().command, "cargo build");
     }
@@ -227,7 +246,7 @@ mod tests {
     #[test]
     fn セッションで範囲を絞る() {
         let h = seeded();
-        let got = h.search("", Scope::Session, 2, "/a", 10).unwrap();
+        let got = h.search("", Scope::Session, "key-2", "/a", 10).unwrap();
         let cmds: Vec<_> = got.iter().map(|e| e.command.as_str()).collect();
         assert_eq!(cmds, vec!["cargo clippy", "git status"]);
     }
@@ -235,7 +254,7 @@ mod tests {
     #[test]
     fn 作業ディレクトリで範囲を絞る() {
         let h = seeded();
-        let got = h.search("", Scope::Cwd, 1, "/a", 10).unwrap();
+        let got = h.search("", Scope::Cwd, "key-1", "/a", 10).unwrap();
         let cmds: Vec<_> = got.iter().map(|e| e.command.as_str()).collect();
         assert_eq!(cmds, vec!["cargo test", "cargo build"]);
     }
@@ -245,7 +264,7 @@ mod tests {
         let h = History::open_memory().unwrap();
         h.record(&rec(1, "/a", "ls", 0, 1000)).unwrap();
         h.record(&rec(1, "/a", "ls", 0, 5000)).unwrap();
-        let got = h.search("ls", Scope::All, 1, "/a", 10).unwrap();
+        let got = h.search("ls", Scope::All, "key-1", "/a", 10).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].started_at, 5000);
     }
@@ -255,7 +274,7 @@ mod tests {
         let h = History::open_memory().unwrap();
         h.record(&rec(1, "/a", "echo 100%", 0, 1000)).unwrap();
         h.record(&rec(1, "/a", "ls", 0, 2000)).unwrap();
-        let got = h.search("%", Scope::All, 1, "/a", 10).unwrap();
+        let got = h.search("%", Scope::All, "key-1", "/a", 10).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].command, "echo 100%");
     }
@@ -263,9 +282,73 @@ mod tests {
     #[test]
     fn 直近の履歴をセッションごとに返す() {
         let h = seeded();
-        let got = h.recent(1, 10).unwrap();
+        let got = h.recent("key-1", 10).unwrap();
         let cmds: Vec<_> = got.iter().map(|e| e.command.as_str()).collect();
         assert_eq!(cmds, vec!["cargo test", "cargo build"]);
+    }
+
+    /// 再起動をまたいでも、同じ鍵なら同じ履歴が見えることを確かめる。
+    /// 通し番号は起動のたびに振り直されるので、鍵で辿る必要がある。
+    #[test]
+    fn 鍵が同じなら通し番号が変わっても辿れる() {
+        let h = History::open_memory().unwrap();
+        // 1 回目の起動。通し番号は 1。
+        h.record(&CommandRecord {
+            session_id: 1,
+            session_key: "same-key".into(),
+            agent_id: None,
+            cwd: "/a".into(),
+            command: "before restart".into(),
+            exit_code: Some(0),
+            started_at: UNIX_EPOCH + Duration::from_millis(1000),
+            duration_ms: None,
+        })
+        .unwrap();
+        // 2 回目の起動。作り直されて通し番号は 7 になったが、鍵は同じ。
+        h.record(&CommandRecord {
+            session_id: 7,
+            session_key: "same-key".into(),
+            agent_id: None,
+            cwd: "/a".into(),
+            command: "after restart".into(),
+            exit_code: Some(0),
+            started_at: UNIX_EPOCH + Duration::from_millis(2000),
+            duration_ms: None,
+        })
+        .unwrap();
+        // 別のセッション。
+        h.record(&rec(9, "/b", "other session", 0, 3000)).unwrap();
+
+        let got = h.recent("same-key", 100).unwrap();
+        let cmds: Vec<_> = got.iter().map(|e| e.command.as_str()).collect();
+        assert_eq!(cmds, vec!["after restart", "before restart"]);
+
+        let got = h.search("", Scope::Session, "same-key", "/a", 500).unwrap();
+        let cmds: Vec<_> = got.iter().map(|e| e.command.as_str()).collect();
+        assert_eq!(cmds, vec!["after restart", "before restart"]);
+    }
+
+    /// 遡れる件数まで返し、それを超えた分は返さないことを確かめる。
+    #[test]
+    fn 上限まで遡れる() {
+        let h = History::open_memory().unwrap();
+        for i in 0..600 {
+            h.record(&CommandRecord {
+                session_id: 1,
+                session_key: "k".into(),
+                agent_id: None,
+                cwd: "/a".into(),
+                command: format!("cmd {i:04}"),
+                exit_code: Some(0),
+                started_at: UNIX_EPOCH + Duration::from_millis(1000 + i as u64),
+                duration_ms: None,
+            })
+            .unwrap();
+        }
+        let got = h.search("", Scope::Session, "k", "/a", 500).unwrap();
+        assert_eq!(got.len(), 500, "上限まで返る");
+        assert_eq!(got[0].command, "cmd 0599", "新しいものから並ぶ");
+        assert_eq!(got[499].command, "cmd 0100");
     }
 
     #[test]
