@@ -108,6 +108,7 @@ pub fn run(out_path: &str) {
         theme,
         sidebar: true,
         search: None,
+        picker: None,
         mods: Default::default(),
         status: None,
         recent: Vec::new(),
@@ -130,6 +131,33 @@ pub fn run(out_path: &str) {
         term_cols,
         term_rows,
     };
+
+    // 重ねた一覧の描画も確かめられるようにする。
+    match std::env::var("TEX_PROBE_OVERLAY").as_deref() {
+        Ok("picker") => {
+            state.picker = Some(crate::PickerState {
+                names: vec!["host".into(), "sandbox".into(), "no-network".into()],
+                selected: 1,
+            })
+        }
+        Ok("search") => {
+            let results = state
+                .history
+                .as_ref()
+                .map(|h| {
+                    h.search("", crate::history::Scope::All, 1, "", 10)
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            state.search = Some(crate::SearchState {
+                query: "car".into(),
+                scope: crate::history::Scope::All,
+                results,
+                selected: 0,
+            });
+        }
+        _ => {}
+    }
 
     state.renderer.begin();
     crate::draw_sidebar(&mut state, &layout, &theme);

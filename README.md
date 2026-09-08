@@ -23,7 +23,7 @@ cargo build --release
 |---|---|
 | `Ctrl+Shift+N` | 新規セッション |
 | `Ctrl+Shift+F` | 選択中セッションを分岐 |
-| `Ctrl+Shift+S` | サンドボックスのプロファイルへ分岐 |
+| `Ctrl+Shift+S` | プロファイルを選んで分岐（`j`/`k` か数字で選び Enter） |
 | `Ctrl+Shift+J` / `K` | 左ペインの選択を下 / 上へ |
 | `Ctrl+Shift+W` | セッションを終了（停止済みなら一覧から外す） |
 | `Ctrl+R` | コマンド履歴を検索 |
@@ -33,6 +33,8 @@ cargo build --release
 | `Shift+PageUp` / `PageDown` | スクロール |
 
 これ以外のキーはすべて子プロセスへ渡す。
+キーの照合には修飾を外したキーを使うので、Ctrl を押した時点で論理キーが
+制御文字になる環境でも組み合わせが届く。
 
 ## シェル統合
 

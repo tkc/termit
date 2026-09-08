@@ -23,6 +23,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowId};
 
 use crate::config::{Config, HOST_PROFILE};
@@ -76,11 +77,17 @@ fn main() {
     }
 }
 
-struct SearchState {
-    query: String,
-    scope: Scope,
-    results: Vec<Entry>,
-    selected: usize,
+/// 重ねて出すプロファイルの一覧。
+pub(crate) struct PickerState {
+    pub(crate) names: Vec<String>,
+    pub(crate) selected: usize,
+}
+
+pub(crate) struct SearchState {
+    pub(crate) query: String,
+    pub(crate) scope: Scope,
+    pub(crate) results: Vec<Entry>,
+    pub(crate) selected: usize,
 }
 
 pub(crate) struct State {
@@ -90,6 +97,7 @@ pub(crate) struct State {
     theme: Theme,
     sidebar: bool,
     search: Option<SearchState>,
+    picker: Option<PickerState>,
     mods: ModifiersState,
     status: Option<String>,
     recent: Vec<Entry>,
@@ -176,6 +184,7 @@ impl ApplicationHandler<UiEvent> for App {
             theme: Theme::default(),
             sidebar: true,
             search: None,
+            picker: None,
             mods: ModifiersState::empty(),
             status: None,
             recent: Vec::new(),
@@ -303,17 +312,27 @@ impl App {
         let Some(state) = &mut self.state else { return };
         let mods = state.mods;
         let key = event.logical_key.clone();
+        // 修飾を外したキー。Ctrl を押すと logical_key が制御文字になる環境が
+        // あるため、キーバインドの照合と制御文字への変換はこちらを使う。
+        let base = event.key_without_modifiers();
 
-        // 検索中はすべてのキーを検索欄が受ける。
+        // 重ねた一覧が開いているあいだは、すべてのキーをそちらが受ける。
+        if state.picker.is_some() {
+            self.on_picker_key(&base, mods);
+            if let Some(s) = &self.state {
+                s.request_redraw();
+            }
+            return;
+        }
         if state.search.is_some() {
-            self.on_search_key(&key, &event, mods);
+            self.on_search_key(&base, &event, mods);
             if let Some(s) = &self.state {
                 s.request_redraw();
             }
             return;
         }
 
-        if let Some(action) = input::action_for(&key, mods) {
+        if let Some(action) = input::action_for(&base, mods) {
             self.on_action(action, event_loop);
             if let Some(s) = &self.state {
                 s.request_redraw();
@@ -325,7 +344,7 @@ impl App {
             return;
         };
         let mode = *session.term.lock().mode();
-        if let Some(bytes) = input::encode(&key, event.text.as_deref(), mods, mode) {
+        if let Some(bytes) = input::encode(&key, &base, event.text.as_deref(), mods, mode) {
             // 入力があったら最下部へ戻す。
             session
                 .term
@@ -360,20 +379,13 @@ impl App {
                 }
             }
             Action::ForkWithProfile => {
-                // host 以外の最初のプロファイルへ分岐する。
                 let names = config.profile_names();
-                let target = names.iter().find(|n| n.as_str() != HOST_PROFILE).cloned();
-                match target {
-                    Some(p) => {
-                        let i = state.manager.selected_index();
-                        if let Err(e) = state.manager.fork(&config, i, Some(&p)) {
-                            state.status = Some(e.to_string());
-                        }
-                    }
-                    None => {
-                        state.status =
-                            Some("設定に host 以外のプロファイルがない".into())
-                    }
+                if names.len() < 2 {
+                    state.status =
+                        Some("設定に host 以外のプロファイルがない".into());
+                } else {
+                    state.search = None;
+                    state.picker = Some(PickerState { names, selected: 1 });
                 }
             }
             Action::SelectNext => state.manager.select_next(),
@@ -390,6 +402,7 @@ impl App {
                 return;
             }
             Action::SearchHistory => {
+                state.picker = None;
                 state.search = Some(SearchState {
                     query: String::new(),
                     scope: Scope::All,
@@ -442,6 +455,45 @@ impl App {
                         .scroll_display(alacritty_terminal::grid::Scroll::PageDown);
                 }
             }
+        }
+    }
+
+    fn on_picker_key(&mut self, key: &Key, _mods: ModifiersState) {
+        let config = self.config.clone();
+        let Some(state) = &mut self.state else { return };
+        let Some(picker) = &mut state.picker else {
+            return;
+        };
+        let n = picker.names.len();
+        match key {
+            Key::Named(NamedKey::Escape) => state.picker = None,
+            Key::Named(NamedKey::ArrowDown) => picker.selected = (picker.selected + 1) % n,
+            Key::Named(NamedKey::ArrowUp) => picker.selected = (picker.selected + n - 1) % n,
+            Key::Named(NamedKey::Enter) => {
+                let name = picker.names[picker.selected].clone();
+                state.picker = None;
+                let i = state.manager.selected_index();
+                if let Err(e) = state.manager.fork(&config, i, Some(&name)) {
+                    state.status = Some(e.to_string());
+                }
+            }
+            Key::Character(c) => match c.as_str() {
+                "j" => picker.selected = (picker.selected + 1) % n,
+                "k" => picker.selected = (picker.selected + n - 1) % n,
+                d if d.len() == 1 && d.chars().next().unwrap().is_ascii_digit() => {
+                    let i = d.chars().next().unwrap().to_digit(10).unwrap() as usize;
+                    if i >= 1 && i <= n {
+                        let name = picker.names[i - 1].clone();
+                        state.picker = None;
+                        let idx = state.manager.selected_index();
+                        if let Err(e) = state.manager.fork(&config, idx, Some(&name)) {
+                            state.status = Some(e.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
         }
     }
 
@@ -794,6 +846,35 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
 
 pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
     let y = layout.rows.saturating_sub(1);
+    if let Some(picker) = &state.picker {
+        let n = picker.names.len();
+        let top = y.saturating_sub(n);
+        let x0 = layout.term_col;
+        let w = layout.term_cols;
+        state.renderer.fill_cells(x0, top, w, n + 1, theme.sidebar_bg);
+        let names = picker.names.clone();
+        let sel = picker.selected;
+        for (i, name) in names.iter().enumerate() {
+            let row = top + i;
+            if i == sel {
+                state.renderer.fill_cells(x0, row, w, 1, theme.sidebar_sel);
+            }
+            let fg = if i == sel { theme.fg } else { theme.sidebar_fg };
+            let label = format!("{}  {}", i + 1, name);
+            state
+                .renderer
+                .put_str_clipped(x0 + 2, row, &label, w.saturating_sub(3), fg);
+        }
+        state.renderer.fill_cells(x0, y, w, 1, theme.sidebar_sel);
+        state.renderer.put_str_clipped(
+            x0 + 1,
+            y,
+            "分岐先のプロファイル: j/k または数字で選び Enter、Esc で取り消し",
+            w.saturating_sub(2),
+            theme.fg,
+        );
+        return;
+    }
     if let Some(search) = &state.search {
         let n = search.results.len().min(SEARCH_ROWS);
         let top = y.saturating_sub(n);

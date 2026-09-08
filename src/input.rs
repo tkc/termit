@@ -25,6 +25,9 @@ pub enum Action {
 }
 
 /// 横取りする組み合わせかを判定する。
+///
+/// 渡すのは修飾を外したキーである。macOS では Ctrl を押した時点で
+/// `logical_key` が制御文字になることがあり、文字で照合できない。
 pub fn action_for(key: &Key, mods: ModifiersState) -> Option<Action> {
     let ctrl = mods.control_key();
     let shift = mods.shift_key();
@@ -54,8 +57,13 @@ pub fn action_for(key: &Key, mods: ModifiersState) -> Option<Action> {
 }
 
 /// キーを PTY へ送るバイト列へ変換する。送るものがなければ `None`。
+///
+/// `base` は修飾を外したキーである。Ctrl と組み合わせたとき、
+/// `logical_key` が制御文字そのものを返す環境があるため、
+/// 制御文字への変換はこちらを使う。
 pub fn encode(
     key: &Key,
+    base: &Key,
     text: Option<&str>,
     mods: ModifiersState,
     mode: TermMode,
@@ -104,8 +112,11 @@ pub fn encode(
         },
         Key::Character(c) => {
             if ctrl {
-                let byte = control_byte(c)?;
-                vec![byte]
+                let source = match base {
+                    Key::Character(b) => b.as_str(),
+                    _ => c.as_str(),
+                };
+                vec![control_byte(source)?]
             } else {
                 text.or(Some(c.as_str()))?.as_bytes().to_vec()
             }
@@ -167,7 +178,7 @@ mod tests {
     #[test]
     fn 印字可能な文字をそのまま送る() {
         assert_eq!(
-            encode(&ch("a"), Some("a"), NONE, TermMode::empty()).unwrap(),
+            encode(&ch("a"), &ch("a"), Some("a"), NONE, TermMode::empty()).unwrap(),
             b"a"
         );
     }
@@ -175,7 +186,7 @@ mod tests {
     #[test]
     fn 日本語の確定文字列を送る() {
         assert_eq!(
-            encode(&ch("あ"), Some("あ"), NONE, TermMode::empty()).unwrap(),
+            encode(&ch("あ"), &ch("あ"), Some("あ"), NONE, TermMode::empty()).unwrap(),
             "あ".as_bytes()
         );
     }
@@ -183,23 +194,23 @@ mod tests {
     #[test]
     fn ctrl_と英字を制御文字へ落とす() {
         let m = ModifiersState::CONTROL;
-        assert_eq!(encode(&ch("c"), None, m, TermMode::empty()).unwrap(), vec![0x03]);
-        assert_eq!(encode(&ch("d"), None, m, TermMode::empty()).unwrap(), vec![0x04]);
-        assert_eq!(encode(&ch("a"), None, m, TermMode::empty()).unwrap(), vec![0x01]);
+        assert_eq!(encode(&ch("\u{3}"), &ch("c"), None, m, TermMode::empty()).unwrap(), vec![0x03]);
+        assert_eq!(encode(&ch("\u{4}"), &ch("d"), None, m, TermMode::empty()).unwrap(), vec![0x04]);
+        assert_eq!(encode(&ch("\u{1}"), &ch("a"), None, m, TermMode::empty()).unwrap(), vec![0x01]);
     }
 
     #[test]
     fn ctrl_と記号を制御文字へ落とす() {
         let m = ModifiersState::CONTROL;
-        assert_eq!(encode(&ch("["), None, m, TermMode::empty()).unwrap(), vec![0x1b]);
-        assert_eq!(encode(&ch(" "), None, m, TermMode::empty()).unwrap(), vec![0x00]);
+        assert_eq!(encode(&ch("\u{1b}"), &ch("["), None, m, TermMode::empty()).unwrap(), vec![0x1b]);
+        assert_eq!(encode(&ch("\0"), &ch(" "), None, m, TermMode::empty()).unwrap(), vec![0x00]);
     }
 
     #[test]
     fn alt_は_esc_を前置する() {
         let m = ModifiersState::ALT;
         assert_eq!(
-            encode(&ch("b"), Some("b"), m, TermMode::empty()).unwrap(),
+            encode(&ch("b"), &ch("b"), Some("b"), m, TermMode::empty()).unwrap(),
             vec![0x1b, b'b']
         );
     }
@@ -207,7 +218,7 @@ mod tests {
     #[test]
     fn backspace_は_0x7f_を送る() {
         assert_eq!(
-            encode(&named(NamedKey::Backspace), None, NONE, TermMode::empty()).unwrap(),
+            encode(&named(NamedKey::Backspace), &named(NamedKey::Backspace), None, NONE, TermMode::empty()).unwrap(),
             vec![0x7f]
         );
     }
@@ -215,7 +226,7 @@ mod tests {
     #[test]
     fn delete_は_csi_3_チルダを送る() {
         assert_eq!(
-            encode(&named(NamedKey::Delete), None, NONE, TermMode::empty()).unwrap(),
+            encode(&named(NamedKey::Delete), &named(NamedKey::Delete), None, NONE, TermMode::empty()).unwrap(),
             b"\x1b[3~"
         );
     }
@@ -223,11 +234,11 @@ mod tests {
     #[test]
     fn 矢印はカーソルモードで形が変わる() {
         assert_eq!(
-            encode(&named(NamedKey::ArrowUp), None, NONE, TermMode::empty()).unwrap(),
+            encode(&named(NamedKey::ArrowUp), &named(NamedKey::ArrowUp), None, NONE, TermMode::empty()).unwrap(),
             b"\x1b[A"
         );
         assert_eq!(
-            encode(&named(NamedKey::ArrowUp), None, NONE, TermMode::APP_CURSOR).unwrap(),
+            encode(&named(NamedKey::ArrowUp), &named(NamedKey::ArrowUp), None, NONE, TermMode::APP_CURSOR).unwrap(),
             b"\x1bOA"
         );
     }
@@ -235,8 +246,21 @@ mod tests {
     #[test]
     fn shift_tab_は逆タブを送る() {
         assert_eq!(
-            encode(&named(NamedKey::Tab), None, ModifiersState::SHIFT, TermMode::empty()).unwrap(),
+            encode(&named(NamedKey::Tab), &named(NamedKey::Tab), None, ModifiersState::SHIFT, TermMode::empty()).unwrap(),
             b"\x1b[Z"
+        );
+    }
+
+    #[test]
+    fn ctrl_で論理キーが制御文字になっても照合できる() {
+        // macOS では Ctrl+C の logical_key が "\u{3}" になることがある。
+        // 修飾を外したキーで照合するため、動作の判定は影響を受けない。
+        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(action_for(&ch("f"), cs), Some(Action::Fork));
+        assert_eq!(
+            encode(&ch("\u{3}"), &ch("c"), None, ModifiersState::CONTROL, TermMode::empty())
+                .unwrap(),
+            vec![0x03]
         );
     }
 

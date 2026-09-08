@@ -317,7 +317,7 @@ RECENT  fork-1
 |---|---|
 | `Ctrl+Shift+N` | 新規セッション（既定プロファイル） |
 | `Ctrl+Shift+F` | 選択中セッションを fork |
-| `Ctrl+Shift+S` | プロファイルを選んで fork |
+| `Ctrl+Shift+S` | プロファイルを選んで fork（一覧を重ねて出す） |
 | `Ctrl+Shift+J` / `K` | 左ペインの選択を下 / 上へ移動 |
 | `Ctrl+Shift+W` | 選択中セッションを終了 |
 | `Ctrl+R` | コマンド履歴検索 |
