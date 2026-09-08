@@ -144,27 +144,27 @@ impl App {
         let theme = Theme::default();
         let (cols, _rows) = renderer.grid_size();
         renderer.begin();
-        renderer.put_str(1, 0, "tex keytest — 押したキーが何として届くかを出す", theme.fg);
+        renderer.put_str(1, 0, "tex keytest — 押したキーが何として届くかを出す", theme.fg_primary);
         renderer.put_str(
             1,
             1,
             "動作の欄が — のままなら、その組み合わせは端末まで来ていない",
-            theme.sidebar_dim,
+            theme.fg_secondary,
         );
         let mut y = 3;
-        renderer.put_str(1, y, "この端末が奪う Ctrl の組み合わせ:", theme.sidebar_dim);
+        renderer.put_str(1, y, "この端末が奪う Ctrl の組み合わせ:", theme.fg_secondary);
         y += 1;
         for (keys, what) in input::STOLEN_CTRL_KEYS {
             renderer.put_str(3, y, keys, theme.accent);
-            renderer.put_str(8, y, what, theme.sidebar_fg);
+            renderer.put_str(8, y, what, theme.fg_secondary);
             y += 1;
         }
         y += 1;
-        renderer.put_str(1, y, "Cmd 側: ⌘N 新規 ⌘D fork ⌘E 選んで fork ⌘W 終了 ⌘[ ⌘] 選択 ⌘C ⌘V", theme.sidebar_dim);
+        renderer.put_str(1, y, "Cmd 側: ⌘N 新規 ⌘D fork ⌘E 選んで fork ⌘W 終了 ⌘[ ⌘] 選択 ⌘C ⌘V", theme.fg_secondary);
         y += 2;
 
         if self.rows.is_empty() {
-            renderer.put_str(1, y, "キーを押してください", theme.sidebar_dim);
+            renderer.put_str(1, y, "キーを押してください", theme.fg_tertiary);
         }
         let rows: Vec<(String, bool)> = self
             .rows
@@ -172,7 +172,7 @@ impl App {
             .map(|r| (r.text.clone(), r.matched))
             .collect();
         for (text, matched) in rows {
-            let color = if matched { theme.accent } else { theme.sidebar_fg };
+            let color = if matched { theme.accent } else { theme.fg_secondary };
             renderer.put_str_clipped(1, y, &text, cols.saturating_sub(2), color);
             y += 1;
         }

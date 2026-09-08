@@ -851,7 +851,7 @@ impl App {
                     layout.sidebar_cols,
                     row,
                     '│',
-                    theme.sidebar_dim,
+                    theme.fg_tertiary,
                     false,
                     false,
                 );
@@ -940,8 +940,8 @@ fn sidebar_hit(state: &State, layout: &Layout, col: usize, row: usize) -> Option
 pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
     let sl = sidebar_layout(state, layout);
     let w = sl.width;
-    state.renderer.fill_cells(0, 0, w, layout.rows, theme.sidebar_bg);
-    state.renderer.put_str(1, 0, "SESSIONS", theme.sidebar_dim);
+    state.renderer.fill_cells(0, 0, w, layout.rows, theme.chrome_bg);
+    state.renderer.put_str(1, 0, "SESSIONS", theme.fg_secondary);
     // 押せる目印。キーが効かない環境でもここから増やせる。
     state.renderer.put_str(sl.action_col, 0, "[+]", theme.accent);
 
@@ -953,19 +953,19 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         let s = &state.manager.sessions()[row.index];
         let is_selected = row.index == selected;
         if is_selected {
-            state.renderer.fill_cells(0, y, w, 1, theme.sidebar_sel);
+            state.renderer.fill_cells(0, y, w, 1, theme.surface);
         }
         let indent = row.depth * 2;
         let mut x = 1 + indent;
         if row.depth > 0 {
             state
                 .renderer
-                .put_char(x - 1, y, '└', theme.sidebar_dim, false, false);
+                .put_char(x - 1, y, '└', theme.fg_tertiary, false, false);
         }
         let fg = if s.is_running() {
-            theme.sidebar_fg
+            theme.fg_primary
         } else {
-            theme.sidebar_dim
+            theme.fg_tertiary
         };
         let mut label = s.title.clone();
         if !s.inherited && s.parent.is_some() {
@@ -981,7 +981,7 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         let _ = x;
         state
             .renderer
-            .put_char(sl.action_col, y, '×', theme.sidebar_dim, false, false);
+            .put_char(sl.action_col, y, '×', theme.fg_tertiary, false, false);
         match s.state {
             RunState::Running => {
                 state
@@ -989,7 +989,7 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
                     .put_char(sl.marker_col, y, '●', theme.accent, false, false);
             }
             RunState::Exited(code) => {
-                let c = if code == 0 { theme.sidebar_dim } else { theme.warn };
+                let c = if code == 0 { theme.fg_tertiary } else { theme.warn };
                 state
                     .renderer
                     .put_char(sl.marker_col, y, '○', c, false, false);
@@ -1003,7 +1003,7 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
     for x in 0..w {
         state
             .renderer
-            .put_char(x, sl.sep_row, '─', theme.sidebar_dim, false, false);
+            .put_char(x, sl.sep_row, '─', theme.fg_tertiary, false, false);
     }
     let title = state
         .manager
@@ -1012,13 +1012,13 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         .unwrap_or_default();
     state
         .renderer
-        .put_str(1, sl.sep_row + 1, "RECENT", theme.sidebar_dim);
+        .put_str(1, sl.sep_row + 1, "RECENT", theme.fg_secondary);
     state.renderer.put_str_clipped(
         8,
         sl.sep_row + 1,
         &title,
         w.saturating_sub(9),
-        theme.sidebar_dim,
+        theme.fg_tertiary,
     );
 
     let avail = layout.rows.saturating_sub(sl.list_top + 1);
@@ -1028,14 +1028,14 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
             sl.list_top,
             "シェル統合が未設定",
             w.saturating_sub(2),
-            theme.sidebar_dim,
+            theme.fg_tertiary,
         );
         return;
     }
     for (i, entry) in state.recent.iter().take(avail).enumerate() {
         let y = sl.list_top + i;
         let code = entry.exit_code.unwrap_or(0);
-        let marker_color = if code == 0 { theme.sidebar_dim } else { theme.warn };
+        let marker_color = if code == 0 { theme.fg_tertiary } else { theme.warn };
         state
             .renderer
             .put_str(1, y, &format!("{code:>3}"), marker_color);
@@ -1044,7 +1044,7 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
             y,
             &entry.command,
             w.saturating_sub(6),
-            theme.sidebar_fg,
+            theme.fg_secondary,
         );
     }
 }
@@ -1096,7 +1096,7 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
             fg = bg;
         }
         if selection.is_some_and(|s| s.contains(indexed.point)) {
-            std::mem::swap(&mut fg, &mut bg);
+            bg = theme.selection;
         }
         let wide = cell.flags.contains(Flags::WIDE_CHAR);
         if wide && indexed.point == cursor.point {
@@ -1157,27 +1157,31 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
         let top = y.saturating_sub(n);
         let x0 = layout.term_col;
         let w = layout.term_cols;
-        state.renderer.fill_cells(x0, top, w, n + 1, theme.sidebar_bg);
+        state.renderer.fill_cells(x0, top, w, n + 1, theme.chrome_bg);
         let names = picker.names.clone();
         let sel = picker.selected;
         for (i, name) in names.iter().enumerate() {
             let row = top + i;
             if i == sel {
-                state.renderer.fill_cells(x0, row, w, 1, theme.sidebar_sel);
+                state.renderer.fill_cells(x0, row, w, 1, theme.surface);
             }
-            let fg = if i == sel { theme.fg } else { theme.sidebar_fg };
+            let fg = if i == sel {
+                theme.fg_primary
+            } else {
+                theme.fg_secondary
+            };
             let label = format!("{}  {}", i + 1, name);
             state
                 .renderer
                 .put_str_clipped(x0 + 2, row, &label, w.saturating_sub(3), fg);
         }
-        state.renderer.fill_cells(x0, y, w, 1, theme.sidebar_sel);
+        state.renderer.fill_cells(x0, y, w, 1, theme.surface);
         state.renderer.put_str_clipped(
             x0 + 1,
             y,
             "分岐先のプロファイル: j/k または数字で選び Enter、Esc で取り消し",
             w.saturating_sub(2),
-            theme.fg,
+            theme.fg_primary,
         );
         return;
     }
@@ -1188,26 +1192,26 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
         let w = layout.term_cols;
         state
             .renderer
-            .fill_cells(x0, top, w, n + 1, theme.sidebar_bg);
+            .fill_cells(x0, top, w, n + 1, theme.chrome_bg);
         for (i, entry) in search.results.iter().take(n).enumerate() {
             let row = top + i;
             if i == search.selected {
-                state.renderer.fill_cells(x0, row, w, 1, theme.sidebar_sel);
+                state.renderer.fill_cells(x0, row, w, 1, theme.surface);
             }
             let fg = if i == search.selected {
-                theme.fg
+                theme.fg_primary
             } else {
-                theme.sidebar_fg
+                theme.fg_secondary
             };
             state
                 .renderer
                 .put_str_clipped(x0 + 2, row, &entry.command, w.saturating_sub(3), fg);
         }
         let prompt = format!("history[{}]: {}", search.scope.label(), search.query);
-        state.renderer.fill_cells(x0, y, w, 1, theme.sidebar_sel);
+        state.renderer.fill_cells(x0, y, w, 1, theme.surface);
         state
             .renderer
-            .put_str_clipped(x0 + 1, y, &prompt, w.saturating_sub(2), theme.fg);
+            .put_str_clipped(x0 + 1, y, &prompt, w.saturating_sub(2), theme.fg_primary);
         let cursor_x = x0 + 1 + prompt.chars().map(char_cols).sum::<usize>();
         if cursor_x < layout.cols {
             state
@@ -1221,7 +1225,7 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
         let msg = msg.clone();
         state
             .renderer
-            .fill_cells(layout.term_col, y, layout.term_cols, 1, theme.sidebar_bg);
+            .fill_cells(layout.term_col, y, layout.term_cols, 1, theme.chrome_bg);
         state.renderer.put_str_clipped(
             layout.term_col + 1,
             y,
@@ -1239,7 +1243,7 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
         y,
         hint,
         layout.term_cols.saturating_sub(2),
-        theme.sidebar_dim,
+        theme.fg_tertiary,
     );
 }
 

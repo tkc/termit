@@ -165,7 +165,7 @@ pub fn run(out_path: &str) {
     for row in 0..layout.rows {
         state
             .renderer
-            .put_char(layout.sidebar_cols, row, '│', theme.sidebar_dim, false, false);
+            .put_char(layout.sidebar_cols, row, '│', theme.fg_tertiary, false, false);
     }
     crate::draw_terminal(&mut state, &layout, &theme);
     crate::draw_bottom(&mut state, &layout, &theme);
