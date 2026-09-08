@@ -1438,7 +1438,6 @@ struct SidebarLayout {
     /// ⌘ の番号を置く桁。
     hint_col: usize,
     sep_row: usize,
-    list_top: usize,
 }
 
 const SIDEBAR_TOP: usize = 2;
@@ -1478,7 +1477,6 @@ fn sidebar_layout(state: &State, layout: &Layout) -> SidebarLayout {
         marker_col: width.saturating_sub(2),
         hint_col: width.saturating_sub(8),
         sep_row,
-        list_top: sep_row + 2,
     }
 }
 
@@ -1514,7 +1512,6 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
     let sl = sidebar_layout(state, layout);
     let w = sl.width;
     state.renderer.fill_cells(0, 0, w, layout.rows, theme.chrome_bg);
-    state.renderer.put_str(1, 0, "SESSIONS", theme.fg_secondary);
     // 押せる目印。キーが効かない環境でもここから増やせる。
     state
         .renderer
@@ -1632,7 +1629,9 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         }
     }
 
-    if sl.sep_row + 2 >= layout.rows {
+    // 直近のコマンド。何もなければ区切りごと出さない。
+    // 見出しを置かなくても、区切りの下にあることで何の一覧かは分かる。
+    if state.recent.is_empty() || sl.sep_row + 1 >= layout.rows {
         return;
     }
     for x in 0..w {
@@ -1640,35 +1639,10 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
             .renderer
             .put_char(x, sl.sep_row, '─', theme.fg_tertiary, false, false);
     }
-    let title = state
-        .manager
-        .selected()
-        .map(|s| s.title.clone())
-        .unwrap_or_default();
-    state
-        .renderer
-        .put_str(1, sl.sep_row + 1, "RECENT", theme.fg_secondary);
-    state.renderer.put_str_clipped(
-        8,
-        sl.sep_row + 1,
-        &title,
-        w.saturating_sub(9),
-        theme.fg_tertiary,
-    );
-
-    let avail = layout.rows.saturating_sub(sl.list_top + 1);
-    if state.recent.is_empty() && state.history.is_some() && avail > 0 {
-        state.renderer.put_str_clipped(
-            1,
-            sl.list_top,
-            "シェル統合が未設定",
-            w.saturating_sub(2),
-            theme.fg_tertiary,
-        );
-        return;
-    }
+    let list_top = sl.sep_row + 1;
+    let avail = layout.rows.saturating_sub(list_top + 1);
     for (i, entry) in state.recent.iter().take(avail).enumerate() {
-        let y = sl.list_top + i;
+        let y = list_top + i;
         let code = entry.exit_code.unwrap_or(0);
         let marker_color = if code == 0 { theme.fg_tertiary } else { theme.warn };
         state
