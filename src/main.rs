@@ -3,6 +3,7 @@
 mod bench;
 mod clipboard;
 mod latency;
+mod mouse;
 mod keytest;
 mod probe;
 mod config;
@@ -134,8 +135,12 @@ fn main() {
 struct MouseState {
     x: f32,
     y: f32,
-    /// 端末領域でドラッグ中か。
+    /// 端末領域でドラッグ中か（端末側の選択）。
     dragging: bool,
+    /// 端末上のプログラムへ報告中の釦。
+    reporting: Option<mouse::Button>,
+    /// 直前に報告したセル。同じセルの中の動きは送らない。
+    last_reported: Option<(usize, usize)>,
     /// 直前のクリックの時刻、セル、連続回数。
     last_click: Option<(std::time::Instant, (usize, usize), u8)>,
 }
@@ -170,6 +175,8 @@ pub(crate) struct State {
     pending_since: Option<std::time::Instant>,
     /// 描こうとして描けなかった。間を置いて描き直す。
     needs_redraw: bool,
+    /// いまウィンドウに出している題名。変わったときだけ設定し直す。
+    shown_title: String,
     window: Option<Arc<Window>>,
 }
 
@@ -329,6 +336,7 @@ impl ApplicationHandler<UiEvent> for App {
             recent_for: None,
             pending_since: None,
             needs_redraw: false,
+            shown_title: String::new(),
             window: Some(window.clone()),
         };
         if state.history.is_none() {
@@ -370,7 +378,11 @@ impl ApplicationHandler<UiEvent> for App {
                     state.pending_since = Some(at);
                 }
             }
-            UiEvent::Title(_, _) => {}
+            UiEvent::Title(id, title) => {
+                if let Some(s) = state.manager.get_mut(id) {
+                    s.window_title = (!title.is_empty()).then_some(title);
+                }
+            }
             UiEvent::ChildExit(id, code) => {
                 state.manager.mark_exited(id, code);
             }
@@ -417,21 +429,50 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse.x = position.x as f32;
                 state.mouse.y = position.y as f32;
-                if state.mouse.dragging {
+                let dragging = state.mouse.dragging;
+                if self.report_mouse_motion() {
+                    return;
+                }
+                if dragging {
                     self.drag_selection();
                     if let Some(s) = &self.state {
                         s.request_redraw();
                     }
                 }
             }
+            WindowEvent::Focused(focused) => {
+                // 全画面のプログラムは、窓の出入りを知りたがることがある。
+                if let Some(s) = state.manager.selected() {
+                    let mode = *s.term.lock().mode();
+                    if mode.contains(TermMode::FOCUS_IN_OUT) {
+                        s.pty.write(if focused {
+                            b"\x1b[I".to_vec()
+                        } else {
+                            b"\x1b[O".to_vec()
+                        });
+                    }
+                }
+            }
             WindowEvent::MouseInput {
                 state: button_state,
-                button: MouseButton::Left,
+                button,
                 ..
             } => {
-                match button_state {
-                    ElementState::Pressed => self.on_click(),
-                    ElementState::Released => self.on_release(),
+                let btn = match button {
+                    MouseButton::Left => Some(mouse::Button::Left),
+                    MouseButton::Middle => Some(mouse::Button::Middle),
+                    MouseButton::Right => Some(mouse::Button::Right),
+                    _ => None,
+                };
+                if let Some(btn) = btn {
+                    let pressed = button_state == ElementState::Pressed;
+                    if !self.report_mouse_button(btn, pressed) && btn == mouse::Button::Left {
+                        if pressed {
+                            self.on_click()
+                        } else {
+                            self.on_release()
+                        }
+                    }
                 }
                 if let Some(s) = &self.state {
                     s.request_redraw();
@@ -695,6 +736,17 @@ fn mouse_cell(state: &State) -> (usize, usize, Side) {
         (col, row, side)
     }
 
+/// 端末領域の中での 0 起点の位置。領域の外なら `None`。
+fn terminal_cell(layout: &Layout, col: usize, row: usize) -> Option<(usize, usize)> {
+    if col < layout.term_col || row >= layout.term_rows {
+        return None;
+    }
+    Some((
+        (col - layout.term_col).min(layout.term_cols.saturating_sub(1)),
+        row,
+    ))
+}
+
 /// 端末領域のセルをグリッドの位置に直す。領域の外なら `None`。
 fn terminal_point(state: &State, layout: &Layout, col: usize, row: usize) -> Option<Point> {
         if col < layout.term_col || row >= layout.term_rows {
@@ -710,6 +762,77 @@ fn terminal_point(state: &State, layout: &Layout, col: usize, row: usize) -> Opt
     }
 
 impl App {
+    /// 端末上のプログラムがマウスを要求していれば、釦の出来事を渡す。
+    ///
+    /// Shift を押しているあいだは渡さず、端末側の選択に使う。
+    /// これは xterm からの作法で、報告中でも文字を選べるようにするためである。
+    fn report_mouse_button(&mut self, button: mouse::Button, pressed: bool) -> bool {
+        let Some(state) = &mut self.state else {
+            return false;
+        };
+        if state.picker.is_some() || state.search.is_some() {
+            return false;
+        }
+        if state.mods.shift_key() {
+            return false;
+        }
+        let layout = layout_of(&self.config, state);
+        let (col, row, _) = mouse_cell(state);
+        let Some((tcol, trow)) = terminal_cell(&layout, col, row) else {
+            return false;
+        };
+        let Some(session) = state.manager.selected() else {
+            return false;
+        };
+        let mode = *session.term.lock().mode();
+        let kind = if pressed {
+            mouse::Kind::Press
+        } else {
+            mouse::Kind::Release
+        };
+        let Some(bytes) = mouse::encode(kind, button, tcol, trow, state.mods, mode) else {
+            return false;
+        };
+        session.pty.write(bytes);
+        state.mouse.reporting = pressed.then_some(button);
+        state.mouse.last_reported = Some((tcol, trow));
+        true
+    }
+
+    /// 移動を報告する。送ったら `true`。
+    fn report_mouse_motion(&mut self) -> bool {
+        let Some(state) = &mut self.state else {
+            return false;
+        };
+        if state.mods.shift_key() || state.picker.is_some() || state.search.is_some() {
+            return false;
+        }
+        let layout = layout_of(&self.config, state);
+        let (col, row, _) = mouse_cell(state);
+        let Some((tcol, trow)) = terminal_cell(&layout, col, row) else {
+            return false;
+        };
+        // 同じセルの中で動いただけなら送らない。送ると数が多すぎる。
+        if state.mouse.last_reported == Some((tcol, trow)) {
+            return false;
+        }
+        let Some(session) = state.manager.selected() else {
+            return false;
+        };
+        let mode = *session.term.lock().mode();
+        let (kind, button) = match state.mouse.reporting {
+            Some(b) => (mouse::Kind::Drag, b),
+            None => (mouse::Kind::Move, mouse::Button::Left),
+        };
+        let Some(bytes) = mouse::encode(kind, button, tcol, trow, state.mods, mode) else {
+            // 報告しない設定でも、報告中の釦があれば選択には使わない。
+            return state.mouse.reporting.is_some();
+        };
+        session.pty.write(bytes);
+        state.mouse.last_reported = Some((tcol, trow));
+        true
+    }
+
     fn on_click(&mut self) {
         let config = self.config.clone();
         let Some(state) = &mut self.state else { return };
@@ -812,12 +935,46 @@ impl App {
         if lines == 0 {
             return;
         }
-        if let Some(session) = state.manager.selected() {
-            session
-                .term
-                .lock()
-                .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+        let layout = layout_of(&self.config, state);
+        let (col, row, _) = mouse_cell(state);
+        let cell = terminal_cell(&layout, col, row);
+        let Some(session) = state.manager.selected() else {
+            return;
+        };
+        let mode = *session.term.lock().mode();
+
+        // まず、プログラムが要求していれば車輪をそのまま渡す。
+        if let Some((tcol, trow)) = cell {
+            if !state.mods.shift_key() {
+                let kind = if lines > 0 {
+                    mouse::Kind::WheelUp
+                } else {
+                    mouse::Kind::WheelDown
+                };
+                let mut sent = false;
+                for _ in 0..lines.abs() {
+                    if let Some(bytes) =
+                        mouse::encode(kind, mouse::Button::Left, tcol, trow, state.mods, mode)
+                    {
+                        session.pty.write(bytes);
+                        sent = true;
+                    }
+                }
+                if sent {
+                    return;
+                }
+            }
         }
+        // 次に、代替画面なら矢印キーに変える。less や man はこれで動く。
+        if let Some(bytes) = mouse::alternate_scroll(lines, mode) {
+            session.pty.write(bytes);
+            return;
+        }
+        // どちらでもなければ、端末のスクロールバックを動かす。
+        session
+            .term
+            .lock()
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
     }
 
 }
@@ -975,6 +1132,18 @@ impl App {
         self.refresh_recent();
         let Some(state) = &mut self.state else { return };
         state.manager.drain_pending_clears();
+        // 選んでいるセッションが名乗った題名を、ウィンドウに出す。
+        let want_title = state
+            .manager
+            .selected()
+            .and_then(|s| s.window_title.clone())
+            .unwrap_or_else(|| "tex".to_string());
+        if want_title != state.shown_title {
+            if let Some(w) = &state.window {
+                w.set_title(&want_title);
+            }
+            state.shown_title = want_title;
+        }
         let theme = state.theme;
         state.renderer.begin();
 

@@ -116,6 +116,7 @@ pub fn run(out_path: &str) {
         recent_for: None,
         pending_since: None,
         needs_redraw: false,
+        shown_title: String::new(),
         window: None,
     };
     let id = state.manager.selected().map(|s| s.id).unwrap_or(0);

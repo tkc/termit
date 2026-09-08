@@ -41,6 +41,11 @@ pub struct Session {
     pub size: TermSize,
     pub window_size: Arc<FairMutex<WindowSize>>,
     pub dirty: Arc<AtomicBool>,
+    /// 端末上のプログラムが OSC 0 や OSC 2 で名乗った題名。
+    ///
+    /// 左ペインの名前はセッションの識別なので置き換えない。
+    /// ウィンドウの題名だけをこれにする。
+    pub window_title: Option<String>,
     /// この時刻まで、描くたびにスクロールバックを捨てる。
     ///
     /// 画面消去でシェルへ Ctrl+L を送ると、シェルは画面を消すのではなく
@@ -343,6 +348,7 @@ impl Manager {
             size: self.size,
             window_size: spawned.window_size,
             dirty: spawned.dirty,
+            window_title: None,
             clear_scrollback_until: None,
         });
         self.selected = self.sessions.len() - 1;

@@ -690,3 +690,148 @@ mod clear_tests {
         handle.kill();
     }
 }
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+    use crate::mouse;
+    use crate::term::TermSize;
+    use alacritty_terminal::term::TermMode;
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
+    use winit::keyboard::ModifiersState;
+
+    fn wait_mode(spawned: &crate::pty::Spawned, want: TermMode, secs: u64) -> TermMode {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let mode = *spawned.term.lock().mode();
+            if mode.contains(want) || Instant::now() > deadline {
+                return mode;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 実際のバイト列から、マウスとフォーカスの要求が旗として立つことを確かめる。
+    /// エージェントの全画面 UI が出すものと同じ並びを使う。
+    #[test]
+    fn マウスとフォーカスの要求が旗として立つ() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (tx, _rx) = channel();
+        let spawned = spawn(
+            31,
+            &["/bin/sh".to_string(), "-c".to_string(),
+              "printf '\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1004h\\033[?1006h'; sleep 5".to_string()],
+            Path::new("/tmp"),
+            TermSize::new(80, 24),
+            (8, 16),
+            100,
+            crate::term::UiSender::Channel(tx),
+        )
+        .expect("起動できる");
+
+        // 1000 と 1002 と 1003 は排他で、後から設定したものが前を置き換える。
+        // 三つを順に設定するエージェントは、結果として「全移動を報告」になる。
+        let want = TermMode::MOUSE_MOTION | TermMode::FOCUS_IN_OUT | TermMode::SGR_MOUSE;
+        let mode = wait_mode(&spawned, want, 10);
+        assert!(mode.contains(want), "要求した旗が立つ: {mode:?}");
+        assert!(
+            !mode.contains(TermMode::MOUSE_REPORT_CLICK),
+            "後から設定した 1003 が 1000 を置き換える: {mode:?}"
+        );
+        assert!(mouse::wants_mouse(mode), "マウスの報告が要求されている");
+
+        // 旗が立っていれば、押下が SGR の形で送れる。
+        let bytes = mouse::encode(
+            mouse::Kind::Press,
+            mouse::Button::Left,
+            4,
+            9,
+            ModifiersState::empty(),
+            mode,
+        )
+        .expect("報告の列ができる");
+        assert_eq!(bytes, b"\x1b[<0;5;10M");
+
+        let mut handle = spawned.handle;
+        handle.kill();
+    }
+
+    /// 押下だけを要求する場合の旗を確かめる。
+    #[test]
+    fn クリックだけの要求も旗として立つ() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (tx, _rx) = channel();
+        let spawned = spawn(
+            33,
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf '\\033[?1000h\\033[?1006h'; sleep 5".to_string(),
+            ],
+            Path::new("/tmp"),
+            TermSize::new(80, 24),
+            (8, 16),
+            100,
+            crate::term::UiSender::Channel(tx),
+        )
+        .expect("起動できる");
+
+        let want = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        let mode = wait_mode(&spawned, want, 10);
+        assert!(mode.contains(want), "押下の要求が立つ: {mode:?}");
+        // 押下だけの要求では、移動を送らない。
+        assert_eq!(
+            mouse::encode(
+                mouse::Kind::Move,
+                mouse::Button::Left,
+                0,
+                0,
+                ModifiersState::empty(),
+                mode
+            ),
+            None
+        );
+
+        let mut handle = spawned.handle;
+        handle.kill();
+    }
+
+    /// 代替画面へ入ると、車輪が矢印キーに変わることを確かめる。
+    #[test]
+    fn 代替画面では車輪が矢印になる() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (tx, _rx) = channel();
+        let spawned = spawn(
+            32,
+            &["/bin/sh".to_string(), "-c".to_string(),
+              "printf '\\033[?1049h'; sleep 5".to_string()],
+            Path::new("/tmp"),
+            TermSize::new(80, 24),
+            (8, 16),
+            100,
+            crate::term::UiSender::Channel(tx),
+        )
+        .expect("起動できる");
+
+        let mode = wait_mode(&spawned, TermMode::ALT_SCREEN, 10);
+        assert!(mode.contains(TermMode::ALT_SCREEN), "代替画面に入る");
+        assert!(
+            mode.contains(TermMode::ALTERNATE_SCROLL),
+            "代替スクロールは既定で有効"
+        );
+        assert_eq!(
+            mouse::alternate_scroll(3, mode).expect("矢印に変わる"),
+            b"\x1b[A\x1b[A\x1b[A"
+        );
+
+        let mut handle = spawned.handle;
+        handle.kill();
+    }
+}
