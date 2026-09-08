@@ -360,12 +360,6 @@ impl Renderer {
         }
     }
 
-    fn request_redraw(&self) {
-        if let Some(t) = &self.target {
-            t.window.request_redraw();
-        }
-    }
-
     // ------------------------------------------------------------ 描画の指示
 
     pub fn begin(&mut self) {
@@ -591,27 +585,30 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, background: Rgb) {
+    /// 1 フレームを描いて表示へ渡す。
+    ///
+    /// 描けなかったときは `false` を返す。呼び出し側は、その更新を
+    /// 描いたことにせず、あとで描き直す必要がある。
+    pub fn render(&mut self, background: Rgb) -> bool {
         let t0 = std::time::Instant::now();
         let (n_cells, n_rects) = (self.cell_draws.len(), self.rect_draws.len());
         self.prepare_frame();
         let t_prepare = t0.elapsed();
         let t1 = std::time::Instant::now();
         let Some(target) = &self.target else {
-            return;
+            return false;
         };
 
         let frame = match target.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                // ここで再描画を要求すると、隠れているあいだ要求と失敗を
-                // 際限なく繰り返して CPU を焼く。次の出来事まで待つ。
-                return;
+                // ここで即座に再描画を要求すると、隠れているあいだ要求と失敗を
+                // 際限なく繰り返して CPU を焼く。呼び出し側が間を置いて試す。
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
                 target.surface.configure(&self.device, &target.config);
-                self.request_redraw();
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 let surface = target
@@ -622,12 +619,11 @@ impl Renderer {
                 if let Some(t) = &mut self.target {
                     t.surface = surface;
                 }
-                self.request_redraw();
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 log::error!("サーフェスの取得で検証エラー");
-                return;
+                return false;
             }
         };
 
@@ -659,6 +655,7 @@ impl Renderer {
             t.glyph_cache = glyphs;
             t.report(false);
         }
+        true
     }
 
     /// 描画の指示だけを組み立てて、CPU 側の費用を測る（ベンチ用）。

@@ -26,7 +26,7 @@ use alacritty_terminal::term::{viewport_to_point, TermMode};
 use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -168,6 +168,8 @@ pub(crate) struct State {
     recent_for: Option<u32>,
     /// 未表示の更新のうち、最も古いものが読み取られた時刻。
     pending_since: Option<std::time::Instant>,
+    /// 描こうとして描けなかった。間を置いて描き直す。
+    needs_redraw: bool,
     window: Option<Arc<Window>>,
 }
 
@@ -278,6 +280,18 @@ impl App {
 }
 
 impl ApplicationHandler<UiEvent> for App {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        // 描けずに待っていた場合は、ここで描き直す。
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            if let Some(s) = &self.state {
+                if s.needs_redraw {
+                    s.request_redraw();
+                }
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -314,6 +328,7 @@ impl ApplicationHandler<UiEvent> for App {
             recent: Vec::new(),
             recent_for: None,
             pending_since: None,
+            needs_redraw: false,
             window: Some(window.clone()),
         };
         if state.history.is_none() {
@@ -455,7 +470,7 @@ impl ApplicationHandler<UiEvent> for App {
                     c.redraw_requested += 1;
                     c.tick();
                 }
-                self.draw();
+                self.draw(event_loop);
             }
             _ => {}
         }
@@ -948,8 +963,13 @@ impl App {
 
     // ---------------------------------------------------------------- 描画
 
-    fn draw(&mut self) {
+    fn draw(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = &mut self.state else { return };
+        // 「描いた」印は、画面の内容を読む前に落とす。あとで落とすと、
+        // 読んでから落とすまでのあいだに届いた更新が、通知を出さないまま
+        // 捨てられる。出力が止まる直前（プロンプトが出た瞬間）に当たると、
+        // その一画面ぶんが永久に描かれない。
+        state.manager.clear_dirty();
         let layout = layout_of(&self.config, state);
 
         self.refresh_recent();
@@ -975,8 +995,18 @@ impl App {
         draw_terminal(state, &layout, &theme);
         draw_bottom(state, &layout, &theme);
 
-        state.renderer.render(theme.bg);
-        state.manager.clear_dirty();
+        let drew = state.renderer.render(theme.bg);
+        if drew {
+            state.needs_redraw = false;
+        } else {
+            // 隠れているなどで描けなかった。間を置いて試す。
+            // すぐ要求し直すと、隠れているあいだ空回りする。
+            state.needs_redraw = true;
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(32),
+            ));
+            return;
+        }
         let latency = state.pending_since.take().map(|t| t.elapsed());
         if let Some(c) = &mut self.counters {
             c.drew += 1;
