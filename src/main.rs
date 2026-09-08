@@ -1,6 +1,7 @@
 //! tex: エージェント向けの軽量ターミナル。
 
 mod clipboard;
+mod keytest;
 mod probe;
 mod config;
 mod history;
@@ -16,11 +17,13 @@ mod theme;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::TermMode;
+use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::term::{viewport_to_point, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use winit::application::ApplicationHandler;
-use winit::event::{Ime, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -36,10 +39,47 @@ use crate::theme::Theme;
 
 const SEARCH_ROWS: usize = 10;
 
+/// 押したキーを記録する。キーバインドが届かないときの切り分けに使う。
+/// `TEX_KEYLOG` に書き出し先を指定したときだけ動く。
+fn keylog(event: &winit::event::KeyEvent, mods: ModifiersState) {
+    use std::io::Write;
+    let Ok(path) = std::env::var("TEX_KEYLOG") else {
+        return;
+    };
+    let base = event.key_without_modifiers();
+    let action = input::action_for(&base, event.physical_key, mods);
+    let line = format!(
+        "state={:?} logical={:?} base={:?} physical={:?} text={:?} \
+         ctrl={} shift={} alt={} super={} action={:?}\n",
+        event.state,
+        event.logical_key,
+        base,
+        event.physical_key,
+        event.text.as_deref(),
+        mods.control_key(),
+        mods.shift_key(),
+        mods.alt_key(),
+        mods.super_key(),
+        action,
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 fn main() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--keytest") {
+        let c = Config::load().unwrap_or_default();
+        keytest::run(&c.window.font, c.window.font_size);
+        return;
+    }
     if args.iter().any(|a| a == "--shell-integration") {
         print!("{}", osc::ZSH_INTEGRATION);
         return;
@@ -77,6 +117,17 @@ fn main() {
     }
 }
 
+/// マウスの状態。
+#[derive(Default)]
+struct MouseState {
+    x: f32,
+    y: f32,
+    /// 端末領域でドラッグ中か。
+    dragging: bool,
+    /// 直前のクリックの時刻、セル、連続回数。
+    last_click: Option<(std::time::Instant, (usize, usize), u8)>,
+}
+
 /// 重ねて出すプロファイルの一覧。
 pub(crate) struct PickerState {
     pub(crate) names: Vec<String>,
@@ -98,6 +149,7 @@ pub(crate) struct State {
     sidebar: bool,
     search: Option<SearchState>,
     picker: Option<PickerState>,
+    mouse: MouseState,
     mods: ModifiersState,
     status: Option<String>,
     recent: Vec<Entry>,
@@ -185,6 +237,7 @@ impl ApplicationHandler<UiEvent> for App {
             sidebar: true,
             search: None,
             picker: None,
+            mouse: MouseState::default(),
             mods: ModifiersState::empty(),
             status: None,
             recent: Vec::new(),
@@ -261,6 +314,35 @@ impl ApplicationHandler<UiEvent> for App {
                 self.reflow();
             }
             WindowEvent::ModifiersChanged(m) => state.mods = m.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                state.mouse.x = position.x as f32;
+                state.mouse.y = position.y as f32;
+                if state.mouse.dragging {
+                    self.drag_selection();
+                    if let Some(s) = &self.state {
+                        s.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state: button_state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                match button_state {
+                    ElementState::Pressed => self.on_click(),
+                    ElementState::Released => self.on_release(),
+                }
+                if let Some(s) = &self.state {
+                    s.request_redraw();
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.on_wheel(delta);
+                if let Some(s) = &self.state {
+                    s.request_redraw();
+                }
+            }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 if state.search.is_some() {
                     if let Some(s) = &mut state.search {
@@ -275,6 +357,7 @@ impl ApplicationHandler<UiEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                keylog(&event, state.mods);
                 if event.state.is_pressed() {
                     self.on_key(event, event_loop);
                 }
@@ -332,7 +415,7 @@ impl App {
             return;
         }
 
-        if let Some(action) = input::action_for(&base, mods) {
+        if let Some(action) = input::action_for(&base, event.physical_key, mods) {
             self.on_action(action, event_loop);
             if let Some(s) = &self.state {
                 s.request_redraw();
@@ -390,6 +473,13 @@ impl App {
             }
             Action::SelectNext => state.manager.select_next(),
             Action::SelectPrev => state.manager.select_prev(),
+            Action::SelectIndex(i) => {
+                let rows = state.manager.tree_rows();
+                if let Some(row) = rows.get(i) {
+                    let index = row.index;
+                    state.manager.select(index);
+                }
+            }
             Action::CloseSession => {
                 state.manager.close_selected();
                 if state.manager.is_empty() {
@@ -458,6 +548,173 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ マウス
+
+}
+
+/// マウス位置をセル座標に直す。戻り値はセルの桁と行、桁内の左右。
+fn mouse_cell(state: &State) -> (usize, usize, Side) {
+        let cell = state.renderer.cell();
+        let col_f = state.mouse.x / cell.width;
+        let col = col_f.max(0.0) as usize;
+        let row = (state.mouse.y / cell.height).max(0.0) as usize;
+        let side = if col_f - col_f.floor() < 0.5 {
+            Side::Left
+        } else {
+            Side::Right
+        };
+        (col, row, side)
+    }
+
+/// 端末領域のセルをグリッドの位置に直す。領域の外なら `None`。
+fn terminal_point(state: &State, layout: &Layout, col: usize, row: usize) -> Option<Point> {
+        if col < layout.term_col || row >= layout.term_rows {
+            return None;
+        }
+        let term_col = (col - layout.term_col).min(layout.term_cols.saturating_sub(1));
+        let session = state.manager.selected()?;
+        let display_offset = session.term.lock().grid().display_offset();
+        Some(viewport_to_point(
+            display_offset,
+            Point::new(row, Column(term_col)),
+        ))
+    }
+
+impl App {
+    fn on_click(&mut self) {
+        let config = self.config.clone();
+        let Some(state) = &mut self.state else { return };
+        let layout = layout_of(&self.config, state);
+        let (col, row, side) = mouse_cell(state);
+
+        // 重ねた一覧が開いているときは、まず閉じる。
+        if state.picker.is_some() || state.search.is_some() {
+            state.picker = None;
+            state.search = None;
+            return;
+        }
+
+        if let Some(hit) = sidebar_hit(state, &layout, col, row) {
+            match hit {
+                SidebarHit::NewSession => {
+                    let dir = state
+                        .manager
+                        .selected()
+                        .map(|s| s.cwd.clone())
+                        .unwrap_or_else(|| self.cwd.clone());
+                    state.status = None;
+                    if let Err(e) = state.manager.spawn_new(&config, HOST_PROFILE, &dir) {
+                        state.status = Some(e.to_string());
+                    }
+                }
+                SidebarHit::Select(i) => state.manager.select(i),
+                SidebarHit::Close(i) => {
+                    state.manager.select(i);
+                    state.manager.close_selected();
+                }
+            }
+            return;
+        }
+
+        // 端末領域。連続クリックの回数で選択の単位を変える。
+        let Some(point) = terminal_point(state, &layout, col, row) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let count = match state.mouse.last_click {
+            Some((at, cell, n))
+                if cell == (col, row) && now.duration_since(at).as_millis() < 400 =>
+            {
+                n % 3 + 1
+            }
+            _ => 1,
+        };
+        state.mouse.last_click = Some((now, (col, row), count));
+        let ty = match count {
+            2 => SelectionType::Semantic,
+            3 => SelectionType::Lines,
+            _ => SelectionType::Simple,
+        };
+        if let Some(session) = state.manager.selected() {
+            session.term.lock().selection = Some(Selection::new(ty, point, side));
+        }
+        state.mouse.dragging = true;
+    }
+
+    fn drag_selection(&mut self) {
+        let Some(state) = &mut self.state else { return };
+        let layout = layout_of(&self.config, state);
+        let (col, row, side) = mouse_cell(state);
+        let Some(point) = terminal_point(state, &layout, col, row) else {
+            return;
+        };
+        if let Some(session) = state.manager.selected() {
+            let mut term = session.term.lock();
+            if let Some(sel) = term.selection.as_mut() {
+                sel.update(point, side);
+            }
+        }
+    }
+
+    fn on_release(&mut self) {
+        let Some(state) = &mut self.state else { return };
+        state.mouse.dragging = false;
+        // 動かさずに離したときは選択を消す。
+        if let Some(session) = state.manager.selected() {
+            let mut term = session.term.lock();
+            let empty = term
+                .selection
+                .as_ref()
+                .map(|s| s.is_empty())
+                .unwrap_or(false);
+            if empty {
+                term.selection = None;
+            }
+        }
+    }
+
+    fn on_wheel(&mut self, delta: MouseScrollDelta) {
+        let Some(state) = &mut self.state else { return };
+        let cell_height = state.renderer.cell().height.max(1.0);
+        let lines = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+            MouseScrollDelta::PixelDelta(p) => (p.y as f32 / cell_height).round() as i32,
+        };
+        if lines == 0 {
+            return;
+        }
+        if let Some(session) = state.manager.selected() {
+            session
+                .term
+                .lock()
+                .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+        }
+    }
+
+}
+
+fn layout_of(config: &Config, state: &State) -> Layout {
+    {
+        let (cols, rows) = state.renderer.grid_size();
+        let sidebar_cols = if state.sidebar {
+            config.window.sidebar_cols.min(cols.saturating_sub(20))
+        } else {
+            0
+        };
+        let sep = usize::from(sidebar_cols > 0);
+        let term_col = sidebar_cols + sep;
+        Layout {
+            cols,
+            rows,
+            sidebar_cols,
+            term_col,
+            term_cols: cols.saturating_sub(term_col).max(2),
+            term_rows: rows.saturating_sub(1).max(1),
+        }
+    }
+}
+
+impl App {
     fn on_picker_key(&mut self, key: &Key, _mods: ModifiersState) {
         let config = self.config.clone();
         let Some(state) = &mut self.state else { return };
@@ -579,24 +836,7 @@ impl App {
 
     fn draw(&mut self) {
         let Some(state) = &mut self.state else { return };
-        let layout = {
-            let (cols, rows) = state.renderer.grid_size();
-            let sidebar_cols = if state.sidebar {
-                self.config.window.sidebar_cols.min(cols.saturating_sub(20))
-            } else {
-                0
-            };
-            let sep = usize::from(sidebar_cols > 0);
-            let term_col = sidebar_cols + sep;
-            Layout {
-                cols,
-                rows,
-                sidebar_cols,
-                term_col,
-                term_cols: cols.saturating_sub(term_col).max(2),
-                term_rows: rows.saturating_sub(1).max(1),
-            }
-        };
+        let layout = layout_of(&self.config, state);
 
         self.refresh_recent();
         let Some(state) = &mut self.state else { return };
@@ -641,21 +881,78 @@ impl App {
     }
 }
 
+/// 左ペインの中の位置。描画と当たり判定で同じ値を使う。
+struct SidebarLayout {
+    width: usize,
+    tree_top: usize,
+    shown: usize,
+    /// [+] と × を置く桁。
+    action_col: usize,
+    /// 実行状態の印を置く桁。
+    marker_col: usize,
+    sep_row: usize,
+    list_top: usize,
+}
+
+fn sidebar_layout(state: &State, layout: &Layout) -> SidebarLayout {
+    let width = layout.sidebar_cols;
+    let tree_top = 1;
+    let max_tree = layout.rows.saturating_sub(6).max(1);
+    let shown = state.manager.tree_rows().len().min(max_tree);
+    let sep_row = tree_top + shown;
+    SidebarLayout {
+        width,
+        tree_top,
+        shown,
+        action_col: width.saturating_sub(4),
+        marker_col: width.saturating_sub(2),
+        sep_row,
+        list_top: sep_row + 2,
+    }
+}
+
+/// 左ペインのどこを押したか。
+enum SidebarHit {
+    NewSession,
+    Select(usize),
+    Close(usize),
+}
+
+fn sidebar_hit(state: &State, layout: &Layout, col: usize, row: usize) -> Option<SidebarHit> {
+    if layout.sidebar_cols == 0 || col >= layout.sidebar_cols {
+        return None;
+    }
+    let sl = sidebar_layout(state, layout);
+    if row == 0 {
+        return (col >= sl.action_col && col < sl.action_col + 3).then_some(SidebarHit::NewSession);
+    }
+    if row >= sl.tree_top && row < sl.tree_top + sl.shown {
+        let i = row - sl.tree_top;
+        let index = state.manager.tree_rows().get(i)?.index;
+        if col >= sl.action_col && col < sl.action_col + 1 {
+            return Some(SidebarHit::Close(index));
+        }
+        return Some(SidebarHit::Select(index));
+    }
+    None
+}
+
 pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
-    let w = layout.sidebar_cols;
+    let sl = sidebar_layout(state, layout);
+    let w = sl.width;
     state.renderer.fill_cells(0, 0, w, layout.rows, theme.sidebar_bg);
     state.renderer.put_str(1, 0, "SESSIONS", theme.sidebar_dim);
+    // 押せる目印。キーが効かない環境でもここから増やせる。
+    state.renderer.put_str(sl.action_col, 0, "[+]", theme.accent);
 
     let rows = state.manager.tree_rows();
     let selected = state.manager.selected_index();
-    let tree_top = 1usize;
-    let max_tree = layout.rows.saturating_sub(6).max(1);
-    let shown = rows.len().min(max_tree);
 
-    for (i, row) in rows.iter().take(shown).enumerate() {
-        let y = tree_top + i;
+    for (i, row) in rows.iter().take(sl.shown).enumerate() {
+        let y = sl.tree_top + i;
         let s = &state.manager.sessions()[row.index];
-        if row.index == selected {
+        let is_selected = row.index == selected;
+        if is_selected {
             state.renderer.fill_cells(0, y, w, 1, theme.sidebar_sel);
         }
         let indent = row.depth * 2;
@@ -670,60 +967,65 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         } else {
             theme.sidebar_dim
         };
-        // 実行状態の印は右端に置くので、名前の幅から差し引く。
-        let name_width = w.saturating_sub(indent + 4);
         let mut label = s.title.clone();
         if !s.inherited && s.parent.is_some() {
             label.push('*');
         }
-        x += state.renderer.put_str_clipped(x, y, &label, name_width, fg);
+        if s.profile != HOST_PROFILE {
+            label.push_str(" box");
+        }
+        let name_width = w.saturating_sub(indent + 6);
+        x += state
+            .renderer
+            .put_str_clipped(x, y, &label, name_width, fg);
         let _ = x;
+        state
+            .renderer
+            .put_char(sl.action_col, y, '×', theme.sidebar_dim, false, false);
         match s.state {
             RunState::Running => {
                 state
                     .renderer
-                    .put_char(w - 2, y, '●', theme.accent, false, false);
+                    .put_char(sl.marker_col, y, '●', theme.accent, false, false);
             }
             RunState::Exited(code) => {
                 let c = if code == 0 { theme.sidebar_dim } else { theme.warn };
-                state.renderer.put_char(w - 2, y, '○', c, false, false);
+                state
+                    .renderer
+                    .put_char(sl.marker_col, y, '○', c, false, false);
             }
-        }
-        if s.profile != HOST_PROFILE {
-            let py = y;
-            let px = w.saturating_sub(6);
-            state
-                .renderer
-                .put_str_clipped(px.max(1), py, "box", 3, theme.accent);
         }
     }
 
-    // 区切りと直近のコマンド。
-    let sep_row = tree_top + shown;
-    if sep_row + 2 >= layout.rows {
+    if sl.sep_row + 2 >= layout.rows {
         return;
     }
     for x in 0..w {
         state
             .renderer
-            .put_char(x, sep_row, '─', theme.sidebar_dim, false, false);
+            .put_char(x, sl.sep_row, '─', theme.sidebar_dim, false, false);
     }
     let title = state
         .manager
         .selected()
         .map(|s| s.title.clone())
         .unwrap_or_default();
-    state.renderer.put_str(1, sep_row + 1, "RECENT", theme.sidebar_dim);
     state
         .renderer
-        .put_str_clipped(8, sep_row + 1, &title, w.saturating_sub(9), theme.sidebar_dim);
+        .put_str(1, sl.sep_row + 1, "RECENT", theme.sidebar_dim);
+    state.renderer.put_str_clipped(
+        8,
+        sl.sep_row + 1,
+        &title,
+        w.saturating_sub(9),
+        theme.sidebar_dim,
+    );
 
-    let list_top = sep_row + 2;
-    let avail = layout.rows.saturating_sub(list_top + 1);
+    let avail = layout.rows.saturating_sub(sl.list_top + 1);
     if state.recent.is_empty() && state.history.is_some() && avail > 0 {
         state.renderer.put_str_clipped(
             1,
-            list_top,
+            sl.list_top,
             "シェル統合が未設定",
             w.saturating_sub(2),
             theme.sidebar_dim,
@@ -731,7 +1033,7 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         return;
     }
     for (i, entry) in state.recent.iter().take(avail).enumerate() {
-        let y = list_top + i;
+        let y = sl.list_top + i;
         let code = entry.exit_code.unwrap_or(0);
         let marker_color = if code == 0 { theme.sidebar_dim } else { theme.warn };
         state
@@ -754,6 +1056,7 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
     let term = session.term.lock();
     let content = term.renderable_content();
     let colors = content.colors;
+    let selection = content.selection;
     let cursor = content.cursor;
     let display_offset = content.display_offset;
     struct Draw {
@@ -791,6 +1094,9 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         }
         if cell.flags.contains(Flags::HIDDEN) {
             fg = bg;
+        }
+        if selection.is_some_and(|s| s.contains(indexed.point)) {
+            std::mem::swap(&mut fg, &mut bg);
         }
         let wide = cell.flags.contains(Flags::WIDE_CHAR);
         if wide && indexed.point == cursor.point {
@@ -927,7 +1233,7 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
     }
 
     // 通常時は操作のヒントだけを薄く出す。
-    let hint = "^⇧N 新規  ^⇧F fork  ^⇧S sandbox fork  ^⇧J/K 選択  ^R 履歴  ^B ペイン";
+    let hint = "^O 新規  ^\\ fork  ^] 選んで fork  ^^ 次のセッション  ^R 履歴  ^B ペイン  ⌘W 終了  ⌘C コピー";
     state.renderer.put_str_clipped(
         layout.term_col + 1,
         y,

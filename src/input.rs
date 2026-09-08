@@ -3,7 +3,7 @@
 //! 端末が横取りするのは第 11 節の一覧だけで、それ以外はすべて子プロセスへ渡す。
 
 use alacritty_terminal::term::TermMode;
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 /// 端末自身が処理する操作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +13,8 @@ pub enum Action {
     ForkWithProfile,
     SelectNext,
     SelectPrev,
+    /// 左ペインの n 番目へ直接切り替える。
+    SelectIndex(usize),
     CloseSession,
     SearchHistory,
     ToggleSidebar,
@@ -28,32 +30,108 @@ pub enum Action {
 ///
 /// 渡すのは修飾を外したキーである。macOS では Ctrl を押した時点で
 /// `logical_key` が制御文字になることがあり、文字で照合できない。
-pub fn action_for(key: &Key, mods: ModifiersState) -> Option<Action> {
-    let ctrl = mods.control_key();
-    let shift = mods.shift_key();
-    match key {
-        Key::Character(c) => {
-            let c = c.to_lowercase();
-            match (ctrl, shift, c.as_str()) {
-                (true, true, "n") => Some(Action::NewSession),
-                (true, true, "f") => Some(Action::Fork),
-                (true, true, "s") => Some(Action::ForkWithProfile),
-                (true, true, "j") => Some(Action::SelectNext),
-                (true, true, "k") => Some(Action::SelectPrev),
-                (true, true, "w") => Some(Action::CloseSession),
-                (true, true, "c") => Some(Action::Copy),
-                (true, true, "v") => Some(Action::Paste),
-                (true, true, "=") | (true, true, "+") => Some(Action::FontBigger),
-                (true, true, "-") | (true, true, "_") => Some(Action::FontSmaller),
-                (true, false, "r") => Some(Action::SearchHistory),
-                (true, false, "b") => Some(Action::ToggleSidebar),
-                _ => None,
-            }
-        }
-        Key::Named(NamedKey::PageUp) if shift => Some(Action::ScrollUp),
-        Key::Named(NamedKey::PageDown) if shift => Some(Action::ScrollDown),
-        _ => None,
+///
+/// 割り当ては二系統ある。
+/// Ctrl 側はこの端末の操作で、シェルとエージェントから 6 個だけ奪う。
+/// Cmd 側は macOS の作法に合わせたもので、シェルもエージェントも
+/// Cmd を使わないため何も奪わない。
+pub fn action_for(key: &Key, physical: PhysicalKey, mods: ModifiersState) -> Option<Action> {
+    if let Some(a) = action_from_char(key, mods) {
+        return Some(a);
     }
+    // 配列によっては文字が取れない。物理キーでも照合する。
+    action_from_physical(physical, mods)
+}
+
+/// この端末が奪う Ctrl の組み合わせ。
+pub const STOLEN_CTRL_KEYS: &[(&str, &str)] = &[
+    ("^O", "新規セッション"),
+    ("^\\", "fork"),
+    ("^]", "fork（プロファイルを選ぶ）"),
+    ("^^", "左ペインの選択を進める"),
+    ("^B", "左ペインの表示"),
+    ("^R", "履歴検索"),
+];
+
+fn action_from_char(key: &Key, mods: ModifiersState) -> Option<Action> {
+    let Key::Character(c) = key else {
+        return match key {
+            Key::Named(NamedKey::PageUp) if mods.shift_key() => Some(Action::ScrollUp),
+            Key::Named(NamedKey::PageDown) if mods.shift_key() => Some(Action::ScrollDown),
+            _ => None,
+        };
+    };
+    let c = c.to_lowercase();
+    // Ctrl 側。Shift との同時押しが端末まで届かない環境があるため、
+    // Shift を要求する組み合わせは作らない。
+    if mods.control_key() && !mods.super_key() && !mods.alt_key() {
+        return match c.as_str() {
+            "o" => Some(Action::NewSession),
+            "\\" => Some(Action::Fork),
+            "]" => Some(Action::ForkWithProfile),
+            "^" => Some(Action::SelectNext),
+            "b" => Some(Action::ToggleSidebar),
+            "r" => Some(Action::SearchHistory),
+            _ => None,
+        };
+    }
+    // Cmd 側。
+    if mods.super_key() && !mods.control_key() && !mods.alt_key() {
+        return match c.as_str() {
+            "n" => Some(Action::NewSession),
+            "d" => Some(Action::Fork),
+            "e" => Some(Action::ForkWithProfile),
+            "w" => Some(Action::CloseSession),
+            "r" => Some(Action::SearchHistory),
+            "b" => Some(Action::ToggleSidebar),
+            "c" => Some(Action::Copy),
+            "v" => Some(Action::Paste),
+            "[" => Some(Action::SelectPrev),
+            "]" => Some(Action::SelectNext),
+            "=" | "+" => Some(Action::FontBigger),
+            "-" | "_" => Some(Action::FontSmaller),
+            d if d.len() == 1 => {
+                let n = d.chars().next()?.to_digit(10)? as usize;
+                (n >= 1).then(|| Action::SelectIndex(n - 1))
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+fn action_from_physical(physical: PhysicalKey, mods: ModifiersState) -> Option<Action> {
+    let PhysicalKey::Code(code) = physical else {
+        return None;
+    };
+    if mods.control_key() && !mods.super_key() && !mods.alt_key() {
+        return match code {
+            KeyCode::KeyO => Some(Action::NewSession),
+            KeyCode::Backslash => Some(Action::Fork),
+            KeyCode::BracketRight => Some(Action::ForkWithProfile),
+            KeyCode::KeyB => Some(Action::ToggleSidebar),
+            KeyCode::KeyR => Some(Action::SearchHistory),
+            _ => None,
+        };
+    }
+    if mods.super_key() && !mods.control_key() && !mods.alt_key() {
+        return match code {
+            KeyCode::KeyN => Some(Action::NewSession),
+            KeyCode::KeyD => Some(Action::Fork),
+            KeyCode::KeyE => Some(Action::ForkWithProfile),
+            KeyCode::KeyW => Some(Action::CloseSession),
+            KeyCode::KeyR => Some(Action::SearchHistory),
+            KeyCode::KeyB => Some(Action::ToggleSidebar),
+            KeyCode::KeyC => Some(Action::Copy),
+            KeyCode::KeyV => Some(Action::Paste),
+            KeyCode::BracketLeft => Some(Action::SelectPrev),
+            KeyCode::BracketRight => Some(Action::SelectNext),
+            KeyCode::Equal => Some(Action::FontBigger),
+            KeyCode::Minus => Some(Action::FontSmaller),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// キーを PTY へ送るバイト列へ変換する。送るものがなければ `None`。
@@ -255,8 +333,10 @@ mod tests {
     fn ctrl_で論理キーが制御文字になっても照合できる() {
         // macOS では Ctrl+C の logical_key が "\u{3}" になることがある。
         // 修飾を外したキーで照合するため、動作の判定は影響を受けない。
-        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        assert_eq!(action_for(&ch("f"), cs), Some(Action::Fork));
+        assert_eq!(
+            action_for(&ch("o"), PhysicalKey::Code(KeyCode::F35), ModifiersState::CONTROL),
+            Some(Action::NewSession)
+        );
         assert_eq!(
             encode(&ch("\u{3}"), &ch("c"), None, ModifiersState::CONTROL, TermMode::empty())
                 .unwrap(),
@@ -266,25 +346,96 @@ mod tests {
 
     #[test]
     fn 端末が横取りする組み合わせを判定する() {
-        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        assert_eq!(action_for(&ch("f"), cs), Some(Action::Fork));
-        assert_eq!(action_for(&ch("F"), cs), Some(Action::Fork));
-        assert_eq!(action_for(&ch("n"), cs), Some(Action::NewSession));
+        let ctrl = ModifiersState::CONTROL;
+        let phys = PhysicalKey::Code(KeyCode::F35);
+        assert_eq!(action_for(&ch("o"), phys, ctrl), Some(Action::NewSession));
+        assert_eq!(action_for(&ch("\\"), phys, ctrl), Some(Action::Fork));
+        assert_eq!(action_for(&ch("]"), phys, ctrl), Some(Action::ForkWithProfile));
+        assert_eq!(action_for(&ch("^"), phys, ctrl), Some(Action::SelectNext));
+        assert_eq!(action_for(&ch("b"), phys, ctrl), Some(Action::ToggleSidebar));
+        assert_eq!(action_for(&ch("r"), phys, ctrl), Some(Action::SearchHistory));
+        // Cmd 側は macOS の作法に合わせる。何も奪わない。
+        let cmd = ModifiersState::SUPER;
+        assert_eq!(action_for(&ch("n"), phys, cmd), Some(Action::NewSession));
+        assert_eq!(action_for(&ch("c"), phys, cmd), Some(Action::Copy));
+        assert_eq!(action_for(&ch("["), phys, cmd), Some(Action::SelectPrev));
+    }
+
+    #[test]
+    fn 物理キーでも照合できる() {
+        // 文字が取れない配列でも、物理キーの位置で組み合わせが届く。
+        let dead = Key::Dead(None);
         assert_eq!(
-            action_for(&ch("r"), ModifiersState::CONTROL),
-            Some(Action::SearchHistory)
+            action_for(&dead, PhysicalKey::Code(KeyCode::KeyO), ModifiersState::CONTROL),
+            Some(Action::NewSession)
         );
         assert_eq!(
-            action_for(&ch("b"), ModifiersState::CONTROL),
-            Some(Action::ToggleSidebar)
+            action_for(&dead, PhysicalKey::Code(KeyCode::Backslash), ModifiersState::CONTROL),
+            Some(Action::Fork)
+        );
+        assert_eq!(
+            action_for(&dead, PhysicalKey::Code(KeyCode::KeyD), ModifiersState::SUPER),
+            Some(Action::Fork)
         );
     }
 
     #[test]
+    fn ctrl_の割り当ては六個だけである() {
+        let ctrl = ModifiersState::CONTROL;
+        let phys = PhysicalKey::Code(KeyCode::F35);
+        let mut found = Vec::new();
+        for c in ["a","b","c","d","e","f","g","h","i","j","k","l","m",
+                  "n","o","p","q","r","s","t","u","v","w","x","y","z",
+                  "\\","]","[","^","-","=",";",",",".","/"] {
+            if action_for(&ch(c), phys, ctrl).is_some() {
+                found.push(c);
+            }
+        }
+        found.sort_unstable();
+        assert_eq!(found, vec!["\\", "]", "^", "b", "o", "r"]);
+    }
+
+    #[test]
+    fn shift_を要求する組み合わせは作らない() {
+        // Ctrl と Shift の同時押しが端末へ届かない環境があるため、
+        // Shift を足すと一致しなくなる組み合わせを残さない。
+        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let phys = PhysicalKey::Code(KeyCode::F35);
+        for c in ["o", "b", "r", "]", "^", "\\"] {
+            assert_eq!(
+                action_for(&ch(c), phys, ModifiersState::CONTROL),
+                action_for(&ch(c), phys, cs),
+                "{c} は Shift の有無で結果が変わらない"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_で番号のセッションへ切り替える() {
+        let phys = PhysicalKey::Code(KeyCode::F35);
+        assert_eq!(
+            action_for(&ch("1"), phys, ModifiersState::SUPER),
+            Some(Action::SelectIndex(0))
+        );
+        assert_eq!(
+            action_for(&ch("9"), phys, ModifiersState::SUPER),
+            Some(Action::SelectIndex(8))
+        );
+        assert_eq!(action_for(&ch("0"), phys, ModifiersState::SUPER), None);
+    }
+
+    #[test]
     fn 横取りしないキーは_none_になる() {
-        // Ctrl+C は子プロセスへ渡す。
-        assert_eq!(action_for(&ch("c"), ModifiersState::CONTROL), None);
-        assert_eq!(action_for(&ch("a"), NONE), None);
-        assert_eq!(action_for(&named(NamedKey::Enter), NONE), None);
+        // Ctrl+C も Ctrl+D も子プロセスへ渡す。
+        let phys = PhysicalKey::Code(KeyCode::F35);
+        for c in ["a", "c", "d", "e", "k", "l", "n", "p", "u", "w"] {
+            assert_eq!(
+                action_for(&ch(c), phys, ModifiersState::CONTROL),
+                None,
+                "Ctrl+{c} は子プロセスへ渡す"
+            );
+        }
+        assert_eq!(action_for(&ch("a"), phys, NONE), None);
+        assert_eq!(action_for(&named(NamedKey::Enter), phys, NONE), None);
     }
 }

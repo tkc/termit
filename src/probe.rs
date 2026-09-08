@@ -109,6 +109,7 @@ pub fn run(out_path: &str) {
         sidebar: true,
         search: None,
         picker: None,
+        mouse: Default::default(),
         mods: Default::default(),
         status: None,
         recent: Vec::new(),
