@@ -44,7 +44,7 @@ termit --latency-test
 ### 2.3 実際の動作中の内訳
 
 ```
-RUST_LOG=info TERMIT_FRAME_LOG=1 tex
+RUST_LOG=info TERMIT_FRAME_LOG=1 termit
 ```
 
 1 秒ごとに次を出す。
@@ -175,7 +175,7 @@ wgpu からは触れない。触るには Metal の層を直接持つ必要が�
 
 **設定が読まれていないことに気付かず、3 回測り直した。**
 出力を出すためにシェルを差し替える設定を `~/.config/termit/` へ置いたが、
-実装は `~/Library/Application Support/tex/` を見ていた。
+実装は `~/Library/Application Support/tex/` を見ていた（当時の名前）。
 その結果「11 秒で 1 フレームしか描かない」という数字が出て、深刻な不具合に見えた。
 実際には、何も出力していないシェルを正しく待っていただけだった。
 

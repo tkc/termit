@@ -1,4 +1,4 @@
-# エージェント向けターミナル tex 設計仕様
+# エージェント向けターミナル termit 設計仕様
 
 作成日：2026-09-08
 状態：設計確定、実装未着手
@@ -99,7 +99,7 @@ Docker の制御には API クライアントを使わず、`docker run` の引�
 
 ```rust
 struct Session {
-    id: SessionId,            // tex 内部の連番
+    id: SessionId,            // termit 内部の連番
     parent: Option<SessionId>,
     title: String,            // 表示名。既定は "main" と "fork-N"
     cwd: PathBuf,
