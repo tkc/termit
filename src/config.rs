@@ -34,6 +34,9 @@ pub struct WindowConfig {
     /// 左ペインの幅（pt）。端末の桁数とは独立に決める。
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
+    /// 前回のセッションの並びを、次の起動で作り直すか。
+    #[serde(default = "default_restore")]
+    pub restore_sessions: bool,
     /// 表示装置の走査に合わせるか。
     ///
     /// 合わせると画面の裂けは起きないが、投入したフレームが出るまで
@@ -44,6 +47,10 @@ pub struct WindowConfig {
 }
 
 fn default_vsync() -> bool {
+    true
+}
+
+fn default_restore() -> bool {
     true
 }
 
@@ -69,6 +76,7 @@ impl Default for WindowConfig {
             font_size: default_font_size(),
             scrollback: default_scrollback(),
             sidebar_width: default_sidebar_width(),
+            restore_sessions: default_restore(),
             vsync: default_vsync(),
         }
     }
@@ -90,6 +98,9 @@ pub struct AgentConfig {
     pub new: Option<String>,
     /// 分岐セッションの起動コマンド。未設定なら親と同じコマンドを再実行する。
     pub fork: Option<String>,
+    /// 再開の起動コマンド。次の起動でセッションを作り直すときに使う。
+    /// 未設定なら、覚えていたコマンドをそのまま動かす。
+    pub resume: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -244,6 +255,7 @@ impl Config {
         for (field, tmpl) in [
             ("agent.new", &self.agent.new),
             ("agent.fork", &self.agent.fork),
+            ("agent.resume", &self.agent.resume),
         ] {
             if let Some(t) = tmpl {
                 if let Err(e) = split_template(t) {
@@ -280,13 +292,21 @@ impl Config {
 
 // ------------------------------------------------------- コマンドの組み立て
 
-pub const KNOWN_VARS: &[&str] = &["new_id", "parent_agent_id", "cwd", "parent_title"];
+pub const KNOWN_VARS: &[&str] = &[
+    "new_id",
+    "parent_agent_id",
+    "agent_id",
+    "cwd",
+    "parent_title",
+];
 
 /// テンプレート展開に渡す値。`None` の変数を使うテンプレートは展開できない。
 #[derive(Debug, Clone, Default)]
 pub struct Vars {
     pub new_id: Option<String>,
     pub parent_agent_id: Option<String>,
+    /// このセッション自身の会話 ID。再開のときに入る。
+    pub agent_id: Option<String>,
     pub cwd: Option<String>,
     pub parent_title: Option<String>,
 }
@@ -296,6 +316,7 @@ impl Vars {
         match name {
             "new_id" => self.new_id.as_deref(),
             "parent_agent_id" => self.parent_agent_id.as_deref(),
+            "agent_id" => self.agent_id.as_deref(),
             "cwd" => self.cwd.as_deref(),
             "parent_title" => self.parent_title.as_deref(),
             _ => None,
@@ -469,6 +490,7 @@ mod tests {
         Vars {
             new_id: Some("11111111-2222-3333-4444-555555555555".into()),
             parent_agent_id: Some("aaaa-bbbb".into()),
+            agent_id: Some("cccc-dddd".into()),
             cwd: Some("/Users/tkc/my repo".into()),
             parent_title: Some("main".into()),
         }

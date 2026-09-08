@@ -110,11 +110,33 @@ fork = "claude --resume {parent_agent_id} --fork-session --session-id {new_id}"
 ```
 
 termit mints the UUID, so it knows the child's conversation id at spawn time.
-Available variables are `{new_id}`, `{parent_agent_id}`, `{cwd}` and
-`{parent_title}`. If `fork` is unset, or if a variable has no value yet, the
+Available variables are `{new_id}`, `{parent_agent_id}`, `{agent_id}`, `{cwd}`
+and `{parent_title}`. If `fork` is unset, or if a variable has no value yet, the
 fork falls back to running the parent's command in the same directory; that
 session is marked with `*` in the left pane to show the conversation was not
 carried over.
+
+## Session restore
+
+termit remembers the session list and rebuilds it the next time you start:
+working directory, profile, name, tree shape and which one was selected. It is
+written to `~/.local/share/termit/sessions.toml` and rewritten whenever the
+list changes.
+
+Processes cannot be restored, so each session is started again. If a session
+has a conversation id and you give termit a resume template, the conversation
+is picked up where it left off:
+
+```toml
+[agent]
+resume = "claude --resume {agent_id}"
+```
+
+Without a resume template, or for a session that never had a conversation id,
+the remembered command is simply run again. A working directory that has since
+disappeared falls back to your home directory.
+
+Turn it off with `restore_sessions = false`.
 
 ## Sandbox profiles
 
@@ -145,11 +167,12 @@ can move a conversation into a container right before something risky.
 
 ```toml
 [window]
-font          = "Menlo"   # falls back to the generic monospace if not found
-font_size     = 13.0
-scrollback    = 10000
-sidebar_width = 200       # points; drag the border to change it live
-vsync         = true      # false removes the wait for the display, may tear
+font             = "Menlo"  # falls back to the generic monospace if not found
+font_size        = 13.0
+scrollback       = 10000
+sidebar_width    = 200      # points; drag the border to change it live
+vsync            = true     # false removes the wait for the display, may tear
+restore_sessions = true     # rebuild the session list on the next start
 
 [shell]
 program = "/bin/zsh"
@@ -182,7 +205,7 @@ Chosen by recording what an agent's full-screen UI actually asks for.
 
 Tabs. Arbitrary splits and tiling. Ligatures. Image protocols. A plugin
 system. A built-in editor. A theme store. A settings GUI. A built-in SSH
-client. Session persistence across restarts.
+client.
 
 The left pane replaces tabs and splits: several agents are several sessions in
 one list.

@@ -259,6 +259,7 @@ impl Manager {
         let vars = Vars {
             new_id: Some(new_id.clone()),
             parent_agent_id: None,
+            agent_id: None,
             cwd: Some(cwd.to_string_lossy().to_string()),
             parent_title: None,
         };
@@ -300,6 +301,7 @@ impl Manager {
         let vars = Vars {
             new_id: Some(new_id.clone()),
             parent_agent_id: parent.agent_id.clone(),
+            agent_id: None,
             cwd: Some(cwd.to_string_lossy().to_string()),
             parent_title: Some(parent_title.clone()),
         };
@@ -389,6 +391,108 @@ impl Manager {
             clear_scrollback_until: None,
         });
         self.selected = self.sessions.len() - 1;
+        Ok(id)
+    }
+
+    /// いまの並びを、次の起動で作り直せる形に写し取る。
+    pub fn snapshot(&self) -> crate::state::SavedState {
+        let index_of: std::collections::HashMap<SessionId, usize> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.id, i))
+            .collect();
+        crate::state::SavedState {
+            version: crate::state::VERSION,
+            selected: self.selected_index(),
+            sessions: self
+                .sessions
+                .iter()
+                .map(|s| crate::state::SavedSession {
+                    name: s.name.clone(),
+                    cwd: s.cwd.to_string_lossy().to_string(),
+                    profile: s.profile.clone(),
+                    agent_id: s.agent_id.clone(),
+                    parent: s.parent.and_then(|p| index_of.get(&p).copied()),
+                    command: s.base_command.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// 覚えていた並びを作り直す。作れたセッションの数を返す。
+    ///
+    /// 会話 ID が分かっていて再開のテンプレートがあれば、それで会話を続ける。
+    /// なければ、覚えていたコマンドをそのまま動かす。
+    pub fn restore(&mut self, config: &Config, saved: &crate::state::SavedState) -> usize {
+        let mut ids: Vec<Option<SessionId>> = Vec::with_capacity(saved.sessions.len());
+        for s in &saved.sessions {
+            let parent = s.parent.and_then(|p| ids.get(p).copied().flatten());
+            match self.restore_one(config, s, parent) {
+                Ok(id) => ids.push(Some(id)),
+                Err(e) => {
+                    log::warn!("cannot restore session in {}: {e}", s.cwd);
+                    ids.push(None);
+                }
+            }
+        }
+        let made = ids.iter().filter(|i| i.is_some()).count();
+        if let Some(Some(_)) = ids.get(saved.selected) {
+            self.selected = saved.selected.min(self.sessions.len().saturating_sub(1));
+        }
+        made
+    }
+
+    fn restore_one(
+        &mut self,
+        config: &Config,
+        saved: &crate::state::SavedSession,
+        parent: Option<SessionId>,
+    ) -> Result<SessionId, SessionError> {
+        let cwd = PathBuf::from(&saved.cwd);
+        // 覚えていた作業ディレクトリが無くなっていることがある。
+        let cwd = if cwd.is_dir() {
+            cwd
+        } else {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+        };
+        let vars = Vars {
+            new_id: Some(uuid::Uuid::new_v4().to_string()),
+            parent_agent_id: None,
+            agent_id: saved.agent_id.clone(),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            parent_title: None,
+        };
+        let (base, agent_id) = match (&config.agent.resume, &saved.agent_id) {
+            (Some(t), Some(_)) => match config::expand_template(t, &vars) {
+                Ok(argv) => (argv, saved.agent_id.clone()),
+                Err(_) => (saved.command.clone(), saved.agent_id.clone()),
+            },
+            _ => (saved.command.clone(), saved.agent_id.clone()),
+        };
+        let base = if base.is_empty() {
+            shell_argv(config)
+        } else {
+            base
+        };
+        let title = if parent.is_none() {
+            "main".to_string()
+        } else {
+            format!("s-{}", self.next_id)
+        };
+        let id = self.launch(
+            config,
+            &saved.profile,
+            &cwd,
+            base,
+            parent,
+            agent_id,
+            title,
+            true,
+        )?;
+        if let Some(s) = self.sessions.last_mut() {
+            s.name = saved.name.clone();
+        }
         Ok(id)
     }
 
@@ -537,6 +641,94 @@ mod tests {
         let argv = shell_argv(&c);
         assert_eq!(argv.len(), 2);
         assert_eq!(argv[1], "-l");
+    }
+
+    fn probe_manager() -> Manager {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Manager::new(
+            TermSize::new(40, 10),
+            (8, 16),
+            crate::term::UiSender::Channel(tx),
+        )
+    }
+
+    fn probe_config() -> Config {
+        let mut c = Config::default();
+        c.shell.program = Some("/bin/sh".into());
+        c.shell.args = vec!["-c".into(), "sleep 20".into()];
+        c
+    }
+
+    /// 覚えた並びから作り直したとき、木の形と名前が戻ることを確かめる。
+    #[test]
+    fn 覚えた並びを作り直せる() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let config = probe_config();
+        let cwd = std::env::current_dir().unwrap();
+        let mut m = probe_manager();
+        m.spawn_new(&config, "host", &cwd).expect("親を作れる");
+        m.fork(&config, 0, None).expect("子を作れる");
+        m.sessions_mut()[1].name = Some("child".into());
+        m.sessions_mut()[0].agent_id = Some("abc-123".into());
+        m.select(1);
+
+        let saved = m.snapshot();
+        assert_eq!(saved.sessions.len(), 2);
+        assert_eq!(saved.selected, 1);
+        assert_eq!(saved.sessions[0].parent, None);
+        assert_eq!(saved.sessions[1].parent, Some(0));
+        assert_eq!(saved.sessions[0].agent_id.as_deref(), Some("abc-123"));
+        assert_eq!(saved.sessions[1].name.as_deref(), Some("child"));
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+
+        // 書いて読み戻しても同じであること。
+        let text = toml::to_string_pretty(&saved).unwrap();
+        let reloaded = crate::state::SavedState::parse(&text).expect("読み戻せる");
+        assert_eq!(reloaded, saved);
+
+        let mut m2 = probe_manager();
+        let made = m2.restore(&config, &reloaded);
+        assert_eq!(made, 2, "2 つとも作り直せる");
+        let rows = m2.tree_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[1].depth, 1, "親子の関係が戻る");
+        assert_eq!(m2.sessions()[1].name.as_deref(), Some("child"));
+        assert_eq!(m2.sessions()[0].agent_id.as_deref(), Some("abc-123"));
+        assert_eq!(m2.selected_index(), 1, "選んでいた位置が戻る");
+        for s in m2.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// 覚えていた作業ディレクトリが無くなっていても、起動そのものは通ること。
+    #[test]
+    fn 消えた作業ディレクトリでも作り直せる() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let config = probe_config();
+        let saved = crate::state::SavedState {
+            version: crate::state::VERSION,
+            selected: 0,
+            sessions: vec![crate::state::SavedSession {
+                name: None,
+                cwd: "/no/such/directory/at/all".into(),
+                profile: "host".into(),
+                agent_id: None,
+                parent: None,
+                command: vec!["/bin/sh".into(), "-c".into(), "sleep 20".into()],
+            }],
+        };
+        let mut m = probe_manager();
+        assert_eq!(m.restore(&config, &saved), 1);
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
     }
 
     #[test]

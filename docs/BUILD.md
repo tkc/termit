@@ -128,6 +128,7 @@ cargo clippy --all-targets -- -D warnings
 |---|---|
 | Config | `$XDG_CONFIG_HOME/termit/config.toml`, else `~/.config/termit/config.toml` |
 | History | `$XDG_DATA_HOME/termit/history.db`, else `~/.local/share/termit/history.db` |
+| Session list | `$XDG_DATA_HOME/termit/sessions.toml`, else `~/.local/share/termit/sessions.toml` |
 
 Note that these are **not** the macOS `~/Library/Application Support` paths that
 `dirs::config_dir()` would give you. People who use a terminal look for their

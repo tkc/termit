@@ -16,6 +16,7 @@ mod rect;
 mod render;
 mod search;
 mod session;
+mod state;
 mod term;
 mod theme;
 
@@ -199,6 +200,10 @@ pub(crate) struct State {
     pending_since: Option<std::time::Instant>,
     /// 描こうとして描けなかった。間を置いて描き直す。
     needs_redraw: bool,
+    /// セッションの並びが変わった。少し置いてから書き出す。
+    state_dirty: bool,
+    /// 最後に書き出した時刻。
+    state_saved_at: Option<std::time::Instant>,
     /// いまウィンドウに出している題名。変わったときだけ設定し直す。
     shown_title: String,
     /// 変換中の文字列。確定するまでは入力にも検索にも渡さない。
@@ -211,6 +216,33 @@ pub(crate) struct State {
 }
 
 impl State {
+    /// セッションの並びが変わったことを覚えておく。
+    fn mark_state_dirty(&mut self) {
+        self.state_dirty = true;
+    }
+
+    /// 覚えている並びを書き出す。頻繁に呼ばれるので間隔を空ける。
+    fn save_state(&mut self, force: bool) {
+        if !self.state_dirty {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = match self.state_saved_at {
+            None => true,
+            Some(t) => now.duration_since(t).as_millis() >= 500,
+        };
+        if !(due || force) {
+            return;
+        }
+        self.state_dirty = false;
+        self.state_saved_at = Some(now);
+        if self.manager.sessions().is_empty() {
+            state::SavedState::clear();
+        } else {
+            self.manager.snapshot().save();
+        }
+    }
+
     fn request_redraw(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -356,6 +388,8 @@ impl ApplicationHandler<UiEvent> for App {
             recent_for: None,
             pending_since: None,
             needs_redraw: false,
+            state_dirty: false,
+            state_saved_at: None,
             shown_title: String::new(),
             preedit: String::new(),
             ime_area: None,
@@ -376,9 +410,20 @@ impl ApplicationHandler<UiEvent> for App {
             .resize(TermSize::new(layout.term_cols, layout.term_rows));
 
         let cwd = self.cwd.clone();
-        if let Err(e) = state.manager.spawn_new(&self.config, HOST_PROFILE, &cwd) {
-            state.status = Some(e.to_string());
+        // 前回の並びを作り直す。作れなければ、いつもどおり 1 つ立ち上げる。
+        let restored = if self.config.window.restore_sessions {
+            state::SavedState::load()
+                .map(|saved| state.manager.restore(&self.config, &saved))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if restored == 0 {
+            if let Err(e) = state.manager.spawn_new(&self.config, HOST_PROFILE, &cwd) {
+                state.status = Some(e.to_string());
+            }
         }
+        state.mark_state_dirty();
 
         self.state = Some(state);
         window.request_redraw();
@@ -408,6 +453,7 @@ impl ApplicationHandler<UiEvent> for App {
             }
             UiEvent::ChildExit(id, code) => {
                 state.manager.mark_exited(id, code);
+                state.mark_state_dirty();
             }
             UiEvent::ClipboardStore(_, text) => clipboard::copy(&text),
             UiEvent::ClipboardLoad(id, format) => {
@@ -419,6 +465,13 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::Osc(id, ev) => {
                 if let Some(s) = state.manager.get_mut(id) {
                     s.on_osc(&ev);
+                }
+                // 作業ディレクトリと会話 ID は、次の起動で作り直すのに要る。
+                if matches!(
+                    ev,
+                    crate::osc::OscEvent::Cwd(_) | crate::osc::OscEvent::AgentId(_)
+                ) {
+                    state.mark_state_dirty();
                 }
             }
             UiEvent::Command(_, record) => {
@@ -436,7 +489,10 @@ impl ApplicationHandler<UiEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(state) = &mut self.state else { return };
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                state.save_state(true);
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 state.renderer.resize(size.width, size.height);
                 self.reflow();
@@ -669,6 +725,13 @@ impl App {
     }
 
     fn on_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        self.on_action_inner(action, event_loop);
+        if let Some(s) = &mut self.state {
+            s.mark_state_dirty();
+        }
+    }
+
+    fn on_action_inner(&mut self, action: Action, event_loop: &ActiveEventLoop) {
         let cwd = self.cwd.clone();
         let config = self.config.clone();
         let Some(state) = &mut self.state else { return };
@@ -962,6 +1025,7 @@ impl App {
                     state.manager.close_selected();
                 }
             }
+            state.mark_state_dirty();
             return;
         }
 
@@ -1125,6 +1189,7 @@ impl App {
                 if let Err(e) = state.manager.fork(&config, i, Some(&name)) {
                     state.status = Some(e.to_string());
                 }
+                state.mark_state_dirty();
             }
             Key::Character(c) => match c.as_str() {
                 "j" => picker.selected = (picker.selected + 1) % n,
@@ -1161,6 +1226,7 @@ impl App {
                     // 空にすると、既定の作業ディレクトリ表示へ戻る。
                     s.name = (!name.is_empty()).then_some(name);
                 }
+                state.mark_state_dirty();
             }
             Key::Named(NamedKey::Backspace) => {
                 rename.input.pop();
@@ -1337,6 +1403,7 @@ impl App {
         let Some(state) = &mut self.state else { return };
         state.manager.drain_pending_clears();
         state.manager.refresh_branches();
+        state.save_state(false);
         collect_find_cells(state);
         // 選んでいるセッションが名乗った題名を、ウィンドウに出す。
         let want_title = state
