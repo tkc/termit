@@ -49,6 +49,41 @@ pub fn action_for(key: &Key, physical: PhysicalKey, mods: ModifiersState) -> Opt
     action_from_physical(physical, mods)
 }
 
+/// 10 番目から先のセッションに割り当てる文字と、その物理キー。
+///
+/// ⌘ と組み合わせる文字は、すでに大半がこの端末の命令で埋まっている。
+/// 空いているものだけを並べるため、A B C とは続かない。
+/// H M Q は macOS 自身が隠す・仕舞う・終わるに使うので取らない。
+const INDEX_KEYS: &[(char, KeyCode)] = &[
+    ('a', KeyCode::KeyA),
+    ('g', KeyCode::KeyG),
+    ('j', KeyCode::KeyJ),
+    ('l', KeyCode::KeyL),
+    ('o', KeyCode::KeyO),
+    ('p', KeyCode::KeyP),
+    ('s', KeyCode::KeyS),
+    ('t', KeyCode::KeyT),
+    ('u', KeyCode::KeyU),
+    ('x', KeyCode::KeyX),
+    ('y', KeyCode::KeyY),
+    ('z', KeyCode::KeyZ),
+];
+
+/// 番号と文字で直接切り替えられるセッションの数。これを超えた行に印は付かない。
+#[cfg(test)]
+const INDEXABLE: usize = 9 + INDEX_KEYS.len();
+
+/// 左ペインの右端に出す ⌘ の印。割り当てがなければ `None`。
+///
+/// 描く側と受ける側で表がずれないよう、どちらもここを通す。
+pub fn index_label(n: usize) -> Option<String> {
+    if n < 9 {
+        return Some(format!("⌘{}", n + 1));
+    }
+    let (c, _) = INDEX_KEYS.get(n - 9)?;
+    Some(format!("⌘{}", c.to_ascii_uppercase()))
+}
+
 /// この端末が奪う Ctrl の組み合わせ。
 pub const STOLEN_CTRL_KEYS: &[(&str, &str)] = &[
     ("^O", "new session"),
@@ -104,9 +139,16 @@ fn action_from_char(key: &Key, mods: ModifiersState) -> Option<Action> {
             "]" => Some(Action::SelectNext),
             "=" | "+" => Some(Action::FontBigger),
             "-" | "_" => Some(Action::FontSmaller),
+            // 命令の割り当てを先に見ているので、ここへ来るのは余った文字だけ。
             d if d.len() == 1 => {
-                let n = d.chars().next()?.to_digit(10)? as usize;
-                (n >= 1).then(|| Action::SelectIndex(n - 1))
+                let c = d.chars().next()?;
+                if let Some(n) = c.to_digit(10) {
+                    return (n >= 1).then(|| Action::SelectIndex(n as usize - 1));
+                }
+                INDEX_KEYS
+                    .iter()
+                    .position(|&(l, _)| l == c)
+                    .map(|i| Action::SelectIndex(9 + i))
             }
             _ => None,
         };
@@ -129,7 +171,7 @@ fn action_from_physical(physical: PhysicalKey, mods: ModifiersState) -> Option<A
         };
     }
     if mods.super_key() && !mods.control_key() && !mods.alt_key() {
-        return match code {
+        let command = match code {
             KeyCode::KeyN => Some(Action::NewSession),
             KeyCode::KeyD => Some(Action::Fork),
             KeyCode::KeyE => Some(Action::ForkWithProfile),
@@ -147,6 +189,13 @@ fn action_from_physical(physical: PhysicalKey, mods: ModifiersState) -> Option<A
             KeyCode::Minus => Some(Action::FontSmaller),
             _ => None,
         };
+        if command.is_some() {
+            return command;
+        }
+        return INDEX_KEYS
+            .iter()
+            .position(|&(_, k)| k == code)
+            .map(|i| Action::SelectIndex(9 + i));
     }
     None
 }
@@ -535,6 +584,89 @@ mod tests {
             Some(Action::SelectIndex(8))
         );
         assert_eq!(action_for(&ch("0"), phys, ModifiersState::SUPER), None);
+    }
+
+    #[test]
+    fn 十番目から先は文字で切り替える() {
+        let phys = PhysicalKey::Code(KeyCode::F35);
+        assert_eq!(index_label(9).as_deref(), Some("⌘A"));
+        assert_eq!(
+            action_for(&ch("a"), phys, ModifiersState::SUPER),
+            Some(Action::SelectIndex(9))
+        );
+        // 大文字で届いても同じところへ行く。
+        assert_eq!(
+            action_for(&ch("A"), phys, ModifiersState::SUPER),
+            Some(Action::SelectIndex(9))
+        );
+    }
+
+    #[test]
+    fn 出す印と受けるキーが一致する() {
+        // 左ペインに出した印を押せば、その行が選ばれる。
+        let phys = PhysicalKey::Code(KeyCode::F35);
+        for n in 0..INDEXABLE {
+            let label = index_label(n).expect("{n} 番目には印がある");
+            let key: String = label.chars().skip(1).collect();
+            assert_eq!(
+                action_for(&ch(&key), phys, ModifiersState::SUPER),
+                Some(Action::SelectIndex(n)),
+                "{label} は {n} 番目を選ぶ"
+            );
+        }
+        assert_eq!(index_label(INDEXABLE), None);
+    }
+
+    #[test]
+    fn 切り替えの文字は命令とぶつからない() {
+        // 命令の割り当てが先にあるため、ぶつかると行へ行けなくなる。
+        let phys = PhysicalKey::Code(KeyCode::F35);
+        for (c, code) in INDEX_KEYS {
+            let by_char = action_for(&ch(&c.to_string()), phys, ModifiersState::SUPER);
+            assert!(
+                matches!(by_char, Some(Action::SelectIndex(_))),
+                "⌘{c} が命令に取られている: {by_char:?}"
+            );
+            let by_code = action_for(
+                &Key::Dead(None),
+                PhysicalKey::Code(*code),
+                ModifiersState::SUPER,
+            );
+            assert_eq!(by_char, by_code, "⌘{c} は文字でも物理キーでも同じ");
+        }
+    }
+
+    #[test]
+    fn 命令の割り当てが切り替えに奪われない() {
+        let phys = PhysicalKey::Code(KeyCode::F35);
+        for (c, want) in [
+            ("b", Action::ToggleSidebar),
+            ("c", Action::Copy),
+            ("d", Action::Fork),
+            ("e", Action::ForkWithProfile),
+            ("f", Action::FindInScreen),
+            ("i", Action::RenameSession),
+            ("k", Action::ClearScreen),
+            ("n", Action::NewSession),
+            ("r", Action::SearchHistory),
+            ("v", Action::Paste),
+            ("w", Action::CloseSession),
+        ] {
+            assert_eq!(
+                action_for(&ch(c), phys, ModifiersState::SUPER),
+                Some(want),
+                "⌘{c} は命令のまま"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_が使う組み合わせは取らない() {
+        // ⌘H は隠す、⌘M は仕舞う、⌘Q は終わる。横取りすると戸惑う。
+        let phys = PhysicalKey::Code(KeyCode::F35);
+        for c in ["h", "m", "q"] {
+            assert_eq!(action_for(&ch(c), phys, ModifiersState::SUPER), None);
+        }
     }
 
     #[test]

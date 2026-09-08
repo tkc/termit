@@ -1734,9 +1734,14 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         let title_h = state.renderer.line_height_px(sidebar::SIZE_TITLE);
         // 右端に並べる印の左端。名前はここまでで切る。
         let right = sl.rect_x + sl.rect_w;
-        let hint_w = state
-            .renderer
-            .measure_px("⌘9", style(sidebar::SIZE_BRANCH, false));
+        // 印は行ごとに幅が違う。実際に出すものではかる。
+        let hint = input::index_label(n);
+        let hint_w = match &hint {
+            Some(h) => state
+                .renderer
+                .measure_px(h, style(sidebar::SIZE_BRANCH, false)),
+            None => 0.0,
+        };
         let name_limit = right - 12.0 * sc - hint_w - text_x;
         let mark_w = state
             .renderer
@@ -1803,15 +1808,11 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
                 style(sidebar::SIZE_SUB, false),
                 theme.fg_secondary,
             );
-        } else if n < 9 {
-            let hint = format!("⌘{}", n + 1);
-            let hw = state
-                .renderer
-                .measure_px(&hint, style(sidebar::SIZE_BRANCH, false));
+        } else if let Some(hint) = &hint {
             state.renderer.put_text_px(
-                right - 6.0 * sc - hw,
+                right - 6.0 * sc - hint_w,
                 y + (title_h - small_h) / 2.0,
-                &hint,
+                hint,
                 style(sidebar::SIZE_BRANCH, false),
                 theme.fg_tertiary,
             );

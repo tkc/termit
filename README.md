@@ -78,13 +78,19 @@ takes nothing, because neither shells nor agents use Cmd.
 | `⌘I` (or `⌘⇧R`) | Rename the session |
 | `⌘K` | Clear the screen and scrollback |
 | `⌘[` / `⌘]` | Select the previous / next session |
-| `⌘1`…`⌘9` | Jump to that session |
+| `⌘1`…`⌘9`, then `⌘A` `⌘G` `⌘J` `⌘L` `⌘O` `⌘P` `⌘S` `⌘T` `⌘U` `⌘X` `⌘Y` `⌘Z` | Jump to that session |
 | `⌘W` | Close the session |
 | `⌘C` / `⌘V` | Copy / paste |
 | `⌘=` / `⌘-` | Font size |
 | `Shift+PageUp` / `PageDown` | Scroll |
 
 Everything else goes to the child process untouched.
+
+The first nine sessions answer to `⌘1`…`⌘9`. Past that the left pane keeps
+labelling rows with letters, but not in alphabetical order: `⌘B`, `⌘C`, `⌘D`
+and most of the rest are already commands, so only the free letters are handed
+out, and `⌘H`, `⌘M` and `⌘Q` are left to macOS. Twenty-one sessions can be
+reached this way; the label a row shows is always the key that selects it.
 
 **No binding uses Shift together with Ctrl.** On some setups that combination
 never reaches the application — measured here, `ctrl` and `shift` were never
