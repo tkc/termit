@@ -1617,24 +1617,36 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
             let x = layout.term_col + cursor_point.column.0.min(layout.term_cols - 1);
             let y = row as usize;
             state.cursor_cell = Some((x, y));
-            match cursor_shape {
-                CursorShape::Beam => state.renderer.cursor_beam(x, y, theme.cursor),
-                CursorShape::Underline => {
-                    state.renderer.underline_cells(x, y, cursor_cols, theme.cursor)
-                }
-                _ => state
-                    .renderer
-                    .fill_cells_alpha(x, y, cursor_cols, 1, theme.cursor, 0.55),
-            }
             // 変換中の文字列は、確定するまで子プロセスへ渡さない。
             // 見えないと何を打っているか分からないので、カーソルの位置に出す。
-            if state.find.is_none() && state.search.is_none() && !state.preedit.is_empty() {
-                let text = state.preedit.clone();
+            let preedit = (state.find.is_none() && state.search.is_none())
+                .then(|| state.preedit.clone())
+                .filter(|p| !p.is_empty());
+            if let Some(text) = preedit {
+                // 変換中はカーソルの塗りを出さない。
+                // 塗りが一文字目に重なると、何を打っているか読めなくなる。
                 let width = layout.term_cols.saturating_sub(x - layout.term_col);
+                let cols: usize = text.chars().map(char_cols).sum();
+                let shown = cols.min(width);
+                state.renderer.fill_cells(x, y, shown, 1, theme.surface);
                 let used = state
                     .renderer
                     .put_str_clipped(x, y, &text, width, theme.fg_primary);
                 state.renderer.underline_cells(x, y, used, theme.accent);
+                // 文字が入る位置は変換中の文字列の末尾なので、細い棒で示す。
+                let caret = (x + used).min(layout.cols.saturating_sub(1));
+                state.renderer.cursor_beam(caret, y, theme.cursor);
+                state.cursor_cell = Some((caret, y));
+            } else {
+                match cursor_shape {
+                    CursorShape::Beam => state.renderer.cursor_beam(x, y, theme.cursor),
+                    CursorShape::Underline => {
+                        state.renderer.underline_cells(x, y, cursor_cols, theme.cursor)
+                    }
+                    _ => state
+                        .renderer
+                        .fill_cells_alpha(x, y, cursor_cols, 1, theme.cursor, 0.55),
+                }
             }
         }
     }
@@ -1660,13 +1672,14 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
         if !state.preedit.is_empty() {
             let text = state.preedit.clone();
             let at = x0 + 1 + used;
-            let n = state.renderer.put_str_clipped(
-                at,
-                y,
-                &text,
-                w.saturating_sub(used + 2),
-                theme.fg_primary,
-            );
+            let avail = w.saturating_sub(used + 2);
+            let cols: usize = text.chars().map(char_cols).sum();
+            state
+                .renderer
+                .fill_cells(at, y, cols.min(avail), 1, theme.chrome_bg);
+            let n = state
+                .renderer
+                .put_str_clipped(at, y, &text, avail, theme.fg_primary);
             state.renderer.underline_cells(at, y, n, theme.accent);
             used += n;
         }

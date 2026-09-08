@@ -178,6 +178,9 @@ pub fn run(out_path: &str) {
                 selected: 0,
             });
         }
+        Ok("preedit") => {
+            state.preedit = "あっだ".into();
+        }
         _ => {}
     }
 
