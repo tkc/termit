@@ -51,7 +51,7 @@ pub struct History {
 pub fn db_path() -> Option<PathBuf> {
     Some(
         crate::config::xdg_dir("XDG_DATA_HOME", ".local/share")?
-            .join("tex")
+            .join("termit")
             .join("history.db"),
     )
 }

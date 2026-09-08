@@ -5,11 +5,11 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::time::SystemTime;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
+use std::time::SystemTime;
 
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::sync::FairMutex;
@@ -101,10 +101,10 @@ pub fn spawn(
     // シェル統合とエージェント側のフックはこれらを見て動作を変える。
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    cmd.env("TERM_PROGRAM", "tex");
+    cmd.env("TERM_PROGRAM", "termit");
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-    cmd.env("TEX_SESSION", id.to_string());
-    cmd.env("TEX_SHELL_INTEGRATION", "1");
+    cmd.env("TERMIT_SESSION", id.to_string());
+    cmd.env("TERMIT_SHELL_INTEGRATION", "1");
 
     let child = pair
         .slave
@@ -285,7 +285,7 @@ fn spawn_reader(
                 ..CommandTracker::default()
             };
             let mut buf = vec![0u8; 65536];
-            let diag = std::env::var("TEX_FRAME_LOG").is_ok();
+            let diag = std::env::var("TERMIT_FRAME_LOG").is_ok();
             let mut read_bytes = 0u64;
             let mut reads = 0u64;
             let mut sent = 0u64;
@@ -453,11 +453,7 @@ mod shell_integration_tests {
         let (tx, rx) = channel();
         let spawned = spawn(
             11,
-            &[
-                "/bin/zsh".to_string(),
-                "-f".to_string(),
-                "-i".to_string(),
-            ],
+            &["/bin/zsh".to_string(), "-f".to_string(), "-i".to_string()],
             Path::new("/tmp"),
             TermSize::new(80, 24),
             (8, 16),
@@ -467,7 +463,7 @@ mod shell_integration_tests {
         .expect("zsh を起動できる");
 
         // 統合を読み込ませてから、記録したいコマンドを打つ。
-        let mut script = crate::osc::ZSH_INTEGRATION.replace('\n', "\n");
+        let mut script = crate::osc::ZSH_INTEGRATION.to_string();
         script.push_str("\nprint -n ''\n");
         spawned.handle.write(script.into_bytes());
         std::thread::sleep(Duration::from_millis(400));
@@ -476,14 +472,11 @@ mod shell_integration_tests {
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut found = None;
         while Instant::now() < deadline && found.is_none() {
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(UiEvent::Command(id, record)) => {
-                    assert_eq!(id, 11);
-                    if record.command.contains("echo hello-from-zsh") {
-                        found = Some(record);
-                    }
+            if let Ok(UiEvent::Command(id, record)) = rx.recv_timeout(Duration::from_millis(200)) {
+                assert_eq!(id, 11);
+                if record.command.contains("echo hello-from-zsh") {
+                    found = Some(record);
                 }
-                _ => {}
             }
         }
         let record = found.expect("echo の記録が届く");
@@ -602,12 +595,7 @@ mod clear_tests {
         out
     }
 
-    fn wait_for(
-        spawned: &crate::pty::Spawned,
-        needle: &str,
-        present: bool,
-        secs: u64,
-    ) -> bool {
+    fn wait_for(spawned: &crate::pty::Spawned, needle: &str, present: bool, secs: u64) -> bool {
         let deadline = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < deadline {
             {
@@ -722,8 +710,12 @@ mod mode_tests {
         let (tx, _rx) = channel();
         let spawned = spawn(
             31,
-            &["/bin/sh".to_string(), "-c".to_string(),
-              "printf '\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1004h\\033[?1006h'; sleep 5".to_string()],
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf '\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1004h\\033[?1006h'; sleep 5"
+                    .to_string(),
+            ],
             Path::new("/tmp"),
             TermSize::new(80, 24),
             (8, 16),
@@ -810,8 +802,11 @@ mod mode_tests {
         let (tx, _rx) = channel();
         let spawned = spawn(
             32,
-            &["/bin/sh".to_string(), "-c".to_string(),
-              "printf '\\033[?1049h'; sleep 5".to_string()],
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf '\\033[?1049h'; sleep 5".to_string(),
+            ],
             Path::new("/tmp"),
             TermSize::new(80, 24),
             (8, 16),

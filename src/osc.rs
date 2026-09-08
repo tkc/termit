@@ -19,7 +19,7 @@ pub enum OscEvent {
     CommandExecuted,
     /// OSC 133;D: コマンドの終了。終了コードは省略されることがある。
     CommandFinished(Option<i32>),
-    /// OSC 1337 SetUserVar=tex_agent_id: エージェント ID の通知。
+    /// OSC 1337 SetUserVar=termit_agent_id: エージェント ID の通知。
     AgentId(String),
 }
 
@@ -158,7 +158,7 @@ fn parse_osc133(rest: &str) -> Option<OscEvent> {
 fn parse_osc1337(rest: &str) -> Option<OscEvent> {
     let var = rest.strip_prefix("SetUserVar=")?;
     let (name, value) = var.split_once('=')?;
-    if name != "tex_agent_id" {
+    if name != "termit_agent_id" {
         return None;
     }
     let decoded = base64::engine::general_purpose::STANDARD
@@ -196,19 +196,19 @@ fn percent_decode(s: &str) -> String {
 /// `precmd` で直前の終了コードと作業ディレクトリを知らせ、続けてプロンプトの
 /// 開始を知らせる。入力の開始位置はプロンプト文字列の末尾に置く。
 /// `%{ %}` は幅を持たない区間を表すので、桁の計算は狂わない。
-pub const ZSH_INTEGRATION: &str = r#"# tex shell integration (zsh)
-if [[ -n "$TEX_SHELL_INTEGRATION" && -z "$__TEX_LOADED" ]]; then
-  __TEX_LOADED=1
-  __tex_precmd() {
+pub const ZSH_INTEGRATION: &str = r#"# termit shell integration (zsh)
+if [[ -n "$TERMIT_SHELL_INTEGRATION" && -z "$__TERMIT_LOADED" ]]; then
+  __TERMIT_LOADED=1
+  __termit_precmd() {
     local st=$?
     printf '\033]133;D;%s\007' "$st"
     printf '\033]7;file://%s%s\007' "${HOST:-localhost}" "$PWD"
     printf '\033]133;A\007'
   }
-  __tex_preexec() { printf '\033]133;C\007' }
+  __termit_preexec() { printf '\033]133;C\007' }
   typeset -ga precmd_functions preexec_functions
-  precmd_functions+=(__tex_precmd)
-  preexec_functions+=(__tex_preexec)
+  precmd_functions+=(__termit_precmd)
+  preexec_functions+=(__termit_preexec)
   PS1="$PS1"$'%{\e]133;B\a%}'
 fi
 "#;
@@ -251,7 +251,10 @@ mod tests {
 
     #[test]
     fn 終了コードのない_d_を読む() {
-        assert_eq!(scan(b"\x1b]133;D\x07"), vec![OscEvent::CommandFinished(None)]);
+        assert_eq!(
+            scan(b"\x1b]133;D\x07"),
+            vec![OscEvent::CommandFinished(None)]
+        );
     }
 
     #[test]
@@ -297,7 +300,7 @@ mod tests {
         // base64("0198f5a2-1111-7000-8000-abcdefabcdef")
         let id = "0198f5a2-1111-7000-8000-abcdefabcdef";
         let b64 = base64::engine::general_purpose::STANDARD.encode(id);
-        let seq = format!("\x1b]1337;SetUserVar=tex_agent_id={b64}\x07");
+        let seq = format!("\x1b]1337;SetUserVar=termit_agent_id={b64}\x07");
         assert_eq!(scan(seq.as_bytes()), vec![OscEvent::AgentId(id.into())]);
     }
 
@@ -312,7 +315,7 @@ mod tests {
     fn 過大なペイロードを捨てる() {
         let mut s = OscScanner::new();
         let mut seq = b"\x1b]133;D;".to_vec();
-        seq.extend(std::iter::repeat(b'9').take(MAX_PAYLOAD + 10));
+        seq.extend(std::iter::repeat_n(b'9', MAX_PAYLOAD + 10));
         seq.push(0x07);
         assert!(s.feed(&seq).is_empty());
         // 打ち切った後も次のシーケンスを読める。

@@ -50,9 +50,7 @@ pub fn encode(
     // 移動の報告は、要求された種類のときだけ送る。
     match kind {
         Kind::Move if !mode.contains(TermMode::MOUSE_MOTION) => return None,
-        Kind::Drag
-            if !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) =>
-        {
+        Kind::Drag if !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) => {
             return None
         }
         _ => {}

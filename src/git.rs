@@ -126,7 +126,10 @@ mod tests {
         let s = short_path(p, 10);
         assert!(s.starts_with('…'), "{s}");
         assert!(s.ends_with("eee"), "{s}");
-        assert!(s.chars().map(crate::render::char_cols).sum::<usize>() <= 10, "{s}");
+        assert!(
+            s.chars().map(crate::render::char_cols).sum::<usize>() <= 10,
+            "{s}"
+        );
     }
 
     #[test]

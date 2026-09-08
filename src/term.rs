@@ -83,7 +83,10 @@ pub enum UiEvent {
     ClipboardStore(SessionId, String),
     /// クリップボードの内容を PTY へ書き戻す要求。
     #[allow(dead_code)]
-    ClipboardLoad(SessionId, Arc<dyn Fn(&str) -> String + Sync + Send + 'static>),
+    ClipboardLoad(
+        SessionId,
+        Arc<dyn Fn(&str) -> String + Sync + Send + 'static>,
+    ),
     /// PTY から取り出した OSC 通知。
     Osc(SessionId, crate::osc::OscEvent),
     /// 組み立てが終わったコマンドの記録。
@@ -136,16 +139,22 @@ impl EventListener for EventProxy {
                 self.write_pty(format(size).into_bytes());
             }
             Event::ClipboardStore(_, text) => {
-                let _ = self.ui_tx.send_event(UiEvent::ClipboardStore(self.id, text));
+                let _ = self
+                    .ui_tx
+                    .send_event(UiEvent::ClipboardStore(self.id, text));
             }
             Event::ClipboardLoad(_, format) => {
-                let _ = self.ui_tx.send_event(UiEvent::ClipboardLoad(self.id, format));
+                let _ = self
+                    .ui_tx
+                    .send_event(UiEvent::ClipboardLoad(self.id, format));
             }
             Event::Title(title) => {
                 let _ = self.ui_tx.send_event(UiEvent::Title(self.id, title));
             }
             Event::ResetTitle => {
-                let _ = self.ui_tx.send_event(UiEvent::Title(self.id, String::new()));
+                let _ = self
+                    .ui_tx
+                    .send_event(UiEvent::Title(self.id, String::new()));
             }
             Event::ChildExit(status) => {
                 let code = status.code().unwrap_or(-1);

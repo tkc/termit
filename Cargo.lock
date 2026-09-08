@@ -2370,7 +2370,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tex"
+name = "termit"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",

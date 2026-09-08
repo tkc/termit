@@ -149,9 +149,7 @@ impl Manager {
         for s in &mut self.sessions {
             let stale = match &s.branch_read {
                 None => true,
-                Some((at, dir)) => {
-                    dir != &s.cwd || now.duration_since(*at).as_secs() >= 2
-                }
+                Some((at, dir)) => dir != &s.cwd || now.duration_since(*at).as_secs() >= 2,
             };
             if stale {
                 s.branch = crate::git::branch_for(&s.cwd);
@@ -296,9 +294,7 @@ impl Manager {
         let parent_id = parent.id;
         let parent_title = parent.title.clone();
         let cwd = parent.cwd.clone();
-        let profile = profile_override
-            .unwrap_or(&parent.profile)
-            .to_string();
+        let profile = profile_override.unwrap_or(&parent.profile).to_string();
         let parent_base = parent.base_command.clone();
         let new_id = uuid::Uuid::new_v4().to_string();
         let vars = Vars {
@@ -427,9 +423,11 @@ impl Manager {
 }
 
 fn shell_argv(config: &Config) -> Vec<String> {
-    let program = config.shell.program.clone().unwrap_or_else(|| {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
-    });
+    let program = config
+        .shell
+        .program
+        .clone()
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
     let mut argv = vec![program];
     if config.shell.args.is_empty() {
         argv.push("-l".to_string());
@@ -485,23 +483,22 @@ impl Session {
 ///
 /// 入力の途中で画面がスクロールすると開始点が現在行より下になる。
 /// その場合は現在行だけを読む。
-pub fn grid_text(
-    term: &alacritty_terminal::Term<EventProxy>,
-    start: Point,
-    end: Point,
-) -> String {
+pub fn grid_text(term: &alacritty_terminal::Term<EventProxy>, start: Point, end: Point) -> String {
     let grid = term.grid();
-    let (start, end) = if start.line > end.line
-        || (start.line == end.line && start.column > end.column)
-    {
-        (Point::new(end.line, Column(0)), end)
-    } else {
-        (start, end)
-    };
+    let (start, end) =
+        if start.line > end.line || (start.line == end.line && start.column > end.column) {
+            (Point::new(end.line, Column(0)), end)
+        } else {
+            (start, end)
+        };
     let mut out = String::new();
     let mut line = start.line;
     while line <= end.line {
-        let first = if line == start.line { start.column.0 } else { 0 };
+        let first = if line == start.line {
+            start.column.0
+        } else {
+            0
+        };
         let last = if line == end.line {
             end.column.0
         } else {

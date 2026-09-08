@@ -287,7 +287,9 @@ impl Renderer {
             text_draws: Vec::new(),
             rect_draws: Vec::new(),
             strings: HashMap::new(),
-            timing: std::env::var("TEX_FRAME_LOG").is_ok().then(FrameTiming::default),
+            timing: std::env::var("TERMIT_FRAME_LOG")
+                .is_ok()
+                .then(FrameTiming::default),
             bench_target: None,
         };
         r.recompute_metrics();
@@ -348,7 +350,9 @@ impl Renderer {
             text_draws: Vec::new(),
             rect_draws: Vec::new(),
             strings: HashMap::new(),
-            timing: std::env::var("TEX_FRAME_LOG").is_ok().then(FrameTiming::default),
+            timing: std::env::var("TERMIT_FRAME_LOG")
+                .is_ok()
+                .then(FrameTiming::default),
             bench_target: None,
         };
         r.recompute_metrics();
@@ -504,9 +508,7 @@ impl Renderer {
             if self.measure_px(&candidate, style) <= max_px || keep == 0 {
                 // もう 1 文字入るなら入れる。
                 let more = build(&chars, keep + 1, drop_tail);
-                if keep + 1 < chars.len()
-                    && self.measure_px(&more, style) <= max_px
-                {
+                if keep + 1 < chars.len() && self.measure_px(&more, style) <= max_px {
                     keep += 1;
                     continue;
                 }
@@ -699,7 +701,12 @@ impl Renderer {
             let mut s = [0u8; 4];
             // Basic では字形の代替が働かず、等幅フォントにない文字が
             // 豆腐になる。1 文字ずつ整形しているので合字は生じない。
-            buffer.set_text(draw.key.c.encode_utf8(&mut s), &attrs, Shaping::Advanced, None);
+            buffer.set_text(
+                draw.key.c.encode_utf8(&mut s),
+                &attrs,
+                Shaping::Advanced,
+                None,
+            );
             buffer.shape_until_scroll(font_system, false);
             glyphs.insert(draw.key, buffer);
         }
@@ -965,7 +972,9 @@ impl Renderer {
             let _ = tx.send(r);
         });
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv().expect("読み戻しを待てない").expect("読み戻しに失敗");
+        rx.recv()
+            .expect("読み戻しを待てない")
+            .expect("読み戻しに失敗");
 
         let data = slice.get_mapped_range().expect("読み戻しの領域を取れない");
         // BGRA から RGBA へ並べ替えつつ、行の詰め物を落とす。

@@ -49,7 +49,9 @@ pub fn run() {
         std::thread::sleep(Duration::from_millis(15));
         // 溜まっている通知を捨て、次の更新で通知が飛ぶようにする。
         while rx.try_recv().is_ok() {}
-        spawned.dirty.store(false, std::sync::atomic::Ordering::Release);
+        spawned
+            .dirty
+            .store(false, std::sync::atomic::Ordering::Release);
         let start = Instant::now();
         spawned.handle.write(vec![ch]);
         let deadline = start + Duration::from_millis(200);
@@ -60,7 +62,9 @@ pub fn run() {
             if rx.recv_timeout(Duration::from_millis(5)).is_err() {
                 continue;
             }
-            spawned.dirty.store(false, std::sync::atomic::Ordering::Release);
+            spawned
+                .dirty
+                .store(false, std::sync::atomic::Ordering::Release);
             let t = spawned.term.lock();
             let grid = t.grid();
             'outer: for l in 0..grid.screen_lines() {

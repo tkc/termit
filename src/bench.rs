@@ -17,7 +17,10 @@ pub fn run() {
     for (w, h) in sizes {
         let mut r = pollster::block_on(Renderer::offscreen(w, h, "Menlo", 13.0));
         let (cols, rows) = r.grid_size();
-        println!("\n=== {w}x{h}  {cols} 桁 x {rows} 行 = {} セル ===", cols * rows);
+        println!(
+            "\n=== {w}x{h}  {cols} 桁 x {rows} 行 = {} セル ===",
+            cols * rows
+        );
         for (label, fill) in [("全面", 1.0f32), ("半分", 0.5), ("1 割", 0.1)] {
             let mut prep = Vec::new();
             let mut submit = Vec::new();

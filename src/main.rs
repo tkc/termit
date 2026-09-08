@@ -2,15 +2,15 @@
 
 mod bench;
 mod clipboard;
-mod latency;
-mod mouse;
-mod keytest;
-mod probe;
 mod config;
 mod git;
 mod history;
 mod input;
+mod keytest;
+mod latency;
+mod mouse;
 mod osc;
+mod probe;
 mod pty;
 mod rect;
 mod render;
@@ -22,9 +22,9 @@ mod theme;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use alacritty_terminal::index::{Column, Direction, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::index::{Column, Direction, Point, Side};
 use alacritty_terminal::term::{viewport_to_point, TermMode};
 use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
@@ -49,7 +49,7 @@ const SEARCH_ROWS: usize = 10;
 /// `TEX_KEYLOG` に書き出し先を指定したときだけ動く。
 fn keylog(event: &winit::event::KeyEvent, mods: ModifiersState) {
     use std::io::Write;
-    let Ok(path) = std::env::var("TEX_KEYLOG") else {
+    let Ok(path) = std::env::var("TERMIT_KEYLOG") else {
         return;
     };
     let base = event.key_without_modifiers();
@@ -99,7 +99,10 @@ fn main() {
         return;
     }
     if let Some(i) = args.iter().position(|a| a == "--probe") {
-        let out = args.get(i + 1).cloned().unwrap_or_else(|| "probe.rgba".into());
+        let out = args
+            .get(i + 1)
+            .cloned()
+            .unwrap_or_else(|| "probe.rgba".into());
         probe::run(&out);
         return;
     }
@@ -107,7 +110,7 @@ fn main() {
     let config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("tex: {e}");
+            eprintln!("termit: {e}");
             std::process::exit(1);
         }
     };
@@ -124,10 +127,12 @@ fn main() {
         cwd,
         proxy,
         state: None,
-        counters: std::env::var("TEX_FRAME_LOG").is_ok().then(Counters::default),
+        counters: std::env::var("TERMIT_FRAME_LOG")
+            .is_ok()
+            .then(Counters::default),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
-        eprintln!("tex: {e}");
+        eprintln!("termit: {e}");
         std::process::exit(1);
     }
 }
@@ -314,7 +319,7 @@ impl ApplicationHandler<UiEvent> for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("tex")
+            .with_title("termit")
             .with_inner_size(winit::dpi::LogicalSize::new(1100.0, 720.0));
         let window = Arc::new(
             event_loop
@@ -592,9 +597,7 @@ impl App {
         state
             .manager
             .set_cell((cell.width as u16, cell.height as u16));
-        state
-            .manager
-            .resize(TermSize::new(term_cols, term_rows));
+        state.manager.resize(TermSize::new(term_cols, term_rows));
         state.request_redraw();
     }
 
@@ -691,8 +694,7 @@ impl App {
             Action::ForkWithProfile => {
                 let names = config.profile_names();
                 if names.len() < 2 {
-                    state.status =
-                        Some("no profile other than host is configured".into());
+                    state.status = Some("no profile other than host is configured".into());
                 } else {
                     state.search = None;
                     state.picker = Some(PickerState { names, selected: 1 });
@@ -716,7 +718,6 @@ impl App {
             Action::ToggleSidebar => {
                 state.sidebar = !state.sidebar;
                 self.reflow();
-                return;
             }
             Action::RenameSession => {
                 let current = state
@@ -728,13 +729,11 @@ impl App {
                 state.search = None;
                 state.find = None;
                 state.rename = Some(RenameState { input: current });
-                return;
             }
             Action::FindInScreen => {
                 state.picker = None;
                 state.search = None;
                 state.find = Some(search::ScreenSearch::new());
-                return;
             }
             Action::SearchHistory => {
                 state.picker = None;
@@ -746,7 +745,6 @@ impl App {
                     selected: 0,
                 });
                 self.refresh_search();
-                return;
             }
             Action::Copy => {
                 if let Some(s) = state.manager.selected() {
@@ -789,13 +787,11 @@ impl App {
                 let size = state.renderer.font_size() + 1.0;
                 state.renderer.set_font_size(size);
                 self.reflow();
-                return;
             }
             Action::FontSmaller => {
                 let size = state.renderer.font_size() - 1.0;
                 state.renderer.set_font_size(size);
                 self.reflow();
-                return;
             }
             Action::ScrollUp => {
                 if let Some(s) = state.manager.selected() {
@@ -815,22 +811,21 @@ impl App {
     }
 
     // ------------------------------------------------------------ マウス
-
 }
 
 /// マウス位置をセル座標に直す。戻り値はセルの桁と行、桁内の左右。
 fn mouse_cell(state: &State) -> (usize, usize, Side) {
-        let cell = state.renderer.cell();
-        let col_f = state.mouse.x / cell.width;
-        let col = col_f.max(0.0) as usize;
-        let row = (state.mouse.y / cell.height).max(0.0) as usize;
-        let side = if col_f - col_f.floor() < 0.5 {
-            Side::Left
-        } else {
-            Side::Right
-        };
-        (col, row, side)
-    }
+    let cell = state.renderer.cell();
+    let col_f = state.mouse.x / cell.width;
+    let col = col_f.max(0.0) as usize;
+    let row = (state.mouse.y / cell.height).max(0.0) as usize;
+    let side = if col_f - col_f.floor() < 0.5 {
+        Side::Left
+    } else {
+        Side::Right
+    };
+    (col, row, side)
+}
 
 /// 端末領域の中での 0 起点の位置。領域の外なら `None`。
 fn terminal_cell(layout: &Layout, col: usize, row: usize) -> Option<(usize, usize)> {
@@ -845,17 +840,17 @@ fn terminal_cell(layout: &Layout, col: usize, row: usize) -> Option<(usize, usiz
 
 /// 端末領域のセルをグリッドの位置に直す。領域の外なら `None`。
 fn terminal_point(state: &State, layout: &Layout, col: usize, row: usize) -> Option<Point> {
-        if col < layout.term_col || row >= layout.term_rows {
-            return None;
-        }
-        let term_col = (col - layout.term_col).min(layout.term_cols.saturating_sub(1));
-        let session = state.manager.selected()?;
-        let display_offset = session.term.lock().grid().display_offset();
-        Some(viewport_to_point(
-            display_offset,
-            Point::new(row, Column(term_col)),
-        ))
+    if col < layout.term_col || row >= layout.term_rows {
+        return None;
     }
+    let term_col = (col - layout.term_col).min(layout.term_cols.saturating_sub(1));
+    let session = state.manager.selected()?;
+    let display_offset = session.term.lock().grid().display_offset();
+    Some(viewport_to_point(
+        display_offset,
+        Point::new(row, Column(term_col)),
+    ))
+}
 
 impl App {
     /// 端末上のプログラムがマウスを要求していれば、釦の出来事を渡す。
@@ -1082,7 +1077,6 @@ impl App {
             .lock()
             .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
     }
-
 }
 
 fn layout_of(config: &Config, state: &State) -> Layout {
@@ -1154,7 +1148,9 @@ impl App {
 
     fn on_rename_key(&mut self, key: &Key, event: &winit::event::KeyEvent) {
         let Some(state) = &mut self.state else { return };
-        let Some(rename) = &mut state.rename else { return };
+        let Some(rename) = &mut state.rename else {
+            return;
+        };
         match key {
             Key::Named(NamedKey::Escape) => state.rename = None,
             Key::Named(NamedKey::Enter) => {
@@ -1184,8 +1180,8 @@ impl App {
     fn on_find_key(&mut self, key: &Key, event: &winit::event::KeyEvent, mods: ModifiersState) {
         let Some(state) = &mut self.state else { return };
         let Some(find) = &mut state.find else { return };
-        let step: Option<Direction>;
-        match key {
+
+        let step: Option<Direction> = match key {
             Key::Named(NamedKey::Escape) => {
                 state.find = None;
                 state.find_cells.clear();
@@ -1196,22 +1192,22 @@ impl App {
             Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowUp) => {
                 // 既定は古い方（上）へ。端末では下ほど新しいので、
                 // 探したいものはたいてい上にある。
-                step = Some(if mods.shift_key() {
+                Some(if mods.shift_key() {
                     Direction::Right
                 } else {
                     Direction::Left
-                });
+                })
             }
-            Key::Named(NamedKey::ArrowDown) => step = Some(Direction::Right),
+            Key::Named(NamedKey::ArrowDown) => Some(Direction::Right),
             Key::Named(NamedKey::Backspace) => {
                 find.query.pop();
                 find.rebuild();
-                step = Some(Direction::Left);
+                Some(Direction::Left)
             }
             Key::Named(NamedKey::Tab) => {
                 find.regex_mode = !find.regex_mode;
                 find.rebuild();
-                step = Some(Direction::Left);
+                Some(Direction::Left)
             }
             _ => {
                 let Some(text) = event.text.as_deref() else {
@@ -1227,9 +1223,9 @@ impl App {
                 }
                 find.query.push_str(text);
                 find.rebuild();
-                step = Some(Direction::Left);
+                Some(Direction::Left)
             }
-        }
+        };
         let Some(direction) = step else { return };
         self.find_step(direction);
     }
@@ -1250,12 +1246,7 @@ impl App {
         }
     }
 
-    fn on_search_key(
-        &mut self,
-        key: &Key,
-        event: &winit::event::KeyEvent,
-        mods: ModifiersState,
-    ) {
+    fn on_search_key(&mut self, key: &Key, event: &winit::event::KeyEvent, mods: ModifiersState) {
         let Some(state) = &mut self.state else { return };
         let Some(search) = &mut state.search else {
             return;
@@ -1352,7 +1343,7 @@ impl App {
             .manager
             .selected()
             .and_then(|s| s.window_title.clone())
-            .unwrap_or_else(|| "tex".to_string());
+            .unwrap_or_else(|| "termit".to_string());
         if want_title != state.shown_title {
             if let Some(w) = &state.window {
                 w.set_title(&want_title);
@@ -1465,7 +1456,8 @@ const DIVIDER_GRAB: f32 = 4.0;
 
 /// 境目の上にカーソルがあるか。
 fn on_divider(state: &State, layout: &Layout, px: f32) -> bool {
-    layout.sidebar_px > 0.0 && (px - layout.sidebar_px).abs() <= DIVIDER_GRAB * state.renderer.scale()
+    layout.sidebar_px > 0.0
+        && (px - layout.sidebar_px).abs() <= DIVIDER_GRAB * state.renderer.scale()
 }
 
 /// 左ペインの文字の体裁。桁に縛られないので、等幅でない書体で組む。
@@ -1573,10 +1565,7 @@ fn sidebar_hit(state: &State, layout: &Layout, px: f32, py: f32) -> Option<Sideb
         let first_line = state.renderer.line_height_px(sidebar::SIZE_TITLE);
         let close_right = sl.rect_x + sl.rect_w - 6.0 * sc;
         let close_left = close_right - 18.0 * sc;
-        if py < b.top + sidebar::PAD_TOP * sc + first_line
-            && px >= close_left
-            && px < close_right
-        {
+        if py < b.top + sidebar::PAD_TOP * sc + first_line && px >= close_left && px < close_right {
             return Some(SidebarHit::Close(b.index));
         }
         return Some(SidebarHit::Select(b.index));
@@ -1593,12 +1582,18 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         .fill_px(0.0, 0.0, sl.width, height_px, theme.chrome_bg, 0.0);
 
     // 押せる目印。キーが効かない環境でもここから増やせる。
-    let plus_w = state.renderer.measure_px("+", style(sidebar::SIZE_TITLE, true));
+    let plus_w = state
+        .renderer
+        .measure_px("+", style(sidebar::SIZE_TITLE, true));
     let plus_x = sl.rect_x + sl.rect_w - plus_w - 6.0 * sc;
     let plus_y = (sidebar::HEADER * sc - state.renderer.line_height_px(sidebar::SIZE_TITLE)) / 2.0;
-    state
-        .renderer
-        .put_text_px(plus_x, plus_y, "+", style(sidebar::SIZE_TITLE, true), theme.accent);
+    state.renderer.put_text_px(
+        plus_x,
+        plus_y,
+        "+",
+        style(sidebar::SIZE_TITLE, true),
+        theme.accent,
+    );
 
     let selected = state.manager.selected_index();
     for (n, b) in sl.blocks.iter().enumerate() {
@@ -1615,9 +1610,8 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
             RunState::Exited(code) => Some(code),
         };
 
-        let hovered = state.mouse.x < sl.width
-            && state.mouse.y >= b.top
-            && state.mouse.y < b.top + b.height;
+        let hovered =
+            state.mouse.x < sl.width && state.mouse.y >= b.top && state.mouse.y < b.top + b.height;
         if b.index == selected {
             state.renderer.fill_px(
                 sl.rect_x,
@@ -1633,9 +1627,13 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         let title_h = state.renderer.line_height_px(sidebar::SIZE_TITLE);
         // 右端に並べる印の左端。名前はここまでで切る。
         let right = sl.rect_x + sl.rect_w;
-        let hint_w = state.renderer.measure_px("⌘9", style(sidebar::SIZE_BRANCH, false));
+        let hint_w = state
+            .renderer
+            .measure_px("⌘9", style(sidebar::SIZE_BRANCH, false));
         let name_limit = right - 12.0 * sc - hint_w - text_x;
-        let mark_w = state.renderer.measure_px("*", style(sidebar::SIZE_TITLE, false));
+        let mark_w = state
+            .renderer
+            .measure_px("*", style(sidebar::SIZE_TITLE, false));
         let avail = (name_limit - if forked { mark_w } else { 0.0 }).max(0.0);
         let mut name = if is_path {
             state
@@ -1688,7 +1686,9 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         // 右端は、ふだんは ⌘ の番号、カーソルが乗っているときは閉じる印。
         // 両方を常に置くと名前の幅が足りない。
         if hovered {
-            let xw = state.renderer.measure_px("×", style(sidebar::SIZE_SUB, false));
+            let xw = state
+                .renderer
+                .measure_px("×", style(sidebar::SIZE_SUB, false));
             state.renderer.put_text_px(
                 right - 6.0 * sc - xw,
                 y + (title_h - state.renderer.line_height_px(sidebar::SIZE_SUB)) / 2.0,
@@ -1698,7 +1698,9 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
             );
         } else if n < 9 {
             let hint = format!("⌘{}", n + 1);
-            let hw = state.renderer.measure_px(&hint, style(sidebar::SIZE_BRANCH, false));
+            let hw = state
+                .renderer
+                .measure_px(&hint, style(sidebar::SIZE_BRANCH, false));
             state.renderer.put_text_px(
                 right - 6.0 * sc - hw,
                 y + (title_h - small_h) / 2.0,
@@ -1711,25 +1713,48 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
 
         // 2 段目は端末上のプログラムが名乗った題名。
         if let Some(title) = osc_title {
-            let w = state
-                .renderer
-                .put_text_px(text_x, y, "✻ ", style(sidebar::SIZE_SUB, false), theme.accent);
+            let w = state.renderer.put_text_px(
+                text_x,
+                y,
+                "✻ ",
+                style(sidebar::SIZE_SUB, false),
+                theme.accent,
+            );
             let limit = (right - 8.0 * sc - (text_x + w)).max(0.0);
             let clipped = state
                 .renderer
                 .fit_tail(&title, style(sidebar::SIZE_SUB, false), limit);
-            state.renderer.put_text_px(text_x + w, y, &clipped, style(sidebar::SIZE_SUB, false), theme.fg_secondary);
+            state.renderer.put_text_px(
+                text_x + w,
+                y,
+                &clipped,
+                style(sidebar::SIZE_SUB, false),
+                theme.fg_secondary,
+            );
             y += state.renderer.line_height_px(sidebar::SIZE_SUB);
         }
 
         // 3 段目はブランチ名。
         if let Some(branch) = branch {
-            let w = state.renderer.put_text_px(text_x, y, "⋔ ", style(sidebar::SIZE_BRANCH, false), theme.fg_tertiary);
+            let w = state.renderer.put_text_px(
+                text_x,
+                y,
+                "⋔ ",
+                style(sidebar::SIZE_BRANCH, false),
+                theme.fg_tertiary,
+            );
             let limit = (right - 8.0 * sc - (text_x + w)).max(0.0);
-            let clipped = state
-                .renderer
-                .fit_tail(&branch, style(sidebar::SIZE_BRANCH, false), limit);
-            state.renderer.put_text_px(text_x + w, y, &clipped, style(sidebar::SIZE_BRANCH, false), theme.fg_tertiary);
+            let clipped =
+                state
+                    .renderer
+                    .fit_tail(&branch, style(sidebar::SIZE_BRANCH, false), limit);
+            state.renderer.put_text_px(
+                text_x + w,
+                y,
+                &clipped,
+                style(sidebar::SIZE_BRANCH, false),
+                theme.fg_tertiary,
+            );
         }
     }
 
@@ -1761,13 +1786,25 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         } else {
             theme.warn
         };
-        let w = state.renderer.put_text_px(sl.rect_x + 4.0 * sc, y, &format!("{code:>3} "), style(sidebar::SIZE_RECENT, false), color);
+        let w = state.renderer.put_text_px(
+            sl.rect_x + 4.0 * sc,
+            y,
+            &format!("{code:>3} "),
+            style(sidebar::SIZE_RECENT, false),
+            color,
+        );
         let limit = (sl.rect_w - 8.0 * sc - w).max(0.0);
         let clipped =
             state
                 .renderer
                 .fit_tail(&entry.command, style(sidebar::SIZE_RECENT, false), limit);
-        state.renderer.put_text_px(sl.rect_x + 4.0 * sc + w, y, &clipped, style(sidebar::SIZE_RECENT, false), theme.fg_secondary);
+        state.renderer.put_text_px(
+            sl.rect_x + 4.0 * sc + w,
+            y,
+            &clipped,
+            style(sidebar::SIZE_RECENT, false),
+            theme.fg_secondary,
+        );
         y += line_h;
     }
 }
@@ -1858,7 +1895,9 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         if d.bg != default_bg {
             state.renderer.fill_cells(x, d.row, cols, 1, d.bg);
         }
-        state.renderer.put_char(x, d.row, d.c, d.fg, d.bold, d.italic);
+        state
+            .renderer
+            .put_char(x, d.row, d.c, d.fg, d.bold, d.italic);
         if d.underline {
             state.renderer.underline_cells(x, d.row, cols, d.fg);
         }
@@ -1895,7 +1934,9 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
                 match cursor_shape {
                     CursorShape::Beam => state.renderer.cursor_beam(x, y, theme.cursor),
                     CursorShape::Underline => {
-                        state.renderer.underline_cells(x, y, cursor_cols, theme.cursor)
+                        state
+                            .renderer
+                            .underline_cells(x, y, cursor_cols, theme.cursor)
                     }
                     _ => state
                         .renderer
@@ -1927,22 +1968,33 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
     // 重ねた一覧は、帯の上へ同じ高さの行で積む。
     let overlay = |state: &mut State, rows: usize| -> f32 {
         let top = bar_y - rows as f32 * line_h;
-        state
-            .renderer
-            .fill_px(x0, top, w, rows as f32 * line_h + bar_h, theme.chrome_bg, 0.0);
+        state.renderer.fill_px(
+            x0,
+            top,
+            w,
+            rows as f32 * line_h + bar_h,
+            theme.chrome_bg,
+            0.0,
+        );
         top
     };
 
     if let Some(rename) = &state.rename {
         let input = rename.input.clone();
-        state.renderer.fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
+        state
+            .renderer
+            .fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
         let mut x = x0 + pad;
         x += state
             .renderer
             .put_text_px(x, ty, "name: ", st, theme.fg_secondary);
-        x += state.renderer.put_text_px(x, ty, &input, st, theme.fg_primary);
+        x += state
+            .renderer
+            .put_text_px(x, ty, &input, st, theme.fg_primary);
         x += draw_preedit_px(state, x, ty, st, theme);
-        state.renderer.fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
+        state
+            .renderer
+            .fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
         state.cursor_px = Some((x, ty));
         let note = "Enter to set   empty resets to path   Esc to cancel";
         let nw = state.renderer.measure_px(note, st);
@@ -1961,16 +2013,28 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
             find.invalid,
             find.current.is_some(),
         );
-        state.renderer.fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
-        let label = if regex_mode { "find (regex): " } else { "find: " };
+        state
+            .renderer
+            .fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
+        let label = if regex_mode {
+            "find (regex): "
+        } else {
+            "find: "
+        };
         let mut x = x0 + pad;
         x += state
             .renderer
             .put_text_px(x, ty, label, st, theme.fg_secondary);
-        let fg = if invalid { theme.warn } else { theme.fg_primary };
+        let fg = if invalid {
+            theme.warn
+        } else {
+            theme.fg_primary
+        };
         x += state.renderer.put_text_px(x, ty, &query, st, fg);
         x += draw_preedit_px(state, x, ty, st, theme);
-        state.renderer.fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
+        state
+            .renderer
+            .fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
         state.cursor_px = Some((x, ty));
         let note = if invalid {
             "invalid regex"
@@ -1995,22 +2059,22 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
         for (i, name) in names.iter().enumerate() {
             let ry = top + i as f32 * line_h;
             if i == sel {
-                state.renderer.fill_px(x0, ry, w, line_h, theme.surface, 0.0);
+                state
+                    .renderer
+                    .fill_px(x0, ry, w, line_h, theme.surface, 0.0);
             }
             let fg = if i == sel {
                 theme.fg_primary
             } else {
                 theme.fg_secondary
             };
-            state.renderer.put_text_px(
-                x0 + pad,
-                ry,
-                &format!("{}  {}", i + 1, name),
-                st,
-                fg,
-            );
+            state
+                .renderer
+                .put_text_px(x0 + pad, ry, &format!("{}  {}", i + 1, name), st, fg);
         }
-        state.renderer.fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
+        state
+            .renderer
+            .fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
         state.renderer.put_text_px(
             x0 + pad,
             ty,
@@ -2031,19 +2095,23 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
         for (i, entry) in results.iter().enumerate() {
             let ry = top + i as f32 * line_h;
             if i == sel {
-                state.renderer.fill_px(x0, ry, w, line_h, theme.surface, 0.0);
+                state
+                    .renderer
+                    .fill_px(x0, ry, w, line_h, theme.surface, 0.0);
             }
             let fg = if i == sel {
                 theme.fg_primary
             } else {
                 theme.fg_secondary
             };
-            let text = state
+            let text = state.renderer.fit_tail(&entry.command, st, w - pad * 3.0);
+            state
                 .renderer
-                .fit_tail(&entry.command, st, w - pad * 3.0);
-            state.renderer.put_text_px(x0 + pad * 2.0, ry, &text, st, fg);
+                .put_text_px(x0 + pad * 2.0, ry, &text, st, fg);
         }
-        state.renderer.fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
+        state
+            .renderer
+            .fill_px(x0, bar_y, w, bar_h, theme.surface, 0.0);
         let mut x = x0 + pad;
         x += state.renderer.put_text_px(
             x,
@@ -2052,16 +2120,22 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
             st,
             theme.fg_secondary,
         );
-        x += state.renderer.put_text_px(x, ty, &query, st, theme.fg_primary);
+        x += state
+            .renderer
+            .put_text_px(x, ty, &query, st, theme.fg_primary);
         x += draw_preedit_px(state, x, ty, st, theme);
-        state.renderer.fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
+        state
+            .renderer
+            .fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
         state.cursor_px = Some((x, ty));
         return;
     }
 
     if let Some(msg) = &state.status {
         let msg = msg.clone();
-        state.renderer.fill_px(x0, bar_y, w, bar_h, theme.chrome_bg, 0.0);
+        state
+            .renderer
+            .fill_px(x0, bar_y, w, bar_h, theme.chrome_bg, 0.0);
         let text = state.renderer.fit_tail(&msg, st, w - pad * 2.0);
         state
             .renderer
@@ -2078,13 +2152,7 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
 }
 
 /// 変換中の文字列を帯の中に出す。返す値は描いた幅。
-fn draw_preedit_px(
-    state: &mut State,
-    x: f32,
-    y: f32,
-    st: TextStyle,
-    theme: &Theme,
-) -> f32 {
+fn draw_preedit_px(state: &mut State, x: f32, y: f32, st: TextStyle, theme: &Theme) -> f32 {
     if state.preedit.is_empty() {
         return 0.0;
     }
@@ -2092,10 +2160,14 @@ fn draw_preedit_px(
     let w = state.renderer.measure_px(&text, st);
     let h = state.renderer.line_height_px(st.size);
     state.renderer.fill_px(x, y, w, h, theme.chrome_bg, 0.0);
-    state.renderer.put_text_px(x, y, &text, st, theme.fg_primary);
+    state
+        .renderer
+        .put_text_px(x, y, &text, st, theme.fg_primary);
     // 未確定であることを下線で示す。
     let t = (state.renderer.scale()).max(1.0);
-    state.renderer.fill_px(x, y + h - t, w, t, theme.accent, 0.0);
+    state
+        .renderer
+        .fill_px(x, y + h - t, w, t, theme.accent, 0.0);
     w
 }
 
@@ -2139,12 +2211,12 @@ mod path_tests {
         let config = crate::config::config_path().expect("設定の場所が決まる");
         let db = crate::history::db_path().expect("履歴の場所が決まる");
         assert!(
-            config.ends_with(".config/tex/config.toml"),
+            config.ends_with(".config/termit/config.toml"),
             "設定の場所が想定と違う: {}",
             config.display()
         );
         assert!(
-            db.ends_with(".local/share/tex/history.db"),
+            db.ends_with(".local/share/termit/history.db"),
             "履歴の場所が想定と違う: {}",
             db.display()
         );
@@ -2184,12 +2256,20 @@ pub(crate) fn collect_find_cells(state: &mut State) {
     drop(term);
 
     let push = |set: &mut std::collections::HashSet<(i32, usize)>,
-                    m: &alacritty_terminal::term::search::Match| {
+                m: &alacritty_terminal::term::search::Match| {
         let (start, end) = (m.start(), m.end());
         let mut line = start.line;
         while line <= end.line {
-            let first = if line == start.line { start.column.0 } else { 0 };
-            let last = if line == end.line { end.column.0 } else { cols - 1 };
+            let first = if line == start.line {
+                start.column.0
+            } else {
+                0
+            };
+            let last = if line == end.line {
+                end.column.0
+            } else {
+                cols - 1
+            };
             for c in first..=last.min(cols.saturating_sub(1)) {
                 set.insert((line.0, c));
             }

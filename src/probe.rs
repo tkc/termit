@@ -148,7 +148,7 @@ pub fn run(out_path: &str) {
     };
 
     // 重ねた一覧の描画も確かめられるようにする。
-    match std::env::var("TEX_PROBE_OVERLAY").as_deref() {
+    match std::env::var("TERMIT_PROBE_OVERLAY").as_deref() {
         Ok("picker") => {
             state.picker = Some(crate::PickerState {
                 names: vec!["host".into(), "sandbox".into(), "no-network".into()],
@@ -215,12 +215,8 @@ pub fn run(out_path: &str) {
     );
 
     // 子プロセスを片付ける。
-    while !state.manager.is_empty() {
-        state.manager.select(0);
-        state.manager.close_selected();
-        state.manager.select(0);
-        state.manager.close_selected();
-        break;
+    for s in state.manager.sessions_mut() {
+        s.pty.kill();
     }
 }
 

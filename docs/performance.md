@@ -1,4 +1,4 @@
-# tex の応答速度を調べた記録
+# termit の応答速度を調べた記録
 
 作成日：2026-09-09
 対象：`ec5f0b8` 以降の実装、macOS（Apple Silicon）、release ビルド
@@ -24,7 +24,7 @@
 ### 2.1 描画そのものの費用
 
 ```
-tex --bench
+termit --bench
 ```
 
 ウィンドウを開かずに、実際の描画関数へ画面いっぱいの文字を流して測る。
@@ -33,7 +33,7 @@ tex --bench
 ### 2.2 入力の往復
 
 ```
-tex --latency-test
+termit --latency-test
 ```
 
 `/bin/cat` を PTY で起動し、1 文字書いてからそれがグリッドに現れるまでを測る。
@@ -44,7 +44,7 @@ tex --latency-test
 ### 2.3 実際の動作中の内訳
 
 ```
-RUST_LOG=info TEX_FRAME_LOG=1 tex
+RUST_LOG=info TERMIT_FRAME_LOG=1 tex
 ```
 
 1 秒ごとに次を出す。
@@ -122,7 +122,7 @@ CPU から表示までの遅れは **50ms、30ms、16ms のあいだで揺れる
 2 にすると、描き終えたフレームは次の走査で表示されることがほぼ保証される。
 
 wgpu の `desired_maximum_frame_latency` はこの値に対応する。
-tex は既定の 2 を使っていた。**1 へ下げた。**
+termit は既定の 2 を使っていた。**1 へ下げた。**
 
 ## 5. 打った手
 
@@ -145,7 +145,7 @@ kitty も `sync_to_monitor no` を、遅延を詰めたい利用者向けの設�
 
 **設定と履歴の置き場所を直した。**
 macOS の `dirs::config_dir()` は `~/.config` ではなく `~/Library/Application Support` を返す。
-README には `~/.config/tex/config.toml` と書いてあり、実装とずれていた。
+README には `~/.config/termit/config.toml` と書いてあり、実装とずれていた。
 XDG の作法（`$XDG_CONFIG_HOME` または `~/.config`）に合わせた。
 この記録の調査中は、設定が読まれないまま測っていて、原因を取り違えかけた。
 
@@ -153,13 +153,13 @@ XDG の作法（`$XDG_CONFIG_HOME` または `~/.config`）に合わせた。
 
 **損傷追跡（damage tracking）**
 alacritty も foot も、変わった行だけを描き直す仕組みを持つ。
-`alacritty_terminal` は `TermDamage` を提供しており、tex はこれを使っていない。
+`alacritty_terminal` は `TermDamage` を提供しており、termit はこれを使っていない。
 ただし 3.1 節のとおり全面書き換えでも 2.4ms なので、いま入れても体感は変わらない。
 入れる価値が出るのは、4K や 6K で全面を毎フレーム描くようになったときである。
 
 **行単位のまとめ描き**
 alacritty は 1 回の描画命令で最大 65,536 個の字形を送る。
-tex は 1 セルにつき 1 個の `TextArea` を積んでおり、命令の数では大きく劣る。
+termit は 1 セルにつき 1 個の `TextArea` を積んでおり、命令の数では大きく劣る。
 それでも 2.4ms で収まっているため、いま作り替える理由はない。
 
 **`presentsWithTransaction`**
@@ -174,7 +174,7 @@ wgpu からは触れない。触るには Metal の層を直接持つ必要が�
 ## 7. この調査で分かった、測り方の落とし穴
 
 **設定が読まれていないことに気付かず、3 回測り直した。**
-出力を出すためにシェルを差し替える設定を `~/.config/tex/` へ置いたが、
+出力を出すためにシェルを差し替える設定を `~/.config/termit/` へ置いたが、
 実装は `~/Library/Application Support/tex/` を見ていた。
 その結果「11 秒で 1 フレームしか描かない」という数字が出て、深刻な不具合に見えた。
 実際には、何も出力していないシェルを正しく待っていただけだった。

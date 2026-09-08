@@ -289,16 +289,31 @@ mod tests {
     #[test]
     fn ctrl_と英字を制御文字へ落とす() {
         let m = ModifiersState::CONTROL;
-        assert_eq!(encode(&ch("\u{3}"), &ch("c"), None, m, TermMode::empty()).unwrap(), vec![0x03]);
-        assert_eq!(encode(&ch("\u{4}"), &ch("d"), None, m, TermMode::empty()).unwrap(), vec![0x04]);
-        assert_eq!(encode(&ch("\u{1}"), &ch("a"), None, m, TermMode::empty()).unwrap(), vec![0x01]);
+        assert_eq!(
+            encode(&ch("\u{3}"), &ch("c"), None, m, TermMode::empty()).unwrap(),
+            vec![0x03]
+        );
+        assert_eq!(
+            encode(&ch("\u{4}"), &ch("d"), None, m, TermMode::empty()).unwrap(),
+            vec![0x04]
+        );
+        assert_eq!(
+            encode(&ch("\u{1}"), &ch("a"), None, m, TermMode::empty()).unwrap(),
+            vec![0x01]
+        );
     }
 
     #[test]
     fn ctrl_と記号を制御文字へ落とす() {
         let m = ModifiersState::CONTROL;
-        assert_eq!(encode(&ch("\u{1b}"), &ch("["), None, m, TermMode::empty()).unwrap(), vec![0x1b]);
-        assert_eq!(encode(&ch("\0"), &ch(" "), None, m, TermMode::empty()).unwrap(), vec![0x00]);
+        assert_eq!(
+            encode(&ch("\u{1b}"), &ch("["), None, m, TermMode::empty()).unwrap(),
+            vec![0x1b]
+        );
+        assert_eq!(
+            encode(&ch("\0"), &ch(" "), None, m, TermMode::empty()).unwrap(),
+            vec![0x00]
+        );
     }
 
     #[test]
@@ -313,7 +328,14 @@ mod tests {
     #[test]
     fn backspace_は_0x7f_を送る() {
         assert_eq!(
-            encode(&named(NamedKey::Backspace), &named(NamedKey::Backspace), None, NONE, TermMode::empty()).unwrap(),
+            encode(
+                &named(NamedKey::Backspace),
+                &named(NamedKey::Backspace),
+                None,
+                NONE,
+                TermMode::empty()
+            )
+            .unwrap(),
             vec![0x7f]
         );
     }
@@ -321,7 +343,14 @@ mod tests {
     #[test]
     fn delete_は_csi_3_チルダを送る() {
         assert_eq!(
-            encode(&named(NamedKey::Delete), &named(NamedKey::Delete), None, NONE, TermMode::empty()).unwrap(),
+            encode(
+                &named(NamedKey::Delete),
+                &named(NamedKey::Delete),
+                None,
+                NONE,
+                TermMode::empty()
+            )
+            .unwrap(),
             b"\x1b[3~"
         );
     }
@@ -329,11 +358,25 @@ mod tests {
     #[test]
     fn 矢印はカーソルモードで形が変わる() {
         assert_eq!(
-            encode(&named(NamedKey::ArrowUp), &named(NamedKey::ArrowUp), None, NONE, TermMode::empty()).unwrap(),
+            encode(
+                &named(NamedKey::ArrowUp),
+                &named(NamedKey::ArrowUp),
+                None,
+                NONE,
+                TermMode::empty()
+            )
+            .unwrap(),
             b"\x1b[A"
         );
         assert_eq!(
-            encode(&named(NamedKey::ArrowUp), &named(NamedKey::ArrowUp), None, NONE, TermMode::APP_CURSOR).unwrap(),
+            encode(
+                &named(NamedKey::ArrowUp),
+                &named(NamedKey::ArrowUp),
+                None,
+                NONE,
+                TermMode::APP_CURSOR
+            )
+            .unwrap(),
             b"\x1bOA"
         );
     }
@@ -341,7 +384,14 @@ mod tests {
     #[test]
     fn shift_tab_は逆タブを送る() {
         assert_eq!(
-            encode(&named(NamedKey::Tab), &named(NamedKey::Tab), None, ModifiersState::SHIFT, TermMode::empty()).unwrap(),
+            encode(
+                &named(NamedKey::Tab),
+                &named(NamedKey::Tab),
+                None,
+                ModifiersState::SHIFT,
+                TermMode::empty()
+            )
+            .unwrap(),
             b"\x1b[Z"
         );
     }
@@ -351,12 +401,22 @@ mod tests {
         // macOS では Ctrl+C の logical_key が "\u{3}" になることがある。
         // 修飾を外したキーで照合するため、動作の判定は影響を受けない。
         assert_eq!(
-            action_for(&ch("o"), PhysicalKey::Code(KeyCode::F35), ModifiersState::CONTROL),
+            action_for(
+                &ch("o"),
+                PhysicalKey::Code(KeyCode::F35),
+                ModifiersState::CONTROL
+            ),
             Some(Action::NewSession)
         );
         assert_eq!(
-            encode(&ch("\u{3}"), &ch("c"), None, ModifiersState::CONTROL, TermMode::empty())
-                .unwrap(),
+            encode(
+                &ch("\u{3}"),
+                &ch("c"),
+                None,
+                ModifiersState::CONTROL,
+                TermMode::empty()
+            )
+            .unwrap(),
             vec![0x03]
         );
     }
@@ -367,10 +427,19 @@ mod tests {
         let phys = PhysicalKey::Code(KeyCode::F35);
         assert_eq!(action_for(&ch("o"), phys, ctrl), Some(Action::NewSession));
         assert_eq!(action_for(&ch("\\"), phys, ctrl), Some(Action::Fork));
-        assert_eq!(action_for(&ch("]"), phys, ctrl), Some(Action::ForkWithProfile));
+        assert_eq!(
+            action_for(&ch("]"), phys, ctrl),
+            Some(Action::ForkWithProfile)
+        );
         assert_eq!(action_for(&ch("^"), phys, ctrl), Some(Action::SelectNext));
-        assert_eq!(action_for(&ch("b"), phys, ctrl), Some(Action::ToggleSidebar));
-        assert_eq!(action_for(&ch("r"), phys, ctrl), Some(Action::SearchHistory));
+        assert_eq!(
+            action_for(&ch("b"), phys, ctrl),
+            Some(Action::ToggleSidebar)
+        );
+        assert_eq!(
+            action_for(&ch("r"), phys, ctrl),
+            Some(Action::SearchHistory)
+        );
         // Cmd 側は macOS の作法に合わせる。何も奪わない。
         let cmd = ModifiersState::SUPER;
         assert_eq!(action_for(&ch("n"), phys, cmd), Some(Action::NewSession));
@@ -385,15 +454,27 @@ mod tests {
         // 文字が取れない配列でも、物理キーの位置で組み合わせが届く。
         let dead = Key::Dead(None);
         assert_eq!(
-            action_for(&dead, PhysicalKey::Code(KeyCode::KeyO), ModifiersState::CONTROL),
+            action_for(
+                &dead,
+                PhysicalKey::Code(KeyCode::KeyO),
+                ModifiersState::CONTROL
+            ),
             Some(Action::NewSession)
         );
         assert_eq!(
-            action_for(&dead, PhysicalKey::Code(KeyCode::Backslash), ModifiersState::CONTROL),
+            action_for(
+                &dead,
+                PhysicalKey::Code(KeyCode::Backslash),
+                ModifiersState::CONTROL
+            ),
             Some(Action::Fork)
         );
         assert_eq!(
-            action_for(&dead, PhysicalKey::Code(KeyCode::KeyD), ModifiersState::SUPER),
+            action_for(
+                &dead,
+                PhysicalKey::Code(KeyCode::KeyD),
+                ModifiersState::SUPER
+            ),
             Some(Action::Fork)
         );
     }
@@ -403,9 +484,11 @@ mod tests {
         let ctrl = ModifiersState::CONTROL;
         let phys = PhysicalKey::Code(KeyCode::F35);
         let mut found = Vec::new();
-        for c in ["a","b","c","d","e","f","g","h","i","j","k","l","m",
-                  "n","o","p","q","r","s","t","u","v","w","x","y","z",
-                  "\\","]","[","^","-","=",";",",",".","/"] {
+        for c in [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+            "r", "s", "t", "u", "v", "w", "x", "y", "z", "\\", "]", "[", "^", "-", "=", ";", ",",
+            ".", "/",
+        ] {
             if action_for(&ch(c), phys, ctrl).is_some() {
                 found.push(c);
             }

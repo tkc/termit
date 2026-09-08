@@ -10,6 +10,7 @@ pub const HOST_PROFILE: &str = "host";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct Config {
     #[serde(default)]
     pub window: WindowConfig,
@@ -19,17 +20,6 @@ pub struct Config {
     pub agent: AgentConfig,
     #[serde(default)]
     pub profile: BTreeMap<String, Profile>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            window: WindowConfig::default(),
-            shell: ShellConfig::default(),
-            agent: AgentConfig::default(),
-            profile: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,19 +76,11 @@ impl Default for WindowConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct ShellConfig {
     pub program: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
-}
-
-impl Default for ShellConfig {
-    fn default() -> Self {
-        Self {
-            program: None,
-            args: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -178,7 +160,11 @@ impl fmt::Display for ConfigError {
 /// macOS の `dirs::config_dir()` は `~/Library/Application Support` を返すが、
 /// 端末の利用者が設定を探すのは `~/.config` である。XDG の作法に合わせる。
 pub fn config_path() -> Option<PathBuf> {
-    Some(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("tex").join("config.toml"))
+    Some(
+        xdg_dir("XDG_CONFIG_HOME", ".config")?
+            .join("termit")
+            .join("config.toml"),
+    )
 }
 
 /// `$XDG_*_HOME` があればそれを、なければ home 直下の既定を返す。
@@ -204,8 +190,8 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
         let config: Config =
             toml::from_str(&text).map_err(|e| ConfigError::Parse(path.to_path_buf(), e))?;
         config.validate()?;
@@ -255,7 +241,10 @@ impl Config {
                 }
             }
         }
-        for (field, tmpl) in [("agent.new", &self.agent.new), ("agent.fork", &self.agent.fork)] {
+        for (field, tmpl) in [
+            ("agent.new", &self.agent.new),
+            ("agent.fork", &self.agent.fork),
+        ] {
             if let Some(t) = tmpl {
                 if let Err(e) = split_template(t) {
                     return Err(ConfigError::Invalid(format!("{field}: {e}")));
@@ -490,7 +479,11 @@ mod tests {
         let got = expand_template("claude --session-id {new_id}", &vars()).unwrap();
         assert_eq!(
             got,
-            vec!["claude", "--session-id", "11111111-2222-3333-4444-555555555555"]
+            vec![
+                "claude",
+                "--session-id",
+                "11111111-2222-3333-4444-555555555555"
+            ]
         );
     }
 
@@ -530,7 +523,10 @@ mod tests {
 
     #[test]
     fn 空のテンプレートを拒む() {
-        assert_eq!(expand_template("   ", &vars()).unwrap_err(), ExpandError::Empty);
+        assert_eq!(
+            expand_template("   ", &vars()).unwrap_err(),
+            ExpandError::Empty
+        );
     }
 
     #[test]

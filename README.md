@@ -1,236 +1,129 @@
-# tex
+# termit
 
-エージェント向けの軽量ターミナル。
+A small terminal built for working with coding agents.
 
-左ペインにセッションの系統樹を出し、キー一つで会話を分岐させ、必要なら Docker
-コンテナへ閉じ込める。それ以外の機能は持たない。
+It has a left pane that shows your sessions, it can fork an agent's
+conversation into a new pane, it can run a session inside a Docker container,
+and it keeps its own command history. That is the whole feature list.
 
-設計の詳細は [仕様書](docs/superpowers/specs/2026-09-08-agent-terminal-design.md) にある。
+![termit](docs/screenshot.png)
 
-## ビルド
+## Why
 
-必要なものは Rust の安定版ツールチェーンだけである。
+Terminals assume one person talking to one shell. When you work with coding
+agents you tend to run several at once against the same repository, branch one
+off from a point in its conversation, and occasionally want one boxed in.
+termit is the smallest terminal that makes those three things one keystroke
+away, and nothing else.
 
-```
+- **Single binary.** `cargo build --release`, no Node, no Python, no bundle.
+- **Small.** ~9 MB binary, ~85 MB resident, ~0.5 ms from a byte arriving on the
+  pty to `present()` returning.
+- **Not a framework.** It spawns processes, relays the pty, and interprets
+  escape sequences. It knows nothing about conversations; everything
+  agent-specific lives in a command template in your config.
+
+## Install
+
+Build from source. See **[docs/BUILD.md](docs/BUILD.md)** for the details.
+
+```sh
+git clone git@github.com:tkc/termit.git
+cd termit
 cargo build --release
+./target/release/termit
 ```
 
-生成物は `target/release/tex` の単一バイナリになる。
+macOS only for now. The renderer, the clipboard bridge and the keyboard
+handling all assume it.
 
-## 使い方
+## Shell integration
 
-操作は二系統ある。
-Ctrl 側はこの端末の操作で、シェルとエージェントから 6 個だけ奪う。
-Cmd 側は macOS の作法に合わせたもので、シェルもエージェントも Cmd を使わないため何も奪わない。
+Command history is not read from your shell's `HISTFILE`. termit builds it
+from OSC 133 marks, so it records the command, the working directory, the exit
+code and how long it took.
 
-| キー | 動作 |
-|---|---|
-| `^O` | 新規セッション |
-| `^\` | 選択中セッションを分岐 |
-| `^]` | プロファイルを選んで分岐 |
-| `^^` | 左ペインの選択を次へ（巡回する） |
-| `^B` | 左ペインの表示を切り替え |
-| `^R` | コマンド履歴を検索 |
-| `⌘N` | 新規セッション |
-| `⌘D` | 分岐 |
-| `⌘E` | プロファイルを選んで分岐 |
-| `⌘[` / `⌘]` | 左ペインの選択を前 / 次へ |
-| `⌘1` から `⌘9` | その番号のセッションへ（左ペインに番号が出る） |
-| `⌘F` | 画面とスクロールバックの中を探す |
-| `⌘I`（`⌘⇧R` も可） | セッションに名前を付ける |
-| `⌘K` | 画面とスクロールバックを消し、プロンプトを出し直す |
-| `⌘W` | セッションを終了（停止済みなら一覧から外す） |
-| `⌘C` / `⌘V` | コピー / 貼り付け |
-| `⌘=` / `⌘-` | フォントサイズ |
-| `Shift+PageUp` / `PageDown` | スクロール |
-
-上の 6 個と Cmd の組み合わせ以外は、すべて子プロセスへ渡す。
-
-`Ctrl` と `Shift` の同時押しは、環境によっては端末まで届かない。
-そのため、Shift を要求する組み合わせは一つも作っていない。
-届いていないかどうかは `tex --keytest` で確かめられる。
-押したキーが何として届き、どの動作に一致したかがそのまま画面に出る。
-
-### 左ペイン
-
-1 セッションを 1 段から 3 段で表す。
-
-```
-                             +
-
-● ~/github/terminal_tex    ⌘1
-  ✻ シンプルターミナル仕様書
-  ⋔ main
-
-└ ● ~/github/terminal_tex*  ⌘2
-    ✻ 配色の実測
-    ⋔ main
-──────────────────────────────
- 0 cargo test
- 0 git status
+```sh
+termit --shell-integration >> ~/.zshrc
 ```
 
-**左ペインは端末の文字グリッドとは別に、画素で組む。**
-段ごとに文字サイズを変え、角を丸め、余白を pt で指定できる。
-書体も端末とは別で、等幅ではないものを使う。同じ幅に多く入る。
+Without it termit works as a terminal, but the history stays empty.
 
-| 段 | 文字サイズ |
+## Keys
+
+Two sets. The Ctrl set is termit's own and takes exactly six keys away from the
+shell and from whatever agent you run. The Cmd set follows macOS convention and
+takes nothing, because neither shells nor agents use Cmd.
+
+| Key | Action |
 |---|---|
-| 名前 | 13pt |
-| 名乗った題名 | 12pt |
-| ブランチ名 | 10pt |
-| 直近のコマンド | 11pt |
+| `^O` | New session |
+| `^\` | Fork the selected session |
+| `^]` | Fork with a chosen profile |
+| `^^` | Select the next session (wraps) |
+| `^B` | Toggle the left pane |
+| `^R` | Search command history |
+| `⌘N` / `⌘D` / `⌘E` | New / fork / fork with a chosen profile |
+| `⌘F` | Find in the screen and scrollback |
+| `⌘I` (or `⌘⇧R`) | Rename the session |
+| `⌘K` | Clear the screen and scrollback |
+| `⌘[` / `⌘]` | Select the previous / next session |
+| `⌘1`…`⌘9` | Jump to that session |
+| `⌘W` | Close the session |
+| `⌘C` / `⌘V` | Copy / paste |
+| `⌘=` / `⌘-` | Font size |
+| `Shift+PageUp` / `PageDown` | Scroll |
 
-**左ペインと端末の境目を掴むと、幅を変えられる。** 掴める位置ではカーソルの形が変わる。
-変えた幅はそのウィンドウのあいだだけ効く。次に開くときは設定の値に戻る。
+Everything else goes to the child process untouched.
 
-実行状態の印は左端に置く。`●` が実行中、`○` が終了である。
-右端はふだん `⌘` の番号を出し、カーソルが乗っているあいだは閉じる印に変わる。
-両方を常に置くと名前の幅が足りない。
+**No binding uses Shift together with Ctrl.** On some setups that combination
+never reaches the application — measured here, `ctrl` and `shift` were never
+both set on the same key event. Run `termit --keytest` to see what your keys
+actually arrive as.
 
-**画面に出る文字は英語にする。** 端末の中身は子プロセスの領分であり、
-端末自身が出す文字だけが対象である。
+## Mouse
 
-最下段の帯は、端末の文字より小さい 11pt で、別の書体で組む。
-端末の中身ではなく端末についての表示なので、桁に揃える必要がない。
-同じ大きさで並べると、本文より目立ってしまう。
-
-見出しの文字は置かない。
-区切り線の上がセッション、下が選択中セッションの直近コマンドである。
-直近コマンドが無ければ区切り線ごと出さない。
-
-寸法は Warp の一覧を画素から測った値に合わせた。
-実測は [docs/warp-metrics.md](docs/warp-metrics.md) にある。
-
-1 段目が名前と `⌘` の番号、閉じる `×`、実行状態（`●` 実行中 / `○` 終了、
-終了コードが 0 でなければ赤）。
-
-**名前は、何もしなければ作業ディレクトリになる。**
-`$HOME` は `~` に縮め、幅に収まらないときは先頭を落として末尾を残す。
-`⌘I` で名前を付けられる。空にすると作業ディレクトリの表示に戻る。
-
-2 段目は端末上のプログラムが名乗った題名（`OSC 0`）。
-Claude Code は作業の題名をここへ送るので、何をしているセッションかが分かる。
-名乗っていなければ段そのものを作らない。
-
-3 段目はブランチ名。git の下にいないときは段そのものを作らない。
-`git` を起動せず `.git/HEAD` を読む。
-作業ディレクトリが変わったときと、2 秒以上経ったときだけ読み直す。
-
-名前の後ろの `*` は、親の会話を引き継いでいない分岐であることを示す。
-分岐は親の下に字下げして並べる。
-
-### 画面の検索
-
-`⌘F` で最下行に検索欄が出る。
-打つたびに探し直し、見つかった箇所をその場で強調する。
-行を絞り込むのではなく、画面をそのまま見せたまま印を付ける。
-
-| キー | 動作 |
+| Action | Result |
 |---|---|
-| 文字 | 打つたびに探し直す |
-| `Enter` / `↑` | 一つ上（古い方）の一致へ |
-| `⇧Enter` / `↓` | 一つ下（新しい方）の一致へ |
-| `Tab` | 入力を正規表現として扱うかを切り替える |
-| `Esc` | 閉じる |
+| `+` in the left pane | New session |
+| A row in the left pane | Switch to that session |
+| `×` on a hovered row | Close that session |
+| Drag in the terminal | Select text (`⌘C` copies) |
+| Double / triple click | Select word / line |
+| Wheel | Scroll |
+| Drag the pane border | Resize the left pane |
 
-探す範囲は選んでいるセッションの画面とスクロールバックである。
-既定では入力をそのままの文字列として探し、`Tab` で正規表現に切り替える。
-**大文字を含まない入力は大小を区別せず、含む入力は区別する。**
+When the program running in the terminal asks for mouse reporting (vim, htop,
+an agent's full-screen UI), clicks and wheel go to it instead. Hold **Shift**
+to select text anyway. In the alternate screen without mouse reporting the
+wheel is translated to arrow keys, so `less` and `man` scroll.
 
-一致は黄、いま選んでいる一致は橙で示す。
-下から上へ探すのは、端末では新しい出力が下にあり、探したいものはたいてい上にあるからである。
+## Fork
 
-日本語などの変換を伴う入力もそのまま使える。
-変換中の文字列は地を一段明るくして下線付きで表示し、確定するまで検索には使わない。
-候補窓は、いま文字が入る位置に寄せる。
-
-`^R` のコマンド履歴検索とは別である。
-あちらは過去に打った命令を探し、こちらは画面に出ている文字を探す。
-
-### マウス
-
-| 操作 | 動作 |
-|---|---|
-| 左ペインの `[+]` | 新規セッション |
-| 左ペインの行 | そのセッションへ切り替え |
-| 行の右の `×` | そのセッションを終了 |
-| 端末をドラッグ | テキストを選択（`⌘C` でコピー） |
-| 端末をダブルクリック | 単語を選択 |
-| 端末をトリプルクリック | 行を選択 |
-| ホイール | スクロール |
-
-端末の上で動いているプログラムがマウスを要求している場合（vim、htop、
-エージェントの全画面 UI など）、クリックとホイールはそのプログラムへ渡る。
-そのあいだ端末側で文字を選びたいときは、**Shift を押しながら**操作する。
-
-代替画面に入っているプログラムがマウスを要求していない場合（`less` や
-`man` など）、ホイールは矢印キーに変換して渡す。
-
-### 端末として実装しているもの
-
-エージェントの全画面 UI が実際に要求する順序を実測して、必要なものを揃えた。
-
-| 機能 | 状態 |
-|---|---|
-| マウス報告（`?1000` `?1002` `?1003` `?1006`） | あり |
-| フォーカス報告（`?1004`） | あり |
-| 括弧付き貼り付け（`?2004`） | あり |
-| 代替画面（`?1049`） | あり |
-| 代替スクロール（`?1007`） | あり |
-| ウィンドウ題名（`OSC 0` / `OSC 2`） | あり |
-| クリップボード（`OSC 52`） | あり |
-| 装置属性の問い合わせ（`CSI c`）への応答 | あり |
-| 呼び鈴（BEL） | **なし** |
-| デスクトップ通知（`OSC 777`） | **なし** |
-| ハイパーリンク（`OSC 8`）とクリック | **なし** |
-| Kitty キーボードプロトコル | **なし**（Claude Code は要求しない） |
-| スクロールバックの検索 | あり（`⌘F`） |
-
-## シェル統合
-
-コマンド履歴はシェルの `HISTFILE` ではなく、端末が OSC 133 から組み立てる。
-zsh 用の設定断片を出力できる。
-
-```
-tex --shell-integration >> ~/.zshrc
-```
-
-読み込むと、コマンド、作業ディレクトリ、終了コード、所要時間が
-`~/.local/share/tex/history.db` に記録される。
-設定しない場合、端末としては動くが履歴は残らない。
-
-## 設定
-
-`~/.config/tex/config.toml` を起動時に一度だけ読む。
-`$XDG_CONFIG_HOME` を設定していればそちらを見る。
-ファイルがなければ既定値で動く。
+`^\` opens a new pane with the same working directory and environment, and runs
+the command template from your config.
 
 ```toml
-[window]
-font       = "Menlo"      # 等幅フォント。見つからなければ総称の等幅へ落とす
-font_size  = 13.0
-scrollback = 10000
-sidebar_cols = 32
-vsync      = true         # false にすると表示待ちが消える代わりに画面が裂けうる
-sidebar_width = 200       # 左ペインの初期の幅（pt）。境目を掴んで変えられる
-
-[shell]
-program = "/bin/zsh"
-args    = ["-l"]
-
-# エージェントの起動コマンド。書かなければシェルが起動する。
-# 端末は会話の中身を知らない。エージェント固有の知識はここに閉じる。
 [agent]
 new  = "claude --session-id {new_id}"
 fork = "claude --resume {parent_agent_id} --fork-session --session-id {new_id}"
+```
 
-# ホスト実行を表す予約名。image は書けない。
-[profile.host]
+termit mints the UUID, so it knows the child's conversation id at spawn time.
+Available variables are `{new_id}`, `{parent_agent_id}`, `{cwd}` and
+`{parent_title}`. If `fork` is unset, or if a variable has no value yet, the
+fork falls back to running the parent's command in the same directory; that
+session is marked with `*` in the left pane to show the conversation was not
+carried over.
 
-# Docker のコンテナ内で起動するプロファイル。
+## Sandbox profiles
+
+A profile says where a pane runs. `host` is the default and runs directly.
+Anything with an `image` runs inside `docker run`.
+
+```toml
 [profile.sandbox]
-image   = "tex-agent:latest"   # claude を入れたイメージ
+image   = "termit-agent:latest"   # an image with your agent installed
 workdir = "/work"
 mount   = ["{cwd}:/work"]
 network = "bridge"
@@ -238,47 +131,70 @@ env     = ["ANTHROPIC_API_KEY"]
 args    = ["--dangerously-skip-permissions"]
 ```
 
-テンプレートで使える変数は `{new_id}`、`{parent_agent_id}`、`{cwd}`、
-`{parent_title}` の四つに限る。
-`{parent_agent_id}` の値がまだ分かっていないセッションから分岐した場合は、
-親と同じコマンドを同じ作業ディレクトリで起動し、会話は引き継がない。
-そのセッションは左ペインで名前の後ろに `*` が付く。
+The isolation comes from the mount scope and the process namespace, not from
+the network. The container only sees what you mounted. `network` defaults to
+`bridge` because an agent that cannot reach its API is not useful; set
+`"none"` for processes that do not need to get out.
 
-### サンドボックス
+Profiles are orthogonal to forking: `^]` forks into a profile you pick, so you
+can move a conversation into a container right before something risky.
 
-隔離の根拠はネットワークの遮断ではなく、マウント範囲とプロセス名前空間にある。
-コンテナから見えるファイルは `mount` に書いた範囲だけであり、
-ホストの他のディレクトリにもホストのプロセスにも届かない。
-`network` の既定を `bridge` にしているのは、モデル API への接続が切れると
-エージェントが動かないためである。
-外部へ出る必要のないプロセスには `network = "none"` を明示する。
+## Configuration
 
-## 作らないもの
+`~/.config/termit/config.toml`, read once at startup. No file means defaults.
 
-タブ、任意の分割とタイル管理、合字、画像表示プロトコル、プラグイン機構、
-内蔵エディタ、テーマの配布機構、設定画面の GUI、内蔵 SSH クライアント、
-セッションの永続化。
+```toml
+[window]
+font          = "Menlo"   # falls back to the generic monospace if not found
+font_size     = 13.0
+scrollback    = 10000
+sidebar_width = 200       # points; drag the border to change it live
+vsync         = true      # false removes the wait for the display, may tear
 
-## 開発
-
-```
-cargo test                     # 単体テストと PTY の結合テスト
-cargo run -- --probe out.png   # ウィンドウを開かずに 1 フレームを描いて書き出す
-cargo run -- --keytest         # 押したキーが何として届くかを画面に出す
-cargo run -- --bench           # 描画そのものの費用を測る
-cargo run -- --latency-test    # 入力の往復にかかる時間を測る
+[shell]
+program = "/bin/zsh"
+args    = ["-l"]
 ```
 
-`--probe` は実際の描画関数を通してオフスクリーンに 1 フレームを描き、PNG にする。
-画面キャプチャの権限がない環境でも、割り付けと字形の配置を目で確かめられる。
+A bad value is reported at startup and termit exits; it never silently
+substitutes a default.
 
-動作中の内訳は次で見られる。
+## Terminal capabilities
 
-```
-RUST_LOG=info TEX_FRAME_LOG=1 tex
-```
+Chosen by recording what an agent's full-screen UI actually asks for.
 
-1 秒ごとに、読み取り回数、再描画の通知と抑制、実際に描いた数、
-読み取りから表示までの時間、描画の工程ごとの費用を出す。
+| | |
+|---|---|
+| Mouse reporting (`?1000` `?1002` `?1003` `?1006`) | yes |
+| Focus reporting (`?1004`) | yes |
+| Bracketed paste (`?2004`) | yes |
+| Alternate screen (`?1049`) | yes |
+| Alternate scroll (`?1007`) | yes |
+| Window title (`OSC 0` / `OSC 2`) | yes |
+| Clipboard (`OSC 52`) | yes |
+| Device attributes (`CSI c`) | yes |
+| Bell | no |
+| Desktop notifications (`OSC 777`) | no |
+| Hyperlinks (`OSC 8`) | no |
+| Kitty keyboard protocol | no |
 
-応答速度を工程ごとに測った記録は [docs/performance.md](docs/performance.md) にある。
+## Not goals
+
+Tabs. Arbitrary splits and tiling. Ligatures. Image protocols. A plugin
+system. A built-in editor. A theme store. A settings GUI. A built-in SSH
+client. Session persistence across restarts.
+
+The left pane replaces tabs and splits: several agents are several sessions in
+one list.
+
+## Design notes
+
+The detailed design record is in Japanese.
+
+- [`docs/superpowers/specs/2026-09-08-agent-terminal-design.md`](docs/superpowers/specs/2026-09-08-agent-terminal-design.md) — the specification
+- [`docs/performance.md`](docs/performance.md) — where the time actually goes, measured
+- [`docs/warp-metrics.md`](docs/warp-metrics.md) — the sizes and paddings the left pane is based on
+
+## License
+
+MIT. See [LICENSE](LICENSE).

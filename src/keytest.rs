@@ -51,9 +51,13 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("tex — keytest")
+            .with_title("termit — keytest")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 560.0));
-        let window = Arc::new(event_loop.create_window(attrs).expect("ウィンドウを作れない"));
+        let window = Arc::new(
+            event_loop
+                .create_window(attrs)
+                .expect("ウィンドウを作れない"),
+        );
         window.set_ime_allowed(true);
         let renderer = pollster::block_on(Renderer::new(
             window.clone(),
@@ -145,7 +149,12 @@ impl App {
         let theme = Theme::default();
         let (cols, _rows) = renderer.grid_size();
         renderer.begin();
-        renderer.put_str(1, 0, "tex keytest — shows what each key press arrives as", theme.fg_primary);
+        renderer.put_str(
+            1,
+            0,
+            "termit keytest — shows what each key press arrives as",
+            theme.fg_primary,
+        );
         renderer.put_str(
             1,
             1,
@@ -153,7 +162,12 @@ impl App {
             theme.fg_secondary,
         );
         let mut y = 3;
-        renderer.put_str(1, y, "Ctrl combinations this terminal takes:", theme.fg_secondary);
+        renderer.put_str(
+            1,
+            y,
+            "Ctrl combinations this terminal takes:",
+            theme.fg_secondary,
+        );
         y += 1;
         for (keys, what) in input::STOLEN_CTRL_KEYS {
             renderer.put_str(3, y, keys, theme.accent);
@@ -161,7 +175,12 @@ impl App {
             y += 1;
         }
         y += 1;
-        renderer.put_str(1, y, "Cmd side: ⌘N new  ⌘D fork  ⌘E fork as…  ⌘K clear  ⌘W close  ⌘[ ⌘] select  ⌘C ⌘V", theme.fg_secondary);
+        renderer.put_str(
+            1,
+            y,
+            "Cmd side: ⌘N new  ⌘D fork  ⌘E fork as…  ⌘K clear  ⌘W close  ⌘[ ⌘] select  ⌘C ⌘V",
+            theme.fg_secondary,
+        );
         y += 2;
 
         if self.rows.is_empty() {
@@ -173,7 +192,11 @@ impl App {
             .map(|r| (r.text.clone(), r.matched))
             .collect();
         for (text, matched) in rows {
-            let color = if matched { theme.accent } else { theme.fg_secondary };
+            let color = if matched {
+                theme.accent
+            } else {
+                theme.fg_secondary
+            };
             renderer.put_str_clipped(1, y, &text, cols.saturating_sub(2), color);
             y += 1;
         }
