@@ -28,8 +28,8 @@ use alacritty_terminal::index::{Column, Direction, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{viewport_to_point, TermMode};
+use alacritty_terminal::vte::ansi::CursorShape;
 use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
-use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -2199,8 +2199,9 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         0.0,
     );
     let mut y = sl.sep_y + sidebar::SEP_PAD * sc;
-    let recent: Vec<crate::history::Entry> = state.recent.clone();
-    for entry in recent {
+    // 別の欄なので、描きながら読める。毎フレーム写し取る必要はない。
+    for i in 0..state.recent.len() {
+        let entry = &state.recent[i];
         if y + line_h > height_px {
             break;
         }
@@ -2243,20 +2244,8 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
     let selection = content.selection;
     let cursor = content.cursor;
     let display_offset = content.display_offset;
-    struct Draw {
-        col: usize,
-        row: usize,
-        c: char,
-        fg: Rgb,
-        bg: Rgb,
-        bold: bool,
-        italic: bool,
-        underline: bool,
-        /// 全角文字は 2 桁を占める。背景とカーソルもその幅で塗る。
-        cols: usize,
-    }
-    let mut cells: Vec<Draw> = Vec::with_capacity(layout.term_cols * layout.term_rows);
     let mut cursor_cols = 1usize;
+    let default_bg = theme.bg;
 
     for indexed in content.display_iter {
         let cell = indexed.cell;
@@ -2295,37 +2284,34 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         if wide && indexed.point == cursor.point {
             cursor_cols = 2;
         }
-        cells.push(Draw {
-            col,
-            row: row as usize,
-            c: cell.c,
+        let underline = cell.flags.intersects(Flags::ALL_UNDERLINES);
+        // 既定の地色のままの空白は、何も出すものがない。
+        if cell.c == ' ' && bg == default_bg && !underline {
+            continue;
+        }
+        let row = row as usize;
+        let x = layout.term_col + col;
+        let span = if wide { 2 } else { 1 };
+        let span = span.min(layout.term_cols.saturating_sub(col)).max(1);
+        if bg != default_bg {
+            state.renderer.fill_cells(x, row, span, 1, bg);
+        }
+        state.renderer.put_char(
+            x,
+            row,
+            cell.c,
             fg,
-            bg,
-            bold: cell.flags.contains(Flags::BOLD),
-            italic: cell.flags.contains(Flags::ITALIC),
-            underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
-            cols: if wide { 2 } else { 1 },
-        });
+            cell.flags.contains(Flags::BOLD),
+            cell.flags.contains(Flags::ITALIC),
+        );
+        if underline {
+            state.renderer.underline_cells(x, row, span, fg);
+        }
     }
     let show_cursor = display_offset == 0 && cursor.shape != CursorShape::Hidden;
     let cursor_point = cursor.point;
     let cursor_shape = cursor.shape;
     drop(term);
-
-    let default_bg = theme.bg;
-    for d in cells {
-        let x = layout.term_col + d.col;
-        let cols = d.cols.min(layout.term_cols.saturating_sub(d.col)).max(1);
-        if d.bg != default_bg {
-            state.renderer.fill_cells(x, d.row, cols, 1, d.bg);
-        }
-        state
-            .renderer
-            .put_char(x, d.row, d.c, d.fg, d.bold, d.italic);
-        if d.underline {
-            state.renderer.underline_cells(x, d.row, cols, d.fg);
-        }
-    }
 
     if show_cursor {
         let row = cursor_point.line.0;
