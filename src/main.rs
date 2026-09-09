@@ -481,6 +481,12 @@ impl ApplicationHandler<UiEvent> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UiEvent) {
+        let selected = self
+            .state
+            .as_ref()
+            .and_then(|s| s.manager.selected())
+            .map(|s| s.id);
+        let redraw = wants_redraw(&event, selected);
         if let Some(c) = &mut self.counters {
             match &event {
                 UiEvent::Wakeup(_, _) => c.wakeup += 1,
@@ -491,9 +497,10 @@ impl ApplicationHandler<UiEvent> for App {
         }
         let Some(state) = &mut self.state else { return };
         match event {
-            UiEvent::Wakeup(_, at) => {
+            UiEvent::Wakeup(id, at) => {
                 // 最も古い更新の時刻を覚えておき、表示までの時間を測る。
-                if state.pending_since.is_none() {
+                // 測るのは見えているものだけである。
+                if state.pending_since.is_none() && selected == Some(id) {
                     state.pending_since = Some(at);
                 }
             }
@@ -534,7 +541,9 @@ impl ApplicationHandler<UiEvent> for App {
                 state.recent_for = None;
             }
         }
-        state.request_redraw();
+        if redraw {
+            state.request_redraw();
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1182,6 +1191,28 @@ impl App {
             .term
             .lock()
             .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+    }
+}
+
+/// この通知で見えているものが変わるか。
+///
+/// 窓に出ているのは、選んでいるセッションの画面と、左ペインの各行だけである。
+/// 背景のセッションが字を出すたびに描き直すと、見えていないもののために
+/// 窓ぜんぶを塗り直すことになる。エージェントを何本も走らせるほど重くなる。
+fn wants_redraw(event: &UiEvent, selected: Option<crate::session::SessionId>) -> bool {
+    let shown = |id: crate::session::SessionId| selected == Some(id);
+    match event {
+        // 画面の中身。見えているのは選んでいるセッションのものだけ。
+        UiEvent::Wakeup(id, _) => shown(*id),
+        // 左ペインに出るもの。どのセッションのものでも見えている。
+        UiEvent::Title(_, _) | UiEvent::ChildExit(_, _) => true,
+        // 作業ディレクトリは左ペインの 1 段目に出る。ほかの OSC は
+        // 画面の中でしか効かない。
+        UiEvent::Osc(id, ev) => shown(*id) || matches!(ev, crate::osc::OscEvent::Cwd(_)),
+        // 直近のコマンドは、選んでいるセッションのぶんだけ出す。
+        UiEvent::Command(id, _) => shown(*id),
+        // 目に見えるものは変わらない。
+        UiEvent::ClipboardStore(_, _) | UiEvent::ClipboardLoad(_, _) => false,
     }
 }
 
@@ -2346,6 +2377,80 @@ fn bracketed(text: &str, mode: TermMode) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::osc::OscEvent;
+    use crate::term::UiEvent;
+
+    fn now() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    #[test]
+    fn 背景のセッションが字を出しても描き直さない() {
+        // 見えているのは選んでいるセッションの画面だけである。
+        // ここで描き直すと、エージェントを何本も走らせるほど重くなる。
+        assert!(!wants_redraw(&UiEvent::Wakeup(7, now()), Some(3)));
+        assert!(wants_redraw(&UiEvent::Wakeup(3, now()), Some(3)));
+    }
+
+    #[test]
+    fn 左ペインに出るものはどのセッションでも描き直す() {
+        assert!(wants_redraw(&UiEvent::Title(7, "x".into()), Some(3)));
+        assert!(wants_redraw(&UiEvent::ChildExit(7, 0), Some(3)));
+        // 作業ディレクトリは 1 段目に出る。
+        assert!(wants_redraw(
+            &UiEvent::Osc(7, OscEvent::Cwd("/tmp".into())),
+            Some(3)
+        ));
+    }
+
+    #[test]
+    fn 画面の中でしか効かない_osc_は背景では描き直さない() {
+        for ev in [
+            OscEvent::PromptStart,
+            OscEvent::CommandStart,
+            OscEvent::CommandExecuted,
+            OscEvent::CommandFinished(Some(0)),
+            OscEvent::AgentId("a".into()),
+        ] {
+            assert!(
+                !wants_redraw(&UiEvent::Osc(7, ev.clone()), Some(3)),
+                "{ev:?} は背景では見えない"
+            );
+            assert!(
+                wants_redraw(&UiEvent::Osc(3, ev.clone()), Some(3)),
+                "{ev:?} は選んでいれば見える"
+            );
+        }
+    }
+
+    #[test]
+    fn 直近のコマンドは選んでいるぶんだけ描き直す() {
+        let rec = |id| crate::session::CommandRecord {
+            session_id: id,
+            session_key: String::new(),
+            agent_id: None,
+            cwd: "/tmp".into(),
+            command: "ls".into(),
+            exit_code: Some(0),
+            started_at: std::time::SystemTime::now(),
+            duration_ms: None,
+        };
+        assert!(!wants_redraw(&UiEvent::Command(7, rec(7)), Some(3)));
+        assert!(wants_redraw(&UiEvent::Command(3, rec(3)), Some(3)));
+    }
+
+    #[test]
+    fn 見た目の変わらない通知では描き直さない() {
+        assert!(!wants_redraw(
+            &UiEvent::ClipboardStore(3, "x".into()),
+            Some(3)
+        ));
+        assert!(!wants_redraw(
+            &UiEvent::ClipboardLoad(3, std::sync::Arc::new(|s: &str| s.to_string())),
+            Some(3)
+        ));
+    }
 
     fn px(y: f64) -> MouseScrollDelta {
         MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, y))
