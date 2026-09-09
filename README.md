@@ -85,8 +85,14 @@ takes nothing, because neither shells nor agents use Cmd.
 | `Shift+PageUp` / `PageDown` | Scroll a page |
 | Wheel / two fingers | Scroll the scrollback; hold `Shift` to keep it from the program |
 | Drag | Select text; hold `Shift` when a program is using the mouse |
+| Drag a row in the left pane | Reorder the sessions |
 
 Everything else goes to the child process untouched.
+
+**Reordering the left pane.** Drag a row and drop it where the line appears.
+A session with forks under it moves together with them, and a fork moves within
+its parent — the drop marker only appears where the row can actually land. The
+order is part of what is restored on the next start.
 
 **Selecting text while an agent is running.** Two things get in the way, and
 both are handled.
