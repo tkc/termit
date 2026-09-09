@@ -244,6 +244,12 @@ pub(crate) struct State {
     /// そのうち、いま選んでいる一致のセル。
     find_current: std::collections::HashSet<(i32, usize)>,
     mouse: MouseState,
+    /// 最後に選び終えた文字と、その持ち主。
+    ///
+    /// 全画面 UI は絶えず描き直す。選んだ行を書き直された時点で
+    /// `Term` は選択を捨てるので、`⌘C` を押す頃には何も残っていない。
+    /// 選び終えた時点で控えておき、消えていたらこちらを使う。
+    picked: Option<(crate::session::SessionId, String)>,
     mods: ModifiersState,
     status: Option<String>,
     recent: Vec<Entry>,
@@ -441,6 +447,7 @@ impl ApplicationHandler<UiEvent> for App {
             find_cells: Default::default(),
             find_current: Default::default(),
             mouse: MouseState::default(),
+            picked: None,
             mods: ModifiersState::empty(),
             status: None,
             recent: Vec::new(),
@@ -636,11 +643,16 @@ impl ApplicationHandler<UiEvent> for App {
                 };
                 if let Some(btn) = btn {
                     let pressed = button_state == ElementState::Pressed;
-                    if !self.report_mouse_button(btn, pressed) && btn == mouse::Button::Left {
+                    let reported = self.report_mouse_button(btn, pressed);
+                    if btn == mouse::Button::Left {
                         if pressed {
-                            self.on_click()
+                            if !reported {
+                                self.on_click();
+                            }
                         } else {
-                            self.on_release()
+                            // 離したときは、報告したかどうかによらず終える。
+                            // Shift を先に離すと報告側へ回り、掴んだままになる。
+                            self.on_release();
                         }
                     }
                 }
@@ -889,14 +901,13 @@ impl App {
                 self.refresh_search();
             }
             Action::Copy => {
-                if let Some(s) = state.manager.selected() {
-                    let text = {
-                        let term = s.term.lock();
-                        term.selection_to_string().unwrap_or_default()
-                    };
-                    if !text.is_empty() {
-                        clipboard::copy(&text);
-                    }
+                let live = state.manager.selected().and_then(|s| {
+                    let term = s.term.lock();
+                    term.selection_to_string()
+                });
+                let id = state.manager.selected().map(|s| s.id);
+                if let Some(text) = copy_text(live, state.picked.as_ref(), id) {
+                    clipboard::copy(&text);
                 }
             }
             Action::Paste => {
@@ -1160,17 +1171,28 @@ impl App {
         }
         state.mouse.dragging = false;
         // 動かさずに離したときは選択を消す。
-        if let Some(session) = state.manager.selected() {
-            let mut term = session.term.lock();
-            let empty = term
-                .selection
-                .as_ref()
-                .map(|s| s.is_empty())
-                .unwrap_or(false);
-            if empty {
-                term.selection = None;
+        // 選べていれば、その文字を控える。画面が塗り替わっても取り出せる。
+        let picked = match state.manager.selected() {
+            Some(session) => {
+                let id = session.id;
+                let mut term = session.term.lock();
+                let empty = term
+                    .selection
+                    .as_ref()
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true);
+                if empty {
+                    term.selection = None;
+                    None
+                } else {
+                    term.selection_to_string()
+                        .filter(|t| !t.is_empty())
+                        .map(|t| (id, t))
+                }
             }
-        }
+            None => None,
+        };
+        state.picked = picked;
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
@@ -1656,6 +1678,26 @@ mod sidebar {
     pub const SIZE_BRANCH: f32 = 10.0;
     /// 直近のコマンド。
     pub const SIZE_RECENT: f32 = 11.0;
+}
+
+/// `⌘C` で写す文字を決める。
+///
+/// いま選ばれているものがあればそれを使う。無ければ、最後に選び終えた
+/// 文字を使う。全画面 UI は選んだ行を書き直した時点で選択を捨てるため、
+/// これが無いと、選べているのに何も写らないという形になる。
+/// 控えは持ち主のセッションでだけ使う。
+fn copy_text(
+    live: Option<String>,
+    picked: Option<&(crate::session::SessionId, String)>,
+    selected: Option<crate::session::SessionId>,
+) -> Option<String> {
+    if let Some(text) = live.filter(|t| !t.is_empty()) {
+        return Some(text);
+    }
+    match (picked, selected) {
+        (Some((owner, text)), Some(id)) if *owner == id && !text.is_empty() => Some(text.clone()),
+        _ => None,
+    }
 }
 
 /// 端末上のプログラムがマウスを掴んでいるときに出す逃げ道。
@@ -2431,6 +2473,42 @@ mod tests {
 
     fn now() -> std::time::Instant {
         std::time::Instant::now()
+    }
+
+    #[test]
+    fn 選んでいるものがあればそれを写す() {
+        assert_eq!(
+            copy_text(Some("live".into()), Some(&(3, "old".into())), Some(3)).as_deref(),
+            Some("live")
+        );
+    }
+
+    #[test]
+    fn 選択が消えていれば控えを写す() {
+        // 全画面 UI が描き直すと Term は選択を捨てる。
+        // 控えが無いと、選べているのに何も写らない。
+        assert_eq!(
+            copy_text(None, Some(&(3, "picked".into())), Some(3)).as_deref(),
+            Some("picked")
+        );
+        assert_eq!(
+            copy_text(Some(String::new()), Some(&(3, "picked".into())), Some(3)).as_deref(),
+            Some("picked")
+        );
+    }
+
+    #[test]
+    fn 控えは持ち主のセッションでだけ使う() {
+        // 別のセッションへ移ってから ⌘C を押しても、前の画面の文字は出さない。
+        assert_eq!(copy_text(None, Some(&(3, "picked".into())), Some(4)), None);
+        assert_eq!(copy_text(None, Some(&(3, "picked".into())), None), None);
+    }
+
+    #[test]
+    fn 何も選んでいなければ写さない() {
+        assert_eq!(copy_text(None, None, Some(3)), None);
+        assert_eq!(copy_text(Some(String::new()), None, Some(3)), None);
+        assert_eq!(copy_text(None, Some(&(3, String::new())), Some(3)), None);
     }
 
     #[test]
