@@ -9,6 +9,7 @@ mod history;
 mod input;
 mod keytest;
 mod latency;
+mod link;
 mod mouse;
 mod osc;
 mod probe;
@@ -26,7 +27,7 @@ use std::sync::Arc;
 
 use alacritty_terminal::index::{Column, Direction, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Flags, Hyperlink};
 use alacritty_terminal::term::{viewport_to_point, TermMode};
 use alacritty_terminal::vte::ansi::CursorShape;
 use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
@@ -263,6 +264,8 @@ pub(crate) struct State {
     /// そのうち、いま選んでいる一致のセル。
     find_current: std::collections::HashSet<(i32, usize)>,
     mouse: MouseState,
+    /// いま指しているリンクの識別子。下線を引く相手を決めるのに使う。
+    hovered_link: Option<String>,
     /// 最後に選び終えた文字と、その持ち主。
     ///
     /// 全画面 UI は絶えず描き直す。選んだ行を書き直された時点で
@@ -478,6 +481,7 @@ impl ApplicationHandler<UiEvent> for App {
             find_cells: Default::default(),
             find_current: Default::default(),
             mouse: MouseState::default(),
+            hovered_link: None,
             picked: None,
             mods: ModifiersState::empty(),
             status: None,
@@ -642,14 +646,25 @@ impl ApplicationHandler<UiEvent> for App {
                     return;
                 }
                 let layout = layout_of(&self.config, state);
-                // 境目の上では、掴めることを形で示す。
+                // 指しているリンクを覚える。変わったときだけ描き直す。
+                let link = hyperlink_at(state, &layout).map(|h| h.id().to_string());
+                let link_changed = link != state.hovered_link;
+                if link_changed {
+                    state.hovered_link = link;
+                }
+                // 境目の上では掴める形、リンクの上では指の形にする。
                 let over = on_divider(state, &layout, state.mouse.x);
                 if let Some(win) = &state.window {
                     win.set_cursor(if over {
                         winit::window::CursorIcon::ColResize
+                    } else if state.hovered_link.is_some() {
+                        winit::window::CursorIcon::Pointer
                     } else {
                         winit::window::CursorIcon::Default
                     });
+                }
+                if link_changed {
+                    state.request_redraw();
                 }
                 // 左ペインの上では、乗っている行の見た目が変わる。
                 if (position.x as f32) < layout.sidebar_px {
@@ -1077,6 +1092,27 @@ fn log_grid(
     );
 }
 
+/// マウスの下にあるリンク。無ければ `None`。
+///
+/// OSC 8 は `alacritty_terminal` がコマに結び付けてくれる。
+/// ここでは、いま指している 1 コマぶんを読むだけである。
+fn hyperlink_at(state: &State, layout: &Layout) -> Option<Hyperlink> {
+    if state.mouse.x < layout.sidebar_px {
+        return None;
+    }
+    let (col, row, _) = mouse_cell(state);
+    let point = terminal_point(state, layout, col, row)?;
+    let session = state.manager.selected()?;
+    let term = session.term.lock();
+    use alacritty_terminal::grid::Dimensions;
+    if point.line.0 < -(term.grid().history_size() as i32)
+        || point.line.0 >= term.grid().screen_lines() as i32
+    {
+        return None;
+    }
+    term.grid()[point].hyperlink()
+}
+
 /// 表示行を画面の何行目かに直す。範囲の外なら `None`。
 ///
 /// `display_iter` が返す行番号は履歴を含む座標で、
@@ -1232,7 +1268,12 @@ impl App {
             return;
         }
 
-        // 端末領域。連続クリックの回数で選択の単位を変える。
+        // 端末領域。リンクの上なら開く。選択はしない。
+        if let Some(uri) = hyperlink_at(state, &layout).map(|h| h.uri().to_string()) {
+            link::open(&uri);
+            return;
+        }
+        // 連続クリックの回数で選択の単位を変える。
         let Some(point) = terminal_point(state, &layout, col, row) else {
             return;
         };
@@ -2311,6 +2352,8 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
     let searching = !state.find_cells.is_empty() || !state.find_current.is_empty();
     // 出した行を数える。表示の食い違いを突き合わせるための記録に使う。
     let mut drawn_rows = std::collections::HashSet::new();
+    // 指しているリンクは、押せることが分かるよう下線を引く。
+    let hovered = state.hovered_link.clone();
 
     for indexed in content.display_iter {
         let cell = indexed.cell;
@@ -2355,7 +2398,12 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         if wide && indexed.point == cursor.point {
             cursor_cols = 2;
         }
-        let underline = cell.flags.intersects(Flags::ALL_UNDERLINES);
+        let mut underline = cell.flags.intersects(Flags::ALL_UNDERLINES);
+        if let Some(id) = &hovered {
+            if cell.hyperlink().is_some_and(|h| h.id() == id) {
+                underline = true;
+            }
+        }
         // 既定の地色のままの空白は、何も出すものがない。
         if cell.c == ' ' && bg == default_bg && !underline {
             continue;

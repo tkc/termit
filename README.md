@@ -86,6 +86,7 @@ takes nothing, because neither shells nor agents use Cmd.
 | Wheel / two fingers | Scroll the scrollback; hold `Shift` to keep it from the program |
 | Drag | Select text; hold `Shift` when a program is using the mouse |
 | Drag a row in the left pane | Reorder the sessions |
+| Click a link | Open an OSC 8 hyperlink |
 
 Everything else goes to the child process untouched.
 
@@ -94,6 +95,25 @@ has ended. It is bright while the session is producing output — an agent that
 is working keeps its spinner moving, so the bright dot means *busy* and the dim
 one means *waiting for you*. A hollow grey dot ended cleanly, a hollow red one
 did not.
+
+**Links.** Text marked up with OSC 8 is underlined when you point at it, the
+pointer turns into a hand, and clicking opens it. Only `http`, `https`,
+`mailto` and `file` are opened — terminal output can come from anywhere, and
+the rest is a way to launch other programs quietly. The link is handed to
+`open` directly, never through a shell.
+
+To emit one from a script:
+
+```sh
+osc8_link() {
+  printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$1" "$2"
+}
+```
+
+The terminator of OSC 8 contains a backslash. If you build a coloured string
+and pass it through `printf '%b'`, the escape handling collides and the link
+comes out broken. Keep the colours as real bytes (`$'\033[33m'`) and print
+everything with `%s`.
 
 **Reordering the left pane.** Drag a row and drop it where the line appears.
 A session with forks under it moves together with them, and a fork moves within

@@ -226,6 +226,67 @@ mod selection_tests {
         (term, parser)
     }
 
+    /// OSC 8 のリンクがコマに結び付くことを確かめる。
+    #[test]
+    fn osc8_のリンクがコマに付く() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (ptx, _prx) = std::sync::mpsc::channel();
+        let ws = Arc::new(FairMutex::new(WindowSize {
+            num_lines: 10,
+            num_cols: 40,
+            cell_width: 8,
+            cell_height: 16,
+        }));
+        let proxy = EventProxy::new(1, ptx, UiSender::Channel(tx), ws);
+        let mut term = new_term(TermSize::new(40, 10), 100, proxy);
+        let mut parser: Processor = Processor::new();
+        // 終端は ST（ESC \）。ここを取り違えるとリンクが壊れる。
+        parser.advance(
+            &mut term,
+            b"\x1b]8;;https://example.com/a\x1b\\link\x1b]8;;\x1b\\ after",
+        );
+
+        let grid = term.grid();
+        let uri = |col: usize| {
+            grid[Line(0)][Column(col)]
+                .hyperlink()
+                .map(|h| h.uri().to_string())
+        };
+        for col in 0..4 {
+            assert_eq!(
+                uri(col).as_deref(),
+                Some("https://example.com/a"),
+                "{col} 桁目はリンクの中"
+            );
+        }
+        assert_eq!(uri(4), None, "閉じたあとはリンクではない");
+        assert_eq!(uri(9), None);
+    }
+
+    /// BEL で終わる書き方でも受けることを確かめる。
+    #[test]
+    fn bel_で終わる_osc8_も受ける() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (ptx, _prx) = std::sync::mpsc::channel();
+        let ws = Arc::new(FairMutex::new(WindowSize {
+            num_lines: 10,
+            num_cols: 40,
+            cell_width: 8,
+            cell_height: 16,
+        }));
+        let proxy = EventProxy::new(1, ptx, UiSender::Channel(tx), ws);
+        let mut term = new_term(TermSize::new(40, 10), 100, proxy);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"\x1b]8;;https://example.com\x07x\x1b]8;;\x07");
+        assert_eq!(
+            term.grid()[Line(0)][Column(0)]
+                .hyperlink()
+                .map(|h| h.uri().to_string())
+                .as_deref(),
+            Some("https://example.com")
+        );
+    }
+
     /// 遡ったとき、画面の行がすべて埋まることを確かめる。
     ///
     /// `display_iter` の行番号は履歴を含む座標で、遡っているあいだは負になる。
