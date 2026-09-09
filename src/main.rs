@@ -22,7 +22,7 @@ mod state;
 mod term;
 mod theme;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alacritty_terminal::index::{Column, Direction, Point, Side};
@@ -723,6 +723,20 @@ impl ApplicationHandler<UiEvent> for App {
                     s.request_redraw();
                 }
             }
+            WindowEvent::DroppedFile(path) => {
+                self.on_dropped_file(&path);
+                if let Some(s) = &self.state {
+                    s.request_redraw();
+                }
+            }
+            WindowEvent::HoveredFile(_) => {
+                state.status = Some(DROP_HINT.into());
+                state.request_redraw();
+            }
+            WindowEvent::HoveredFileCancelled => {
+                state.status = None;
+                state.request_redraw();
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.on_wheel(delta);
                 if let Some(s) = &self.state {
@@ -1388,6 +1402,26 @@ impl App {
         state.picked = picked;
     }
 
+    /// 落とされたファイルの場所を、打ったのと同じように渡す。
+    ///
+    /// 複数まとめて落とすと 1 つずつ届く。後ろに空白を置いて、
+    /// 続けて並ぶようにする。
+    fn on_dropped_file(&mut self, path: &Path) {
+        let Some(state) = &mut self.state else { return };
+        state.status = None;
+        let Some(session) = state.manager.selected() else {
+            return;
+        };
+        let mode = *session.term.lock().mode();
+        let mut text = quote_path(path);
+        text.push(' ');
+        session
+            .term
+            .lock()
+            .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+        session.pty.write(bracketed(&text, mode));
+    }
+
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
         let Some(state) = &mut self.state else { return };
         let cell_height = state.renderer.cell().height.max(1.0);
@@ -1918,6 +1952,9 @@ fn copy_text(
         _ => None,
     }
 }
+
+/// ファイルを持ってきたときに下の帯へ出す案内。
+const DROP_HINT: &str = "drop to paste the path";
 
 /// 端末上のプログラムがマウスを掴んでいるときに出す逃げ道。
 ///
@@ -2726,6 +2763,35 @@ fn draw_preedit_px(state: &mut State, x: f32, y: f32, st: TextStyle, theme: &The
 }
 
 /// 括弧付き貼り付けに対応している端末には印を付けて送る。
+/// 落とされたファイルの場所を、そのまま打ったのと同じ形にする。
+///
+/// 空白や引用符を含む場所は、そのまま渡すとシェルが分けてしまう。
+/// 素直な字だけで出来ているときは、囲まずにそのまま返す。
+/// 囲むときは単引用符を使い、中の単引用符だけ `'\''` で継ぐ。
+fn quote_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text.is_empty() {
+        return "''".to_string();
+    }
+    let plain = text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._-/+=:@,%".contains(c));
+    if plain {
+        return text.into_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for c in text.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 fn bracketed(text: &str, mode: TermMode) -> Vec<u8> {
     let cleaned: String = text.replace("\r\n", "\r").replace('\n', "\r");
     if mode.contains(TermMode::BRACKETED_PASTE) {
@@ -2944,6 +3010,62 @@ mod tests {
     fn まとめて来た大きな動きも行数に直す() {
         let mut w = WheelAccum::default();
         assert_eq!(w.push(px(170.0), 17.0), 10);
+    }
+
+    #[test]
+    fn 素直な場所はそのまま渡す() {
+        assert_eq!(
+            quote_path(Path::new("/Users/tkc/a.txt")),
+            "/Users/tkc/a.txt"
+        );
+        assert_eq!(quote_path(Path::new("src/main.rs")), "src/main.rs");
+        assert_eq!(quote_path(Path::new("a-b_c.2.tar.gz")), "a-b_c.2.tar.gz");
+    }
+
+    #[test]
+    fn 空白を含む場所は囲む() {
+        // 囲まずに渡すと、シェルが二つの引数に分けてしまう。
+        assert_eq!(
+            quote_path(Path::new("/Users/tkc/My Documents/a.txt")),
+            "'/Users/tkc/My Documents/a.txt'"
+        );
+    }
+
+    #[test]
+    fn 単引用符は継いで囲む() {
+        // 単引用符の中では単引用符を書けない。いったん閉じて継ぐ。
+        assert_eq!(
+            quote_path(Path::new("/tmp/it's here")),
+            "'/tmp/it'\\''s here'"
+        );
+    }
+
+    #[test]
+    fn シェルに読まれる字は囲む() {
+        for raw in [
+            "/tmp/a;rm -rf b",
+            "/tmp/$(whoami)",
+            "/tmp/a`id`b",
+            "/tmp/a&b",
+            "/tmp/a|b",
+            "/tmp/a>b",
+            "/tmp/a*b",
+            "/tmp/a\\b",
+            "/tmp/a\"b",
+        ] {
+            let got = quote_path(Path::new(raw));
+            assert!(got.starts_with('\'') && got.ends_with('\''), "{raw} は囲む");
+        }
+    }
+
+    #[test]
+    fn 日本語の場所も囲んで渡す() {
+        assert_eq!(quote_path(Path::new("/tmp/資料.txt")), "'/tmp/資料.txt'");
+    }
+
+    #[test]
+    fn 空の場所は空の引数にする() {
+        assert_eq!(quote_path(Path::new("")), "''");
     }
 
     #[test]
