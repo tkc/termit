@@ -192,7 +192,26 @@ struct MouseState {
     last_click: Option<(std::time::Instant, (usize, usize), u8)>,
     /// 車輪の端数。
     wheel: WheelAccum,
+    /// 左ペインで行を掴んでいる最中の状態。
+    sidebar_drag: Option<SidebarDrag>,
 }
+
+/// 左ペインの行を掴んで動かしている最中。
+struct SidebarDrag {
+    /// 掴んだ行（`tree_rows` の添字）。
+    from_row: usize,
+    /// 掴んだときの縦の位置。動いたと見なす閾値に使う。
+    start_y: f32,
+    /// 落とす境目。落とせる位置が無ければ `None`。
+    to: Option<usize>,
+    /// 掴んだだけか、動かしたか。
+    moved: bool,
+}
+
+/// 掴んだと見なすまでに動かす距離（pt）。
+///
+/// これが無いと、押しただけで目印が一瞬出る。
+const DRAG_SLOP: f32 = 5.0;
 
 /// 名前を付けるための入力。
 pub(crate) struct RenameState {
@@ -584,6 +603,13 @@ impl ApplicationHandler<UiEvent> for App {
                 state.mouse.x = position.x as f32;
                 state.mouse.y = position.y as f32;
                 let dragging = state.mouse.dragging;
+                if state.mouse.sidebar_drag.is_some() {
+                    self.drag_sidebar_row();
+                    if let Some(s) = &self.state {
+                        s.request_redraw();
+                    }
+                    return;
+                }
                 if state.mouse.resizing {
                     // 掴んでいるあいだは、その位置を幅にする。
                     let w = (state.mouse.x / state.renderer.scale()).clamp(80.0, 800.0);
@@ -1114,7 +1140,19 @@ impl App {
                         state.status = Some(e.to_string());
                     }
                 }
-                SidebarHit::Select(i) => state.manager.select(i),
+                SidebarHit::Select(i) => {
+                    state.manager.select(i);
+                    // 押した行はそのまま掴んでいる。動かせば並べ替えになる。
+                    let sl = sidebar_layout(state, &layout);
+                    if let Some(row) = sl.blocks.iter().position(|b| b.index == i) {
+                        state.mouse.sidebar_drag = Some(SidebarDrag {
+                            from_row: row,
+                            start_y: state.mouse.y,
+                            to: None,
+                            moved: false,
+                        });
+                    }
+                }
                 SidebarHit::Close(i) => state.manager.close(i),
             }
             state.mark_state_dirty();
@@ -1146,6 +1184,36 @@ impl App {
         state.mouse.dragging = true;
     }
 
+    /// 掴んでいる行の落とし先を、いまの位置から決める。
+    ///
+    /// ペインの外へ出ても、最後に決めた落とし先は残す。
+    /// 端末の座標で決め直すと、離した瞬間に飛ぶ。
+    fn drag_sidebar_row(&mut self) {
+        let Some(state) = &mut self.state else { return };
+        let layout = layout_of(&self.config, state);
+        let sl = sidebar_layout(state, &layout);
+        let sc = state.renderer.scale();
+        let (x, y) = (state.mouse.x, state.mouse.y);
+        let Some(drag) = &mut state.mouse.sidebar_drag else {
+            return;
+        };
+        if !drag.moved && (y - drag.start_y).abs() < DRAG_SLOP * sc {
+            return;
+        }
+        drag.moved = true;
+        if x >= sl.width {
+            return;
+        }
+        let want = sidebar_boundary(&sl, y);
+        let from_row = drag.from_row;
+        let to = state.manager.drop_row(from_row, want);
+        if let Some(drag) = &mut state.mouse.sidebar_drag {
+            if to.is_some() {
+                drag.to = to;
+            }
+        }
+    }
+
     fn drag_selection(&mut self) {
         let Some(state) = &mut self.state else { return };
         let layout = layout_of(&self.config, state);
@@ -1163,6 +1231,17 @@ impl App {
 
     fn on_release(&mut self) {
         let Some(state) = &mut self.state else { return };
+        // 左ペインで掴んでいた行を落とす。
+        if let Some(drag) = state.mouse.sidebar_drag.take() {
+            if drag.moved {
+                if let Some(to) = drag.to {
+                    if state.manager.reorder(drag.from_row, to) {
+                        state.mark_state_dirty();
+                    }
+                }
+                return;
+            }
+        }
         if state.mouse.resizing {
             state.mouse.resizing = false;
             // 離した時点で、残りも合わせる。次のできごとを待たせない。
@@ -1793,6 +1872,28 @@ fn sidebar_layout(state: &State, layout: &Layout) -> SidebarLayout {
     }
 }
 
+/// 縦の位置が、行と行のどの境目を指しているか。0 は先頭、行数は末尾。
+fn sidebar_boundary(sl: &SidebarLayout, py: f32) -> usize {
+    for (i, b) in sl.blocks.iter().enumerate() {
+        if py < b.top + b.height / 2.0 {
+            return i;
+        }
+    }
+    sl.blocks.len()
+}
+
+/// 境目を描く高さ。
+fn sidebar_boundary_y(sl: &SidebarLayout, at: usize, sc: f32) -> f32 {
+    let half = sidebar::GAP * sc / 2.0;
+    match sl.blocks.get(at) {
+        Some(b) => b.top - half,
+        None => match sl.blocks.last() {
+            Some(b) => b.top + b.height + half,
+            None => sidebar::HEADER * sc,
+        },
+    }
+}
+
 /// 左ペインのどこを押したか。
 enum SidebarHit {
     NewSession,
@@ -2011,6 +2112,21 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
                 &clipped,
                 style(sidebar::SIZE_BRANCH, false),
                 theme.fg_tertiary,
+            );
+        }
+    }
+
+    // 掴んでいる行の落とし先。
+    if let Some(drag) = &state.mouse.sidebar_drag {
+        if let (true, Some(at)) = (drag.moved, drag.to) {
+            let y = sidebar_boundary_y(&sl, at, sc);
+            state.renderer.fill_px(
+                sl.rect_x,
+                y - (1.0 * sc).max(1.0),
+                sl.rect_w,
+                (2.0 * sc).max(2.0),
+                theme.accent,
+                0.0,
             );
         }
     }

@@ -292,6 +292,102 @@ impl Manager {
         s.pty.resize(size, cell.0, cell.1);
     }
 
+    /// 掴んだ行が、その子孫ともども占める行数。
+    fn group_len(rows: &[TreeRow], from_row: usize) -> usize {
+        let depth = rows[from_row].depth;
+        let mut n = 1;
+        for r in &rows[from_row + 1..] {
+            if r.depth <= depth {
+                break;
+            }
+            n += 1;
+        }
+        n
+    }
+
+    /// 落とせる位置に丸める。行と行のあいだを指す 0..=行数 を返す。
+    ///
+    /// 根は根のあいだへ、子は同じ親の下へしか動かせない。
+    /// 木の形は並べ替えでは変えない。丸めた結果を目印として描くので、
+    /// 見えている位置と落ちる位置が食い違わない。
+    pub fn drop_row(&self, from_row: usize, want: usize) -> Option<usize> {
+        let rows = self.tree_rows();
+        if from_row >= rows.len() {
+            return None;
+        }
+        let len = Self::group_len(&rows, from_row);
+        let depth = rows[from_row].depth;
+        // 自分の中は落とし先にならない。
+        if want > from_row && want <= from_row + len {
+            return None;
+        }
+        // 同じ深さの行の頭だけが境目になる。末尾も含める。
+        let mut stops: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.depth == depth)
+            .map(|(i, _)| i)
+            .collect();
+        if depth == 0 {
+            stops.push(rows.len());
+        } else {
+            // 子は親の連なりの終わりまで。
+            let parent = rows[..from_row].iter().rposition(|r| r.depth < depth)?;
+            let end = parent + Self::group_len(&rows, parent);
+            stops.push(end);
+            stops.retain(|&i| i > parent && i <= end);
+        }
+        stops
+            .into_iter()
+            .min_by_key(|&i| want.abs_diff(i))
+            .filter(|&i| !(i > from_row && i <= from_row + len))
+    }
+
+    /// 行を掴んで並べ替える。掴んだ行にぶら下がるものは一緒に動く。
+    ///
+    /// `insert_at` は [`Manager::drop_row`] で丸めた境目である。
+    /// 動かすのは並びだけで、親子の関係は変えない。
+    pub fn reorder(&mut self, from_row: usize, insert_at: usize) -> bool {
+        let rows = self.tree_rows();
+        if from_row >= rows.len() || insert_at > rows.len() {
+            return false;
+        }
+        let len = Self::group_len(&rows, from_row);
+        if insert_at > from_row && insert_at <= from_row + len {
+            return false;
+        }
+        let before: Vec<usize> = rows.iter().map(|r| r.index).collect();
+        let mut order = before.clone();
+        let group: Vec<usize> = order.drain(from_row..from_row + len).collect();
+        let at = if insert_at > from_row {
+            insert_at - len
+        } else {
+            insert_at
+        }
+        .min(order.len());
+        for (k, idx) in group.into_iter().enumerate() {
+            order.insert(at + k, idx);
+        }
+        if order == before {
+            return false;
+        }
+        // 並びのとおりに作り直す。選んでいたセッションは追いかける。
+        let selected_id = self.sessions.get(self.selected_index()).map(|s| s.id);
+        let mut taken: Vec<Option<Session>> = self.sessions.drain(..).map(Some).collect();
+        self.sessions = order.iter().filter_map(|&i| taken[i].take()).collect();
+        // 拾い残しがあれば末尾へ。並びが崩れてもセッションは失わない。
+        for s in taken.into_iter().flatten() {
+            self.sessions.push(s);
+        }
+        if let Some(id) = selected_id {
+            if let Some(p) = self.sessions.iter().position(|s| s.id == id) {
+                self.selected = p;
+            }
+        }
+        self.ensure_visible_size();
+        true
+    }
+
     /// 深さ優先で親の直後に子が並ぶ順序を作る。
     pub fn tree_rows(&self) -> Vec<TreeRow> {
         let mut rows = Vec::with_capacity(self.sessions.len());
@@ -871,6 +967,183 @@ mod tests {
         m.resize_visible(same);
         assert!(m.pending.is_none(), "待たせるものが出ない");
         for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// 並べ替え用に n 本立ち上げ、名前で見分けられるようにする。
+    fn ordered(n: usize) -> Option<(Manager, Config)> {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return None;
+        }
+        let config = probe_config();
+        let cwd = std::env::current_dir().unwrap();
+        let mut m = probe_manager();
+        for i in 0..n {
+            m.spawn_new(&config, "host", &cwd).expect("作れる");
+            m.sessions_mut()[i].name = Some(format!("s{i}"));
+        }
+        Some((m, config))
+    }
+
+    /// 上から順の名前。
+    fn names(m: &Manager) -> Vec<String> {
+        m.tree_rows()
+            .iter()
+            .map(|r| m.sessions()[r.index].name.clone().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn 行を掴んで先頭へ動かせる() {
+        let Some((mut m, _)) = ordered(4) else { return };
+        assert_eq!(names(&m), ["s0", "s1", "s2", "s3"]);
+        assert!(m.reorder(2, 0));
+        assert_eq!(names(&m), ["s2", "s0", "s1", "s3"]);
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    #[test]
+    fn 行を掴んで末尾へ動かせる() {
+        let Some((mut m, _)) = ordered(4) else { return };
+        assert!(m.reorder(0, 4));
+        assert_eq!(names(&m), ["s1", "s2", "s3", "s0"]);
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    #[test]
+    fn 同じ場所へ落としても何も起きない() {
+        let Some((mut m, _)) = ordered(3) else { return };
+        assert!(!m.reorder(1, 1), "自分の頭は動かない");
+        assert!(!m.reorder(1, 2), "自分の後ろも動かない");
+        assert_eq!(names(&m), ["s0", "s1", "s2"]);
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    #[test]
+    fn 選んでいたセッションは動いても選ばれたまま() {
+        let Some((mut m, _)) = ordered(4) else { return };
+        m.select(2);
+        let id = m.sessions()[2].id;
+        assert!(m.reorder(2, 0));
+        assert_eq!(m.selected().map(|s| s.id), Some(id));
+        assert_eq!(m.selected_index(), 0);
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    #[test]
+    fn 分岐は親ごと動き親子の関係は変わらない() {
+        let Some((mut m, config)) = ordered(3) else {
+            return;
+        };
+        // s1 の下に子を 2 つ作る。
+        m.fork(&config, 1, None).expect("子を作れる");
+        m.sessions_mut()[3].name = Some("c1".into());
+        m.fork(&config, 1, None).expect("子をもう 1 つ");
+        m.sessions_mut()[4].name = Some("c2".into());
+        assert_eq!(names(&m), ["s0", "s1", "c1", "c2", "s2"]);
+
+        // s1 の行を掴むと、子ごと先頭へ動く。
+        assert!(m.reorder(1, 0));
+        assert_eq!(names(&m), ["s1", "c1", "c2", "s0", "s2"]);
+        // 親子の関係はそのまま。
+        let parent = m.sessions()[0].id;
+        assert_eq!(m.sessions()[1].parent, Some(parent));
+        assert_eq!(m.sessions()[2].parent, Some(parent));
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    #[test]
+    fn 自分の中へは落とせない() {
+        let Some((mut m, config)) = ordered(2) else {
+            return;
+        };
+        m.fork(&config, 0, None).expect("子を作れる");
+        m.sessions_mut()[2].name = Some("c".into());
+        assert_eq!(names(&m), ["s0", "c", "s1"]);
+        // 行 0 は s0 とその子。行 1 は自分の中。
+        assert_eq!(m.drop_row(0, 1), None, "自分の中は落とし先にならない");
+        assert!(!m.reorder(0, 1));
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    #[test]
+    fn 子は親の下から出られない() {
+        let Some((mut m, config)) = ordered(2) else {
+            return;
+        };
+        m.fork(&config, 0, None).expect("子を作れる");
+        m.sessions_mut()[2].name = Some("c".into());
+        assert_eq!(names(&m), ["s0", "c", "s1"]);
+        // 子（行 1）を先頭へ落とそうとしても、親の下へ丸められる。
+        let at = m.drop_row(1, 0).expect("落とし先はある");
+        assert_eq!(at, 1, "親の直後より前へは行かない");
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    #[test]
+    fn 並べ替えた順は覚えて作り直せる() {
+        let Some((mut m, config)) = ordered(3) else {
+            return;
+        };
+        assert!(m.reorder(2, 0));
+        assert_eq!(names(&m), ["s2", "s0", "s1"]);
+
+        let saved = m.snapshot();
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+        // 親の添字は自分より前を指す、という決まりを守っている。
+        let text = toml::to_string_pretty(&saved).unwrap();
+        let reloaded = crate::state::SavedState::parse(&text).expect("読み戻せる");
+
+        let mut m2 = probe_manager();
+        assert_eq!(m2.restore(&config, &reloaded), 3);
+        assert_eq!(names(&m2), ["s2", "s0", "s1"], "並べ替えた順で戻る");
+        for s in m2.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    #[test]
+    fn 分岐を並べ替えても親の添字は前を指す() {
+        let Some((mut m, config)) = ordered(2) else {
+            return;
+        };
+        m.fork(&config, 0, None).expect("子を作れる");
+        m.sessions_mut()[2].name = Some("c".into());
+        assert!(m.reorder(0, 3), "親と子を末尾へ動かす");
+        assert_eq!(names(&m), ["s1", "s0", "c"]);
+
+        let saved = m.snapshot();
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+        for (i, s) in saved.sessions.iter().enumerate() {
+            if let Some(p) = s.parent {
+                assert!(p < i, "{i} 番目の親 {p} は自分より前");
+            }
+        }
+        let text = toml::to_string_pretty(&saved).unwrap();
+        let reloaded = crate::state::SavedState::parse(&text).expect("読み戻せる");
+        let mut m2 = probe_manager();
+        assert_eq!(m2.restore(&config, &reloaded), 3);
+        assert_eq!(names(&m2), ["s1", "s0", "c"]);
+        for s in m2.sessions_mut() {
             s.pty.kill();
         }
     }
