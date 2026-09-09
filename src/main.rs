@@ -51,7 +51,7 @@ const SEARCH_ROWS: usize = 10;
 const SEARCH_LIMIT: usize = 500;
 
 /// 押したキーを記録する。キーバインドが届かないときの切り分けに使う。
-/// `TEX_KEYLOG` に書き出し先を指定したときだけ動く。
+/// `TERMIT_KEYLOG` に書き出し先を指定したときだけ動く。
 fn keylog(event: &winit::event::KeyEvent, mods: ModifiersState) {
     use std::io::Write;
     let Ok(path) = std::env::var("TERMIT_KEYLOG") else {
@@ -303,7 +303,7 @@ impl State {
 }
 
 /// 描画されない原因を工程ごとに切り分けるための計数。
-/// `TEX_FRAME_LOG` を指定したときだけ動く。
+/// `TERMIT_FRAME_LOG` を指定したときだけ動く。
 #[derive(Default)]
 struct Counters {
     wakeup: u64,

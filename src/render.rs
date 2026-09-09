@@ -128,7 +128,7 @@ pub struct Renderer {
     /// 画素指定で置く文字列の整形結果。
     strings: HashMap<StringKey, Buffer>,
 
-    /// フレームの内訳を測る。`TEX_FRAME_LOG` を指定したときだけ動く。
+    /// フレームの内訳を測る。`TERMIT_FRAME_LOG` を指定したときだけ動く。
     timing: Option<FrameTiming>,
     /// ベンチで使い回す出力先。
     bench_target: Option<(wgpu::Texture, wgpu::TextureView)>,
