@@ -645,7 +645,7 @@ impl ApplicationHandler<UiEvent> for App {
                     if let Some(c) = &mut self.counters {
                         c.key += 1;
                     }
-                    self.on_key(event, event_loop);
+                    self.on_key(event);
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -674,7 +674,7 @@ impl App {
         state.request_redraw();
     }
 
-    fn on_key(&mut self, event: winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
+    fn on_key(&mut self, event: winit::event::KeyEvent) {
         let Some(state) = &mut self.state else { return };
         let mods = state.mods;
         let key = event.logical_key.clone();
@@ -713,7 +713,7 @@ impl App {
         }
 
         if let Some(action) = input::action_for(&base, event.physical_key, mods) {
-            self.on_action(action, event_loop);
+            self.on_action(action);
             if let Some(s) = &self.state {
                 s.request_redraw();
             }
@@ -741,14 +741,14 @@ impl App {
         }
     }
 
-    fn on_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
-        self.on_action_inner(action, event_loop);
+    fn on_action(&mut self, action: Action) {
+        self.on_action_inner(action);
         if let Some(s) = &mut self.state {
             s.mark_state_dirty();
         }
     }
 
-    fn on_action_inner(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+    fn on_action_inner(&mut self, action: Action) {
         let cwd = self.cwd.clone();
         let config = self.config.clone();
         let Some(state) = &mut self.state else { return };
@@ -789,12 +789,7 @@ impl App {
                     state.manager.select(index);
                 }
             }
-            Action::CloseSession => {
-                state.manager.close_selected();
-                if state.manager.is_empty() {
-                    event_loop.exit();
-                }
-            }
+            Action::CloseSession => state.manager.close_selected(),
             Action::ToggleSidebar => {
                 state.sidebar = !state.sidebar;
                 self.reflow();
@@ -1039,10 +1034,7 @@ impl App {
                     }
                 }
                 SidebarHit::Select(i) => state.manager.select(i),
-                SidebarHit::Close(i) => {
-                    state.manager.select(i);
-                    state.manager.close_selected();
-                }
+                SidebarHit::Close(i) => state.manager.close(i),
             }
             state.mark_state_dirty();
             return;
@@ -1429,6 +1421,11 @@ impl App {
 
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = &mut self.state else { return };
+        // 最後の 1 つを閉じたら窓ごと閉じる。鍵盤でも鼠でもここを通る。
+        if state.manager.is_empty() {
+            event_loop.exit();
+            return;
+        }
         // 「描いた」印は、画面の内容を読む前に落とす。あとで落とすと、
         // 読んでから落とすまでのあいだに届いた更新が、通知を出さないまま
         // 捨てられる。出力が止まる直前（プロンプトが出た瞬間）に当たると、
