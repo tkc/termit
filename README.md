@@ -82,7 +82,8 @@ takes nothing, because neither shells nor agents use Cmd.
 | `⌘W` | Close the session (stops it if it is still running) |
 | `⌘C` / `⌘V` | Copy / paste |
 | `⌘=` / `⌘-` | Font size |
-| `Shift+PageUp` / `PageDown` | Scroll |
+| `Shift+PageUp` / `PageDown` | Scroll a page |
+| Wheel / two fingers | Scroll the scrollback; hold `Shift` to keep it from the program |
 
 Everything else goes to the child process untouched.
 

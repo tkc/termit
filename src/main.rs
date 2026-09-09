@@ -142,6 +142,38 @@ fn main() {
     }
 }
 
+/// 車輪の動きを行数に直す。端数は次の通知まで持ち越す。
+///
+/// 触覚板は 1 回の通知が数画素しかない。行に満たないぶんを捨てると、
+/// ゆっくり動かしているあいだ何も起こらず、動かないように見える。
+#[derive(Default)]
+struct WheelAccum {
+    /// まだ行にならずに残っている分。符号は向きを表す。
+    carry: f32,
+}
+
+impl WheelAccum {
+    /// 通知 1 回ぶんを足し、動かせる行数を返す。
+    fn push(&mut self, delta: MouseScrollDelta, cell_height: f32) -> i32 {
+        let add = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y,
+            MouseScrollDelta::PixelDelta(p) => p.y as f32 / cell_height.max(1.0),
+        };
+        if add == 0.0 {
+            return 0;
+        }
+        // 向きが変わったら持ち越しは捨てる。逆向きの端数が残っていると、
+        // 折り返した最初のひと押しがそれに食われる。
+        if self.carry != 0.0 && add.signum() != self.carry.signum() {
+            self.carry = 0.0;
+        }
+        self.carry += add;
+        let whole = self.carry.trunc();
+        self.carry -= whole;
+        whole as i32
+    }
+}
+
 /// マウスの状態。
 #[derive(Default)]
 struct MouseState {
@@ -157,6 +189,8 @@ struct MouseState {
     last_reported: Option<(usize, usize)>,
     /// 直前のクリックの時刻、セル、連続回数。
     last_click: Option<(std::time::Instant, (usize, usize), u8)>,
+    /// 車輪の端数。
+    wheel: WheelAccum,
 }
 
 /// 名前を付けるための入力。
@@ -1104,10 +1138,7 @@ impl App {
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
         let Some(state) = &mut self.state else { return };
         let cell_height = state.renderer.cell().height.max(1.0);
-        let lines = match delta {
-            MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
-            MouseScrollDelta::PixelDelta(p) => (p.y as f32 / cell_height).round() as i32,
-        };
+        let lines = state.mouse.wheel.push(delta, cell_height);
         if lines == 0 {
             return;
         }
@@ -2315,6 +2346,57 @@ fn bracketed(text: &str, mode: TermMode) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn px(y: f64) -> MouseScrollDelta {
+        MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, y))
+    }
+
+    #[test]
+    fn 触覚板の細かい動きを取りこぼさない() {
+        // 1 回 3 画素、行は 17 画素。切り捨てると永久に 0 行のままになる。
+        let mut w = WheelAccum::default();
+        let mut moved = 0;
+        for _ in 0..12 {
+            moved += w.push(px(3.0), 17.0);
+        }
+        assert_eq!(moved, 2, "36 画素ぶんは 2 行になる");
+    }
+
+    #[test]
+    fn 行に足りない一回では動かない() {
+        let mut w = WheelAccum::default();
+        assert_eq!(w.push(px(3.0), 17.0), 0);
+    }
+
+    #[test]
+    fn 端数は次の通知へ持ち越す() {
+        let mut w = WheelAccum::default();
+        assert_eq!(w.push(px(10.0), 17.0), 0);
+        assert_eq!(w.push(px(10.0), 17.0), 1, "20 画素で 1 行");
+        assert_eq!(w.push(px(10.0), 17.0), 0);
+        assert_eq!(w.push(px(10.0), 17.0), 1, "残りの 3 画素が効いている");
+    }
+
+    #[test]
+    fn 向きを変えたら持ち越しを捨てる() {
+        let mut w = WheelAccum::default();
+        assert_eq!(w.push(px(10.0), 17.0), 0, "上へ 10 画素、まだ行にならない");
+        // 逆向きの端数が残っていると、折り返した最初のひと押しが食われる。
+        assert_eq!(w.push(px(-17.0), 17.0), -1, "下へ 1 行");
+    }
+
+    #[test]
+    fn 行単位の通知はそのまま通る() {
+        let mut w = WheelAccum::default();
+        assert_eq!(w.push(MouseScrollDelta::LineDelta(0.0, 3.0), 17.0), 3);
+        assert_eq!(w.push(MouseScrollDelta::LineDelta(0.0, -1.0), 17.0), -1);
+    }
+
+    #[test]
+    fn まとめて来た大きな動きも行数に直す() {
+        let mut w = WheelAccum::default();
+        assert_eq!(w.push(px(170.0), 17.0), 10);
+    }
 
     #[test]
     fn 貼り付けは改行を復帰に揃える() {
