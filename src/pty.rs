@@ -475,6 +475,78 @@ mod tests {
     }
 }
 
+/// OSC 52 でクリップボードへ書けることを確かめる。
+///
+/// コンテナの中で走るエージェントは `pbcopy` に手が届かない。
+/// 外へコピーする道はこれだけなので、経路が生きているかを見張る。
+#[cfg(test)]
+mod osc52_tests {
+    use super::*;
+    use crate::term::TermSize;
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
+
+    /// 台本を走らせ、届いたクリップボードの中身を返す。
+    fn stored(script: &str) -> Option<String> {
+        let (tx, rx) = channel();
+        let _spawned = spawn(
+            SpawnOptions {
+                id: 1,
+                argv: &["/bin/sh".into(), "-c".into(), script.into()],
+                cwd: Path::new("/"),
+                size: TermSize::new(80, 24),
+                cell: (8, 16),
+                scrollback: 100,
+                session_key: "osc52".into(),
+            },
+            crate::term::UiSender::Channel(tx),
+        )
+        .expect("PTY を起動できる");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(UiEvent::ClipboardStore(_, text)) =
+                rx.recv_timeout(Duration::from_millis(200))
+            {
+                return Some(text);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn bel_で終わる_osc52_を受け取る() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        assert_eq!(
+            stored("printf '\\033]52;c;aGVsbG8=\\007'; sleep 1").as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn st_で終わる_osc52_を受け取る() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        assert_eq!(
+            stored("printf '\\033]52;c;aGVsbG8=\\033\\\\'; sleep 1").as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn 大きな_osc52_も切り詰めない() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // 画面ぶんを超える貼り付けが切れないこと。
+        let script = "b=$(head -c 65536 /dev/zero | tr '\\0' a | base64 | tr -d '\\n'); \
+                      printf '\\033]52;c;%s\\007' \"$b\"; sleep 2";
+        assert_eq!(stored(script).map(|s| s.len()), Some(65536));
+    }
+}
+
 #[cfg(test)]
 mod shell_integration_tests {
     use super::*;
