@@ -38,6 +38,7 @@ printf 'On branch \033[1mmain\033[0m\r\n'
 printf '\033[31m 変更されたファイル\033[0m: src/render.rs 全角の桁送りを確かめる\r\n'
 printf '\033[34m青\033[0m \033[35m紫\033[0m \033[36m水\033[0m \033[1m太字\033[0m \033[7m反転\033[0m \033[4m下線 underline\033[0m\r\n'
 printf '\033]8;id=probe;https://example.com/\033\\example.com\033]8;;\033\\ は OSC 8 のリンク\r\n'
+printf '素の URL も押せる: https://github.com/tkc/termit/pull/22\r\n'
 printf '\033]133;D;0\007'
 printf '\033]133;A\007'
 printf '\033[32m~/github/terminal_tex\033[0m $ '
@@ -119,7 +120,12 @@ pub fn run(out_path: &str) {
         find_current: Default::default(),
         mouse: Default::default(),
         // 指している状態を作って、リンクの下線を見えるようにする。
-        hovered_link: Some("probe".into()),
+        hovered_link: Some(crate::HoveredLink {
+            uri: "https://example.com/".into(),
+            id: Some("probe".into()),
+            span: None,
+        }),
+        url_regex: crate::link::url_search(),
         picked: None,
         mods: Default::default(),
         status: None,
