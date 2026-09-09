@@ -79,7 +79,7 @@ takes nothing, because neither shells nor agents use Cmd.
 | `⌘K` | Clear the screen and scrollback |
 | `⌘[` / `⌘]` | Select the previous / next session |
 | `⌘1`…`⌘9`, then `⌘A` `⌘G` `⌘J` `⌘L` `⌘O` `⌘P` `⌘S` `⌘T` `⌘U` `⌘X` `⌘Y` `⌘Z` | Jump to that session |
-| `⌘W` | Close the session |
+| `⌘W` | Close the session (stops it if it is still running) |
 | `⌘C` / `⌘V` | Copy / paste |
 | `⌘=` / `⌘-` | Font size |
 | `Shift+PageUp` / `PageDown` | Scroll |

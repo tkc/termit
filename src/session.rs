@@ -542,19 +542,26 @@ impl Manager {
         Ok(id)
     }
 
-    /// 選択中のセッションを終了させる。実行中なら停止、停止済みなら一覧から外す。
+    /// 選択中のセッションを閉じる。
     pub fn close_selected(&mut self) {
-        let i = self.selected_index();
-        let Some(s) = self.sessions.get_mut(i) else {
+        self.close(self.selected_index());
+    }
+
+    /// 番号で指定したセッションを閉じる。走っていれば止め、一覧から外す。
+    ///
+    /// 止めるだけで行を残すと、消せない行が居座っているように見える。
+    /// 閉じる操作は一度で閉じきる。
+    pub fn close(&mut self, index: usize) {
+        let Some(s) = self.sessions.get_mut(index) else {
             return;
         };
-        if s.is_running() {
-            s.pty.kill();
-        } else {
-            self.sessions.remove(i);
-            if self.selected >= self.sessions.len() {
-                self.selected = self.sessions.len().saturating_sub(1);
-            }
+        s.pty.kill();
+        self.sessions.remove(index);
+        // 消した行が選択より前なら、選択はその分だけ前へずれる。
+        if index < self.selected {
+            self.selected -= 1;
+        } else if self.selected >= self.sessions.len() {
+            self.selected = self.sessions.len().saturating_sub(1);
         }
     }
 
@@ -705,6 +712,138 @@ mod tests {
         c.shell.program = Some("/bin/sh".into());
         c.shell.args = vec!["-c".into(), "sleep 20".into()];
         c
+    }
+
+    /// その pid がまだ生きているか。合図は送らずに存在だけ見る。
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// pid が消えるまで待つ。消えなければ `false`。
+    fn wait_gone(pid: i32) -> bool {
+        for _ in 0..200 {
+            if !alive(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// 走っているセッションでも一度で閉じられることを確かめる。
+    #[test]
+    fn 走っているセッションも一度で閉じる() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let config = probe_config();
+        let cwd = std::env::current_dir().unwrap();
+        let mut m = probe_manager();
+        m.spawn_new(&config, "host", &cwd).expect("1 つめを作れる");
+        m.spawn_new(&config, "host", &cwd).expect("2 つめを作れる");
+        m.select(1);
+        assert!(m.sessions()[1].is_running());
+
+        m.close_selected();
+        assert_eq!(m.sessions().len(), 1, "走っていても一度で消える");
+        assert_eq!(m.selected_index(), 0, "選択が残った側へ寄る");
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// 止まったセッションも同じように外れることを確かめる。
+    #[test]
+    fn 止まったセッションを一覧から外せる() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let config = probe_config();
+        let cwd = std::env::current_dir().unwrap();
+        let mut m = probe_manager();
+        m.spawn_new(&config, "host", &cwd).expect("1 つめを作れる");
+        m.spawn_new(&config, "host", &cwd).expect("2 つめを作れる");
+        let id = m.sessions()[1].id;
+        m.mark_exited(id, 130);
+        m.select(1);
+        assert!(!m.sessions()[1].is_running());
+
+        m.close_selected();
+        assert_eq!(m.sessions().len(), 1, "止まっていても一度で消える");
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// 閉じたあとにプロセスが残らないことを確かめる。
+    ///
+    /// 一度で行が消えるようになったぶん、殺し損ねると気付けない。
+    /// シェルだけでなく、その下で走っているものまで落ちること。
+    #[test]
+    fn 閉じたセッションのプロセスは残らない() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // 孫の pid をファイルへ書かせる。シェルは wait で居座る。
+        let note = std::env::temp_dir().join(format!("termit-close-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&note);
+        let mut config = probe_config();
+        config.shell.args = vec![
+            "-c".into(),
+            format!("sleep 30 & echo $! > {}; wait", note.display()),
+        ];
+
+        let cwd = std::env::current_dir().unwrap();
+        let mut m = probe_manager();
+        m.spawn_new(&config, "host", &cwd).expect("作れる");
+        let shell = m.sessions()[0].pty.foreground_pid().expect("pid が取れる");
+
+        let mut child = 0;
+        for _ in 0..200 {
+            if let Ok(t) = std::fs::read_to_string(&note) {
+                if let Ok(p) = t.trim().parse::<i32>() {
+                    child = p;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(&note);
+        assert!(child > 0, "孫の pid を受け取れる");
+        assert!(alive(shell) && alive(child), "閉じる前は両方走っている");
+
+        m.close_selected();
+        assert!(m.is_empty(), "一覧から消える");
+        assert!(wait_gone(shell), "シェル {shell} が残っている");
+        assert!(wait_gone(child), "その下の {child} が残っている");
+    }
+
+    /// 選択より前の行を閉じても、選択が別のセッションへ移らないことを確かめる。
+    #[test]
+    fn 前の行を閉じても選択はずれない() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let config = probe_config();
+        let cwd = std::env::current_dir().unwrap();
+        let mut m = probe_manager();
+        for _ in 0..3 {
+            m.spawn_new(&config, "host", &cwd).expect("作れる");
+        }
+        m.select(2);
+        let want = m.sessions()[2].id;
+
+        // 鼠で「×」を押す道は、選択と関係ない行を閉じる。
+        m.close(0);
+        assert_eq!(m.sessions().len(), 2);
+        assert_eq!(
+            m.selected().map(|s| s.id),
+            Some(want),
+            "選んでいたセッションのまま"
+        );
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
     }
 
     /// 覚えた並びから作り直したとき、木の形と名前が戻ることを確かめる。
