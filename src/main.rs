@@ -135,6 +135,7 @@ fn main() {
         counters: std::env::var("TERMIT_FRAME_LOG")
             .is_ok()
             .then(Counters::default),
+        resize_quiet_since: None,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("termit: {e}");
@@ -356,12 +357,19 @@ impl Counters {
     }
 }
 
+/// 引きずる手が止まったと見なすまでの間。
+///
+/// これを過ぎたら、待たせていたセッションの桁数も合わせる。
+const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
+
 struct App {
     config: Config,
     cwd: PathBuf,
     proxy: EventLoopProxy<UiEvent>,
     state: Option<State>,
     counters: Option<Counters>,
+    /// 最後に大きさが変わった時刻。合わせ残しがあるときだけ入る。
+    resize_quiet_since: Option<std::time::Instant>,
 }
 
 /// 画面の割り付け。すべてセル単位で扱う。
@@ -713,8 +721,22 @@ impl App {
         state
             .manager
             .set_cell((cell.width as u16, cell.height as u16));
-        state.manager.resize(TermSize::new(term_cols, term_rows));
-        state.request_redraw();
+        // 引きずっている最中かもしれない。見えているものだけ先に合わせる。
+        state
+            .manager
+            .resize_visible(TermSize::new(term_cols, term_rows));
+        self.resize_quiet_since = Some(std::time::Instant::now());
+        if let Some(s) = &self.state {
+            s.request_redraw();
+        }
+    }
+
+    /// 待たせていたセッションを、いま合わせる。
+    fn settle_resize(&mut self) {
+        self.resize_quiet_since = None;
+        if let Some(state) = &mut self.state {
+            state.manager.settle();
+        }
     }
 
     fn on_key(&mut self, event: winit::event::KeyEvent) {
@@ -1127,6 +1149,8 @@ impl App {
         let Some(state) = &mut self.state else { return };
         if state.mouse.resizing {
             state.mouse.resizing = false;
+            // 離した時点で、残りも合わせる。次のできごとを待たせない。
+            self.settle_resize();
             return;
         }
         state.mouse.dragging = false;
@@ -1482,6 +1506,13 @@ impl App {
     // ---------------------------------------------------------------- 描画
 
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
+        // 引きずる手が止まったら、待たせていたセッションを合わせる。
+        if self
+            .resize_quiet_since
+            .is_some_and(|at| at.elapsed() >= RESIZE_SETTLE)
+        {
+            self.settle_resize();
+        }
         let Some(state) = &mut self.state else { return };
         // 最後の 1 つを閉じたら窓ごと閉じる。鍵盤でも鼠でもここを通る。
         if state.manager.is_empty() {
@@ -1559,6 +1590,11 @@ impl App {
             if let Some(d) = latency {
                 c.latency_us.push(d.as_micros() as u64);
             }
+        }
+        // 合わせ残しがあるなら、手が止まったころに起こしてもらう。
+        // 引きずり終わりが最後のできごとになることがある。
+        if let Some(at) = self.resize_quiet_since {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(at + RESIZE_SETTLE));
         }
     }
 
