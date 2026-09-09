@@ -5,7 +5,7 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -72,6 +72,11 @@ pub struct Spawned {
     pub window_size: Arc<FairMutex<WindowSize>>,
     /// 前回の描画以降に画面が変わったか。通知の氾濫を抑えるために使う。
     pub dirty: Arc<AtomicBool>,
+    /// 最後に何か読んだ時刻（起動からのミリ秒）。
+    ///
+    /// 描き直しの有無に左右されず、出力があったことだけを表す。
+    /// 左ペインで「動いている」印を出すのに使う。
+    pub activity: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -167,12 +172,16 @@ pub fn spawn(opts: SpawnOptions<'_>, ui_tx: UiSender) -> Result<Spawned, SpawnEr
     )));
 
     let dirty = Arc::new(AtomicBool::new(true));
+    let activity = Arc::new(AtomicU64::new(crate::term::now_ms()));
     spawn_reader(
         id,
         reader,
         term.clone(),
         ui_tx.clone(),
-        dirty.clone(),
+        ReaderFlags {
+            dirty: dirty.clone(),
+            activity: activity.clone(),
+        },
         cwd.to_string_lossy().to_string(),
         session_key,
     );
@@ -192,6 +201,7 @@ pub fn spawn(opts: SpawnOptions<'_>, ui_tx: UiSender) -> Result<Spawned, SpawnEr
         term,
         window_size,
         dirty,
+        activity,
     })
 }
 
@@ -302,15 +312,24 @@ impl CommandTracker {
     }
 }
 
+/// 読み取りスレッドが共有する印。
+struct ReaderFlags {
+    /// 前回の描画以降に画面が変わったか。
+    dirty: Arc<AtomicBool>,
+    /// 最後に何か読んだ時刻。
+    activity: Arc<AtomicU64>,
+}
+
 fn spawn_reader(
     id: SessionId,
     mut reader: Box<dyn Read + Send>,
     term: Arc<FairMutex<alacritty_terminal::Term<EventProxy>>>,
     ui_tx: UiSender,
-    dirty: Arc<AtomicBool>,
+    flags: ReaderFlags,
     cwd: String,
     session_key: String,
 ) {
+    let ReaderFlags { dirty, activity } = flags;
     thread::Builder::new()
         .name("termit-pty-read".into())
         .spawn(move || {
@@ -352,6 +371,8 @@ fn spawn_reader(
                         skipped = 0;
                     }
                 }
+                // 出力があったことを残す。描き直しの有無に左右されない。
+                activity.store(crate::term::now_ms(), Ordering::Relaxed);
                 let bytes = &buf[..n];
                 let events = scanner.feed(bytes);
                 let mut out: Vec<UiEvent> = Vec::new();

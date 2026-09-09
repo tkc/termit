@@ -170,6 +170,18 @@ impl EventListener for EventProxy {
     }
 }
 
+/// 起動からの経過ミリ秒。
+///
+/// 読み取りスレッドと描画のあいだで時刻を渡すために使う。
+/// `Instant` は原子変数に入らないので、起点からの差を数える。
+pub fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
 pub fn new_term(size: TermSize, scrollback: usize, proxy: EventProxy) -> Term<EventProxy> {
     let config = TermConfig {
         scrolling_history: scrollback,

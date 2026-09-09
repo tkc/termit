@@ -89,6 +89,12 @@ takes nothing, because neither shells nor agents use Cmd.
 
 Everything else goes to the child process untouched.
 
+**The dot on a row** is filled while the session is alive and hollow once it
+has ended. It is bright while the session is producing output — an agent that
+is working keeps its spinner moving, so the bright dot means *busy* and the dim
+one means *waiting for you*. A hollow grey dot ended cleanly, a hollow red one
+did not.
+
 **Reordering the left pane.** Drag a row and drop it where the line appears.
 A session with forks under it moves together with them, and a fork moves within
 its parent — the drop marker only appears where the row can actually land. The
