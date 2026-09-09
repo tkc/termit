@@ -198,6 +198,13 @@ program = "/bin/zsh"
 args    = ["-l"]
 ```
 
+`scrollback` is per session, and a row costs its full width whether or not
+anything is on it — `lines × columns × 24 bytes`. At the default 10000 lines
+and 200 columns that is 48 MB for one session that has filled it, so a dozen
+busy sessions can reach several hundred megabytes. Nothing leaks — memory
+stops growing once the limit is reached — but if you keep many sessions open,
+lower this. `docs/performance.md` has the measurements.
+
 A bad value is reported at startup and termit exits; it never silently
 substitutes a default.
 
