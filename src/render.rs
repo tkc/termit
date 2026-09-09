@@ -26,6 +26,80 @@ struct GlyphKey {
     italic: bool,
 }
 
+/// 体裁の数。太字と斜体の組み合わせ。
+const STYLES: usize = 4;
+/// 添字で引く範囲の先頭と、その文字数。
+const ASCII_FIRST: u32 = 0x20;
+const ASCII_COUNT: usize = 0x7f - 0x20;
+
+/// 整形済みの字形の入れ物。
+///
+/// 1 コマにつき 2 回引くので、既定の SipHash では割に合わない。
+/// 実測では、この引き方だけで本体が使う時間の 1 割近くを占めていた。
+/// よく出る ASCII は添字で直に引き、それ以外だけを表に置く。
+struct GlyphCache {
+    /// `(c - 0x20) * STYLES + 太字 * 2 + 斜体` の位置に入る。
+    ascii: Vec<Option<Buffer>>,
+    rest: HashMap<GlyphKey, Buffer, rustc_hash::FxBuildHasher>,
+}
+
+impl GlyphCache {
+    fn new() -> Self {
+        let mut ascii = Vec::new();
+        ascii.resize_with(ASCII_COUNT * STYLES, || None);
+        Self {
+            ascii,
+            rest: HashMap::default(),
+        }
+    }
+
+    /// 添字で引ける文字なら、その位置。
+    fn slot(key: &GlyphKey) -> Option<usize> {
+        let c = key.c as u32;
+        if !(ASCII_FIRST..ASCII_FIRST + ASCII_COUNT as u32).contains(&c) {
+            return None;
+        }
+        Some(
+            (c - ASCII_FIRST) as usize * STYLES
+                + usize::from(key.bold) * 2
+                + usize::from(key.italic),
+        )
+    }
+
+    fn get(&self, key: &GlyphKey) -> Option<&Buffer> {
+        match Self::slot(key) {
+            Some(i) => self.ascii[i].as_ref(),
+            None => self.rest.get(key),
+        }
+    }
+
+    fn contains_key(&self, key: &GlyphKey) -> bool {
+        match Self::slot(key) {
+            Some(i) => self.ascii[i].is_some(),
+            None => self.rest.contains_key(key),
+        }
+    }
+
+    fn insert(&mut self, key: GlyphKey, buffer: Buffer) {
+        match Self::slot(&key) {
+            Some(i) => self.ascii[i] = Some(buffer),
+            None => {
+                self.rest.insert(key, buffer);
+            }
+        }
+    }
+
+    /// 書体が変わったら、整形し直す。
+    fn clear(&mut self) {
+        self.ascii.fill_with(|| None);
+        self.rest.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.ascii.iter().filter(|s| s.is_some()).count() + self.rest.len()
+    }
+}
+
 struct CellDraw {
     x: f32,
     y: f32,
@@ -115,7 +189,7 @@ pub struct Renderer {
     text_renderer: TextRenderer,
     rects: RectRenderer,
 
-    glyphs: HashMap<GlyphKey, Buffer>,
+    glyphs: GlyphCache,
     family: Option<String>,
     metrics: Metrics,
     cell: CellMetrics,
@@ -126,7 +200,7 @@ pub struct Renderer {
     text_draws: Vec<TextDraw>,
     rect_draws: Vec<Rect>,
     /// 画素指定で置く文字列の整形結果。
-    strings: HashMap<StringKey, Buffer>,
+    strings: HashMap<StringKey, Buffer, rustc_hash::FxBuildHasher>,
 
     /// フレームの内訳を測る。`TERMIT_FRAME_LOG` を指定したときだけ動く。
     timing: Option<FrameTiming>,
@@ -274,7 +348,7 @@ impl Renderer {
             atlas,
             text_renderer,
             rects,
-            glyphs: HashMap::new(),
+            glyphs: GlyphCache::new(),
             family,
             metrics: Metrics::new(1.0, 1.0),
             cell: CellMetrics {
@@ -286,7 +360,7 @@ impl Renderer {
             cell_draws: Vec::new(),
             text_draws: Vec::new(),
             rect_draws: Vec::new(),
-            strings: HashMap::new(),
+            strings: HashMap::default(),
             timing: std::env::var("TERMIT_FRAME_LOG")
                 .is_ok()
                 .then(FrameTiming::default),
@@ -337,7 +411,7 @@ impl Renderer {
             atlas,
             text_renderer,
             rects,
-            glyphs: HashMap::new(),
+            glyphs: GlyphCache::new(),
             family,
             metrics: Metrics::new(1.0, 1.0),
             cell: CellMetrics {
@@ -349,7 +423,7 @@ impl Renderer {
             cell_draws: Vec::new(),
             text_draws: Vec::new(),
             rect_draws: Vec::new(),
-            strings: HashMap::new(),
+            strings: HashMap::default(),
             timing: std::env::var("TERMIT_FRAME_LOG")
                 .is_ok()
                 .then(FrameTiming::default),
@@ -432,6 +506,11 @@ impl Renderer {
         // 出てこなくなった文字列を溜め込まないよう、時々捨てる。
         if self.strings.len() > 512 {
             self.strings.clear();
+        }
+        // 添字で引けない字形も、際限なく溜めない。
+        // 日本語や絵文字を大量に流したときの上限になる。
+        if self.glyphs.rest.len() > 4096 {
+            self.glyphs.rest.clear();
         }
     }
 
@@ -1049,7 +1128,7 @@ fn has_family(fs: &FontSystem, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::char_cols;
+    use super::{char_cols, GlyphCache, GlyphKey, STYLES};
 
     #[test]
     fn 全角文字は二桁を占める() {
@@ -1063,5 +1142,44 @@ mod tests {
     fn 幅のない文字も一桁として数える() {
         // 結合文字を 0 桁にするとセル位置がずれるため 1 桁として扱う。
         assert_eq!(char_cols('\u{0301}'), 1);
+    }
+
+    fn key(c: char, bold: bool, italic: bool) -> GlyphKey {
+        GlyphKey { c, bold, italic }
+    }
+
+    #[test]
+    fn ascii_は添字で引く() {
+        // 1 コマにつき 2 回引く。ここで表を引かないぶんが効く。
+        assert_eq!(GlyphCache::slot(&key(' ', false, false)), Some(0));
+        assert_eq!(GlyphCache::slot(&key('~', false, false)), Some(94 * STYLES));
+    }
+
+    #[test]
+    fn 体裁ごとに別の位置を使う() {
+        let plain = GlyphCache::slot(&key('a', false, false)).unwrap();
+        assert_eq!(GlyphCache::slot(&key('a', false, true)), Some(plain + 1));
+        assert_eq!(GlyphCache::slot(&key('a', true, false)), Some(plain + 2));
+        assert_eq!(GlyphCache::slot(&key('a', true, true)), Some(plain + 3));
+    }
+
+    #[test]
+    fn 添字で引けない文字は表へ回す() {
+        assert_eq!(GlyphCache::slot(&key('あ', false, false)), None);
+        assert_eq!(GlyphCache::slot(&key('🙂', false, false)), None);
+        // 制御文字と DEL は範囲の外。
+        assert_eq!(GlyphCache::slot(&key('\u{1f}', false, false)), None);
+        assert_eq!(GlyphCache::slot(&key('\u{7f}', false, false)), None);
+    }
+
+    #[test]
+    fn 添字は用意した範囲に収まる() {
+        let cache = GlyphCache::new();
+        for c in ' '..='~' {
+            for (bold, italic) in [(false, false), (false, true), (true, false), (true, true)] {
+                let i = GlyphCache::slot(&key(c, bold, italic)).expect("{c} は添字で引ける");
+                assert!(i < cache.ascii.len(), "{c} の位置 {i} が範囲内");
+            }
+        }
     }
 }

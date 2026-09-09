@@ -2384,6 +2384,7 @@ dependencies = [
  "pollster",
  "portable-pty",
  "rusqlite",
+ "rustc-hash 2.1.3",
  "serde",
  "toml",
  "unicode-width",

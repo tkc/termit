@@ -23,9 +23,17 @@ env_logger = "0.11"
 pollster = "0.4"
 unicode-width = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
+# 字形の表を引くための速い雑ぱなハッシュ。glyphon が同じものを使っている。
+rustc-hash = "2"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# release と同じ最適化で、記号だけ残す。`sample` で中身を見るために使う。
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 1
