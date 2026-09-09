@@ -226,6 +226,59 @@ mod selection_tests {
         (term, parser)
     }
 
+    /// 遡ったとき、画面の行がすべて埋まることを確かめる。
+    ///
+    /// `display_iter` の行番号は履歴を含む座標で、遡っているあいだは負になる。
+    /// 負を捨てると上から抜け、画面の下がそのぶん空いたまま出る。
+    #[test]
+    fn 遡っても画面の行がすべて出る() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (ptx, _prx) = std::sync::mpsc::channel();
+        let ws = Arc::new(FairMutex::new(WindowSize {
+            num_lines: 10,
+            num_cols: 40,
+            cell_width: 8,
+            cell_height: 16,
+        }));
+        let proxy = EventProxy::new(1, ptx, UiSender::Channel(tx), ws);
+        let mut term = new_term(TermSize::new(40, 10), 100, proxy);
+        let mut parser: Processor = Processor::new();
+        for i in 0..60 {
+            parser.advance(&mut term, format!("line{i}\r\n").as_bytes());
+        }
+
+        for offset in [0usize, 1, 5, 9, 10, 30] {
+            term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+            term.scroll_display(alacritty_terminal::grid::Scroll::Delta(offset as i32));
+            let content = term.renderable_content();
+            let display_offset = content.display_offset;
+            let mut rows: Vec<usize> = Vec::new();
+            let mut filled = std::collections::HashSet::new();
+            for indexed in content.display_iter {
+                let Some(row) = crate::screen_row(indexed.point.line.0, display_offset, 10) else {
+                    continue;
+                };
+                if indexed.point.column.0 == 0 {
+                    rows.push(row);
+                }
+                if indexed.cell.c != ' ' {
+                    filled.insert(row);
+                }
+            }
+            assert_eq!(
+                rows,
+                (0..10).collect::<Vec<_>>(),
+                "{offset} 行遡ったとき、画面の行が順に出る"
+            );
+            // 最下部にいるときは、いま打ちかけの行だけが空になる。
+            assert!(
+                filled.len() >= 9,
+                "{offset} 行遡ったとき、字のある行が {} しかない",
+                filled.len()
+            );
+        }
+    }
+
     #[test]
     fn 選んだ行を書き直されると選択が消える() {
         let (mut term, mut parser) = selected();
