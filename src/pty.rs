@@ -427,7 +427,13 @@ mod tests {
         let spawned = spawn(
             SpawnOptions {
                 id: 7,
-                argv: &["/bin/echo".to_string(), "hello".to_string()],
+                // 出力を読み終える前に子が終わると、擬似端末に残った
+                // ぶんが捨てられることがある。読む間だけ生かしておく。
+                argv: &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo hello; sleep 1".to_string(),
+                ],
                 cwd: Path::new("/"),
                 size: TermSize::new(40, 8),
                 cell: (8, 16),
@@ -438,22 +444,8 @@ mod tests {
         )
         .expect("PTY を起動できる");
 
+        // 先に画面を見る。子はまだ生きている。
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut exit_code = None;
-        while Instant::now() < deadline && exit_code.is_none() {
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(UiEvent::ChildExit(id, code)) => {
-                    assert_eq!(id, 7);
-                    exit_code = Some(code);
-                }
-                Ok(_) => {}
-                Err(_) => {}
-            }
-        }
-        assert_eq!(exit_code, Some(0), "子プロセスが終了コード 0 で終わる");
-
-        // 出力の読み取りが終わるまで少し待つ。
-        let deadline = Instant::now() + Duration::from_secs(5);
         let mut found = false;
         while Instant::now() < deadline && !found {
             {
@@ -472,6 +464,21 @@ mod tests {
             }
         }
         assert!(found, "グリッドに hello が現れる");
+
+        // 読み終えてから、終わり方を見る。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut exit_code = None;
+        while Instant::now() < deadline && exit_code.is_none() {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(UiEvent::ChildExit(id, code)) => {
+                    assert_eq!(id, 7);
+                    exit_code = Some(code);
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert_eq!(exit_code, Some(0), "子プロセスが終了コード 0 で終わる");
     }
 }
 
