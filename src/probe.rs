@@ -117,6 +117,7 @@ pub fn run(out_path: &str) {
         find_cells: Default::default(),
         find_current: Default::default(),
         mouse: Default::default(),
+        picked: None,
         mods: Default::default(),
         status: None,
         recent: Vec::new(),

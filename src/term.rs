@@ -177,3 +177,70 @@ pub fn new_term(size: TermSize, scrollback: usize, proxy: EventProxy) -> Term<Ev
     };
     Term::new(config, &size, proxy)
 }
+
+/// 全画面 UI の描き直しで選択が消えることを確かめる。
+///
+/// これが `State::picked` の理由である。
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use alacritty_terminal::index::{Column, Line, Point, Side};
+    use alacritty_terminal::selection::{Selection, SelectionType};
+    use alacritty_terminal::vte::ansi::Processor;
+
+    /// 端末と、`hello` を選んだ状態を作る。
+    fn selected() -> (Term<EventProxy>, Processor) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (ptx, _prx) = std::sync::mpsc::channel();
+        let ws = Arc::new(FairMutex::new(WindowSize {
+            num_lines: 10,
+            num_cols: 80,
+            cell_width: 8,
+            cell_height: 16,
+        }));
+        let proxy = EventProxy::new(1, ptx, UiSender::Channel(tx), ws);
+        let mut term = new_term(TermSize::new(80, 10), 100, proxy);
+        let mut parser = Processor::new();
+        parser.advance(&mut term, b"hello world\r\n");
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        ));
+        if let Some(s) = term.selection.as_mut() {
+            s.update(Point::new(Line(0), Column(4)), Side::Right);
+        }
+        assert_eq!(term.selection_to_string().as_deref(), Some("hello"));
+        (term, parser)
+    }
+
+    #[test]
+    fn 選んだ行を書き直されると選択が消える() {
+        let (mut term, mut parser) = selected();
+        // 全画面 UI が同じ行を描き直す。
+        parser.advance(&mut term, b"\x1b[H\x1b[Kxxxxx");
+        assert_eq!(
+            term.selection_to_string(),
+            None,
+            "書き直された時点で選択は捨てられる"
+        );
+    }
+
+    #[test]
+    fn 画面消去でも選択が消える() {
+        let (mut term, mut parser) = selected();
+        parser.advance(&mut term, b"\x1b[2J");
+        assert_eq!(term.selection_to_string(), None);
+    }
+
+    #[test]
+    fn 別の行を書かれても選択は残る() {
+        let (mut term, mut parser) = selected();
+        parser.advance(&mut term, b"\x1b[3;1H\x1b[Kother line");
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("hello"),
+            "触られていない行の選択は残る"
+        );
+    }
+}
