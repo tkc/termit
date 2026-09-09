@@ -429,7 +429,13 @@ impl ApplicationHandler<UiEvent> for App {
         if matches!(cause, StartCause::ResumeTimeReached { .. }) {
             event_loop.set_control_flow(ControlFlow::Wait);
             if let Some(s) = &self.state {
-                if s.needs_redraw {
+                // 描けずに待っていたときのほか、大きさの合わせ残しと
+                // 「動いている」印の描き直しも、ここを起点にする。
+                // 起こしてもらっても描かなければ、どれも先へ進まない。
+                if s.needs_redraw
+                    || s.manager.has_pending_size()
+                    || s.manager.sessions().iter().any(|x| x.shown_working)
+                {
                     s.request_redraw();
                 }
             }
@@ -1646,6 +1652,9 @@ impl App {
             event_loop.exit();
             return;
         }
+        // 出すセッションの大きさを、描く前に必ず合わせる。
+        // 引きずるあいだ待たせたものを、そのまま描くと下半分が空く。
+        state.manager.ensure_visible_size();
         // 「描いた」印は、画面の内容を読む前に落とす。あとで落とすと、
         // 読んでから落とすまでのあいだに届いた更新が、通知を出さないまま
         // 捨てられる。出力が止まる直前（プロンプトが出た瞬間）に当たると、
