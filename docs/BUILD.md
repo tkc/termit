@@ -85,7 +85,11 @@ RUST_LOG=info TERMIT_FRAME_LOG=1 termit
 
 It prints how many times the reader thread read, how many redraws were
 requested and actually happened, how long it took from a byte arriving to
-`present()` returning, and the per-stage cost of drawing.
+`present()` returning, and the per-stage cost of drawing. It also prints, once
+a second, how the screen was composed — the rows the layout has, the lines the
+grid has, the size of the scrollback, how far back the view is scrolled, where
+the cursor is, and which rows nothing was drawn on. A screenshot cannot tell a
+drawing mistake from a grid that is genuinely blank there; this can.
 
 To record what your keyboard delivers:
 
