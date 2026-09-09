@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use alacritty_terminal::index::{Column, Direction, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::term::cell::{Flags, Hyperlink};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{viewport_to_point, TermMode};
 use alacritty_terminal::vte::ansi::CursorShape;
 use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
@@ -264,8 +264,10 @@ pub(crate) struct State {
     /// そのうち、いま選んでいる一致のセル。
     find_current: std::collections::HashSet<(i32, usize)>,
     mouse: MouseState,
-    /// いま指しているリンクの識別子。下線を引く相手を決めるのに使う。
-    hovered_link: Option<String>,
+    /// いま指しているリンク。下線を引く相手と、押したときに開く相手。
+    hovered_link: Option<HoveredLink>,
+    /// 素の URL を探す道具。作るのが重いので使い回す。
+    url_regex: Option<alacritty_terminal::term::search::RegexSearch>,
     /// 最後に選び終えた文字と、その持ち主。
     ///
     /// 全画面 UI は絶えず描き直す。選んだ行を書き直された時点で
@@ -482,6 +484,7 @@ impl ApplicationHandler<UiEvent> for App {
             find_current: Default::default(),
             mouse: MouseState::default(),
             hovered_link: None,
+            url_regex: link::url_search(),
             picked: None,
             mods: ModifiersState::empty(),
             status: None,
@@ -647,7 +650,7 @@ impl ApplicationHandler<UiEvent> for App {
                 }
                 let layout = layout_of(&self.config, state);
                 // 指しているリンクを覚える。変わったときだけ描き直す。
-                let link = hyperlink_at(state, &layout).map(|h| h.id().to_string());
+                let link = hyperlink_at(state, &layout);
                 let link_changed = link != state.hovered_link;
                 if link_changed {
                     state.hovered_link = link;
@@ -1110,7 +1113,7 @@ fn log_grid(
 ///
 /// OSC 8 は `alacritty_terminal` がコマに結び付けてくれる。
 /// ここでは、いま指している 1 コマぶんを読むだけである。
-fn hyperlink_at(state: &State, layout: &Layout) -> Option<Hyperlink> {
+fn hyperlink_at(state: &mut State, layout: &Layout) -> Option<HoveredLink> {
     if state.mouse.x < layout.sidebar_px {
         return None;
     }
@@ -1124,7 +1127,23 @@ fn hyperlink_at(state: &State, layout: &Layout) -> Option<Hyperlink> {
     {
         return None;
     }
-    term.grid()[point].hyperlink()
+    // OSC 8 で印が付いていれば、それを使う。
+    if let Some(h) = term.grid()[point].hyperlink() {
+        return Some(HoveredLink {
+            uri: h.uri().to_string(),
+            id: Some(h.id().to_string()),
+            span: None,
+        });
+    }
+    // 印が無ければ、素で書かれた URL を探す。
+    let regex = state.url_regex.as_mut()?;
+    let span = link::url_at(&term, regex, point)?;
+    let uri = term.bounds_to_string(*span.start(), *span.end());
+    link::openable(&uri).then_some(HoveredLink {
+        uri,
+        id: None,
+        span: Some(span),
+    })
 }
 
 /// 表示行を画面の何行目かに直す。範囲の外なら `None`。
@@ -1283,8 +1302,8 @@ impl App {
         }
 
         // 端末領域。リンクの上なら開く。選択はしない。
-        if let Some(uri) = hyperlink_at(state, &layout).map(|h| h.uri().to_string()) {
-            link::open(&uri);
+        if let Some(hit) = hyperlink_at(state, &layout) {
+            link::open(&hit.uri);
             return;
         }
         // 連続クリックの回数で選択の単位を変える。
@@ -1953,6 +1972,17 @@ fn copy_text(
     }
 }
 
+/// いま指しているリンク。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HoveredLink {
+    /// 押したときに開く相手。
+    pub(crate) uri: String,
+    /// OSC 8 の識別子。素の URL を見つけたときは `None`。
+    pub(crate) id: Option<String>,
+    /// 素の URL のときの範囲。OSC 8 のときは `None`。
+    pub(crate) span: Option<alacritty_terminal::term::search::Match>,
+}
+
 /// ファイルを持ってきたときに下の帯へ出す案内。
 const DROP_HINT: &str = "drop to paste the path";
 
@@ -2436,8 +2466,13 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
             cursor_cols = 2;
         }
         let mut underline = cell.flags.intersects(Flags::ALL_UNDERLINES);
-        if let Some(id) = &hovered {
-            if cell.hyperlink().is_some_and(|h| h.id() == id) {
+        if let Some(link) = &hovered {
+            let hit = match (&link.id, &link.span) {
+                (Some(id), _) => cell.hyperlink().is_some_and(|h| h.id() == *id),
+                (None, Some(span)) => span.contains(&indexed.point),
+                _ => false,
+            };
+            if hit {
                 underline = true;
             }
         }

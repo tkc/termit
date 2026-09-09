@@ -86,7 +86,7 @@ takes nothing, because neither shells nor agents use Cmd.
 | Wheel / two fingers | Scroll the scrollback; hold `Shift` to keep it from the program |
 | Drag | Select text; hold `Shift` when a program is using the mouse |
 | Drag a row in the left pane | Reorder the sessions |
-| Click a link | Open an OSC 8 hyperlink |
+| Click a link | Open it — an OSC 8 hyperlink, or a URL written plainly |
 | Drop a file on the window | Paste its path |
 
 Everything else goes to the child process untouched.
@@ -103,11 +103,17 @@ arguments. Paths that need it are quoted for the shell, so spaces and quotes
 in a name do not split into separate arguments. If the program has bracketed
 paste on, the path arrives as pasted text rather than as typing.
 
-**Links.** Text marked up with OSC 8 is underlined when you point at it, the
-pointer turns into a hand, and clicking opens it. Only `http`, `https`,
-`mailto` and `file` are opened — terminal output can come from anywhere, and
-the rest is a way to launch other programs quietly. The link is handed to
-`open` directly, never through a shell.
+**Links.** Point at a link and it is underlined, the pointer turns into a
+hand, and clicking opens it. That works both for text marked up with OSC 8 and
+for a URL written plainly in the output — a URL printed by a program or echoed
+back by an error message carries no markup, and needing one would make the
+feature useless where it is most wanted.
+
+Only `http`, `https`, `mailto` and `file` are opened — terminal output can
+come from anywhere, and the rest is a way to launch other programs quietly.
+Trailing punctuation is left out, so a URL at the end of a sentence or inside
+brackets still opens correctly. The link is handed to `open` directly, never
+through a shell.
 
 To emit one from a script:
 
