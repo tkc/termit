@@ -87,6 +87,7 @@ takes nothing, because neither shells nor agents use Cmd.
 | Drag | Select text; hold `Shift` when a program is using the mouse |
 | Drag a row in the left pane | Reorder the sessions |
 | Click a link | Open an OSC 8 hyperlink |
+| Drop a file on the window | Paste its path |
 
 Everything else goes to the child process untouched.
 
@@ -95,6 +96,12 @@ has ended. It is bright while the session is producing output — an agent that
 is working keeps its spinner moving, so the bright dot means *busy* and the dim
 one means *waiting for you*. A hollow grey dot ended cleanly, a hollow red one
 did not.
+
+**Dropping files.** Drag a file onto the window and its path is typed into
+the session, followed by a space, so several files dropped together line up as
+arguments. Paths that need it are quoted for the shell, so spaces and quotes
+in a name do not split into separate arguments. If the program has bracketed
+paste on, the path arrives as pasted text rather than as typing.
 
 **Links.** Text marked up with OSC 8 is underlined when you point at it, the
 pointer turns into a hand, and clicking opens it. Only `http`, `https`,
