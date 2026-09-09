@@ -237,11 +237,12 @@ impl Manager {
         }
     }
 
-    /// 出す前に、見えているセッションの桁数を合わせる。
+    /// 出す前に、見えているセッションの大きさを合わせる。
     ///
     /// 引きずるあいだ待たせていたものへ切り替わることがある。
-    /// 待たせたまま描くと、違う桁で組んだ画面が出る。
-    fn ensure_visible_size(&mut self) {
+    /// 待たせたまま描くと、行数の足りない画面が出る。下半分が地のまま残る。
+    /// 選び方は何通りもあるので、描く直前にも必ずここを通す。
+    pub fn ensure_visible_size(&mut self) {
         if let Some(size) = self.pending {
             self.apply_size(self.selected_index(), size);
         }
@@ -254,7 +255,7 @@ impl Manager {
     pub fn select_prev(&mut self) {
         if !self.sessions.is_empty() {
             let n = self.sessions.len();
-            self.selected = (self.selected_index() + n - 1) % n;
+            self.select((self.selected_index() + n - 1) % n);
         }
     }
 
@@ -283,6 +284,11 @@ impl Manager {
         self.size = size;
         self.pending = Some(size);
         self.apply_size(self.selected_index(), size);
+    }
+
+    /// まだ合わせ残しがあるか。
+    pub fn has_pending_size(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// 待たせていたセッションを、いまの大きさへ合わせる。
@@ -1201,6 +1207,81 @@ mod tests {
         assert_eq!(m2.restore(&config, &reloaded), 3);
         assert_eq!(names(&m2), ["s1", "s0", "c"]);
         for s in m2.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// 待たせたセッションが、どの選び方でも合ってから出ることを確かめる。
+    #[test]
+    fn 前へ戻る選び方でも大きさを合わせる() {
+        let Some((mut m, _)) = resize_manager(3) else {
+            return;
+        };
+        m.select(2);
+        let want = TermSize::new(80, 48);
+        m.resize_visible(want);
+        assert_ne!(m.sessions()[1].size, want, "まだ待っている");
+
+        // ⌘[ の道。ここを素通りすると、行数の足りない画面が出る。
+        m.select_prev();
+        assert_eq!(m.selected_index(), 1);
+        assert_eq!(m.sessions()[1].size, want, "出す前に合っている");
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// 描く直前の念押しが効くことを確かめる。
+    #[test]
+    fn 描く直前に必ず大きさを合わせる() {
+        let Some((mut m, _)) = resize_manager(2) else {
+            return;
+        };
+        let want = TermSize::new(80, 48);
+        m.resize_visible(want);
+        // 選び方を通さずに、直接ずらしてみる（並べ替えや復元など）。
+        m.settle();
+        m.resize_visible(TermSize::new(80, 60));
+        m.select(1);
+        assert_eq!(m.sessions()[1].size, TermSize::new(80, 60));
+
+        // 合わせ残しがあることは外から見える。
+        m.resize_visible(TermSize::new(80, 70));
+        assert!(m.has_pending_size(), "合わせ残しがあると分かる");
+        m.settle();
+        assert!(!m.has_pending_size());
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// 行数を増やしたとき、グリッドもその行数になることを確かめる。
+    #[test]
+    fn 窓を高くしたら画面の行数も増える() {
+        let Some((mut m, _)) = resize_manager(2) else {
+            return;
+        };
+        use alacritty_terminal::grid::Dimensions;
+        m.select(0);
+        assert_eq!(m.sessions()[0].term.lock().grid().screen_lines(), 24);
+        m.resize_visible(TermSize::new(80, 48));
+        assert_eq!(
+            m.sessions()[0].term.lock().grid().screen_lines(),
+            48,
+            "見えているセッションはすぐ増える"
+        );
+        assert_eq!(
+            m.sessions()[1].term.lock().grid().screen_lines(),
+            24,
+            "残りはまだ待っている"
+        );
+        m.settle();
+        assert_eq!(
+            m.sessions()[1].term.lock().grid().screen_lines(),
+            48,
+            "残りも追いつく"
+        );
+        for s in m.sessions_mut() {
             s.pty.kill();
         }
     }
