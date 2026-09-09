@@ -84,8 +84,22 @@ takes nothing, because neither shells nor agents use Cmd.
 | `⌘=` / `⌘-` | Font size |
 | `Shift+PageUp` / `PageDown` | Scroll a page |
 | Wheel / two fingers | Scroll the scrollback; hold `Shift` to keep it from the program |
+| Drag | Select text; hold `Shift` when a program is using the mouse |
 
 Everything else goes to the child process untouched.
+
+**Selecting text while an agent is running.** A full-screen UI such as Claude
+Code turns on mouse reporting (`?1000` `?1002` `?1003` `?1006`) when it starts,
+and from then on a drag belongs to the program, not to the terminal — so
+dragging selects nothing and `⌘C` copies nothing. **Hold `Shift`** and the
+terminal takes the drag instead. termit says so in the bottom bar the first
+time a click goes to the program.
+
+This is unrelated to running the agent in a container, though it tends to show
+up there: inside a container the agent cannot reach `pbcopy`, so anything it
+copies for you has to travel by OSC 52. termit accepts OSC 52 writes (both
+`BEL` and `ST` terminated, and payloads well past a screenful) — there are
+tests for it.
 
 The first nine sessions answer to `⌘1`…`⌘9`. Past that the left pane keeps
 labelling rows with letters, but not in alphabetical order: `⌘B`, `⌘C`, `⌘D`

@@ -1029,6 +1029,11 @@ impl App {
         session.pty.write(bytes);
         state.mouse.reporting = pressed.then_some(button);
         state.mouse.last_reported = Some((tcol, trow));
+        // 釦がプログラムへ渡ったということは、引いても選択にならない。
+        // 文字をコピーできない、と見えるのはここである。逃げ道を出す。
+        if pressed && button == mouse::Button::Left {
+            state.status = Some(SELECT_HINT.into());
+        }
         true
     }
 
@@ -1652,6 +1657,13 @@ mod sidebar {
     /// 直近のコマンド。
     pub const SIZE_RECENT: f32 = 11.0;
 }
+
+/// 端末上のプログラムがマウスを掴んでいるときに出す逃げ道。
+///
+/// Claude Code のような全画面 UI は起動時に `?1000` `?1002` `?1003` を
+/// 設定する。以後、引いた動きはプログラムのものになり、端末側の選択は
+/// できない。Shift を足すと端末が受け取る。
+const SELECT_HINT: &str = "the program is using the mouse — hold ⇧ to select text";
 
 /// 左ペインと端末の境目を掴める幅（pt）。
 const DIVIDER_GRAB: f32 = 4.0;
