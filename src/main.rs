@@ -1039,6 +1039,16 @@ fn terminal_cell(layout: &Layout, col: usize, row: usize) -> Option<(usize, usiz
     ))
 }
 
+/// 表示行を画面の何行目かに直す。範囲の外なら `None`。
+///
+/// `display_iter` が返す行番号は履歴を含む座標で、
+/// 遡っているあいだは `-遡った行数` から始まる。
+/// 遡った分を足すと `0..行数` に収まる。
+fn screen_row(line: i32, display_offset: usize, rows: usize) -> Option<usize> {
+    let row = line + display_offset as i32;
+    (row >= 0 && (row as usize) < rows).then_some(row as usize)
+}
+
 /// 端末領域のセルをグリッドの位置に直す。領域の外なら `None`。
 fn terminal_point(state: &State, layout: &Layout, col: usize, row: usize) -> Option<Point> {
     if col < layout.term_col || row >= layout.term_rows {
@@ -2264,10 +2274,13 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
             continue;
         }
-        let row = indexed.point.line.0;
-        if row < 0 || row as usize >= layout.term_rows {
+        // 行番号は履歴を含む座標で来る。遡っているあいだは負になるので、
+        // 遡った分を足して画面の行に直す。足さずに負を捨てると、
+        // 上から遡った分だけ行が抜け、画面の下がそのぶん空く。
+        let line = indexed.point.line.0;
+        let Some(row) = screen_row(line, display_offset, layout.term_rows) else {
             continue;
-        }
+        };
         let col = indexed.point.column.0;
         if col >= layout.term_cols {
             continue;
@@ -2284,8 +2297,9 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
             bg = theme.selection;
         }
         // 検索の強調は選択より優先する。探しているものを見失わないため。
+        // 印の位置は履歴を含む座標で覚えてあるので、直す前の行番号で引く。
         if searching {
-            let key = (row, col);
+            let key = (line, col);
             if state.find_current.contains(&key) {
                 bg = theme.search_current;
                 fg = theme.search_fg;
@@ -2303,7 +2317,6 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         if cell.c == ' ' && bg == default_bg && !underline {
             continue;
         }
-        let row = row as usize;
         let x = layout.term_col + col;
         let span = if wide { 2 } else { 1 };
         let span = span.min(layout.term_cols.saturating_sub(col)).max(1);
@@ -2640,6 +2653,39 @@ mod tests {
 
     fn now() -> std::time::Instant {
         std::time::Instant::now()
+    }
+
+    #[test]
+    fn 遡っていなければ行番号はそのまま() {
+        assert_eq!(screen_row(0, 0, 24), Some(0));
+        assert_eq!(screen_row(23, 0, 24), Some(23));
+        assert_eq!(screen_row(24, 0, 24), None);
+        assert_eq!(screen_row(-1, 0, 24), None);
+    }
+
+    #[test]
+    fn 遡っているあいだの負の行番号を画面へ直す() {
+        // 5 行遡ると、いちばん上は -5 行目として来る。
+        // 直さずに捨てると、上から 5 行ぶん抜けて画面の下が空く。
+        assert_eq!(screen_row(-5, 5, 24), Some(0));
+        assert_eq!(screen_row(-1, 5, 24), Some(4));
+        assert_eq!(screen_row(0, 5, 24), Some(5));
+        assert_eq!(screen_row(18, 5, 24), Some(23));
+        assert_eq!(screen_row(19, 5, 24), None, "画面の外");
+        assert_eq!(screen_row(-6, 5, 24), None, "画面の外");
+    }
+
+    #[test]
+    fn どこまで遡っても画面ぶんの行が埋まる() {
+        // 遡った量にかかわらず、画面の行は 0..行数 で埋まる。
+        for offset in [0usize, 1, 5, 23, 24, 100, 9999] {
+            let rows = 24;
+            let got: Vec<usize> = (0..rows)
+                .map(|i| -(offset as i32) + i as i32)
+                .filter_map(|line| screen_row(line, offset, rows))
+                .collect();
+            assert_eq!(got, (0..rows).collect::<Vec<_>>(), "{offset} 行遡ったとき");
+        }
     }
 
     #[test]
