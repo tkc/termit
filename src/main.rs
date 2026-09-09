@@ -2246,6 +2246,9 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
     let display_offset = content.display_offset;
     let mut cursor_cols = 1usize;
     let default_bg = theme.bg;
+    // 探していないときは、1 コマごとに二つの集合を引く必要がない。
+    // 空でも鍵を混ぜる費用はかかる。画面の広さぶん、まるごと無駄になる。
+    let searching = !state.find_cells.is_empty() || !state.find_current.is_empty();
 
     for indexed in content.display_iter {
         let cell = indexed.cell;
@@ -2272,13 +2275,15 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
             bg = theme.selection;
         }
         // 検索の強調は選択より優先する。探しているものを見失わないため。
-        let key = (row, col);
-        if state.find_current.contains(&key) {
-            bg = theme.search_current;
-            fg = theme.search_fg;
-        } else if state.find_cells.contains(&key) {
-            bg = theme.search_hit;
-            fg = theme.search_fg;
+        if searching {
+            let key = (row, col);
+            if state.find_current.contains(&key) {
+                bg = theme.search_current;
+                fg = theme.search_fg;
+            } else if state.find_cells.contains(&key) {
+                bg = theme.search_hit;
+                fg = theme.search_fg;
+            }
         }
         let wide = cell.flags.contains(Flags::WIDE_CHAR);
         if wide && indexed.point == cursor.point {

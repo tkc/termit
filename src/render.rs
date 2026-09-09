@@ -219,6 +219,10 @@ pub struct FrameTiming {
     pub cells: u64,
     pub rects: u64,
     pub glyph_cache: u64,
+    /// 描く面を取れずに諦めた回数。種類ごとに数える。
+    pub timeout: u64,
+    pub occluded: u64,
+    pub outdated: u64,
     last_report: Option<std::time::Instant>,
 }
 
@@ -246,6 +250,14 @@ impl FrameTiming {
             self.rects as f64 / n,
             self.glyph_cache,
         );
+        if self.timeout + self.occluded + self.outdated > 0 {
+            log::info!(
+                "描く面を取れなかった: 間に合わず={} 隠れて={} 作り直し={}",
+                self.timeout,
+                self.occluded,
+                self.outdated
+            );
+        }
         *self = FrameTiming {
             last_report: self.last_report,
             glyph_cache: self.glyph_cache,
@@ -889,13 +901,23 @@ impl Renderer {
 
         let frame = match target.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                // ここで即座に再描画を要求すると、隠れているあいだ要求と失敗を
-                // 際限なく繰り返して CPU を焼く。呼び出し側が間を置いて試す。
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                if let Some(t) = &mut self.timing {
+                    t.timeout += 1;
+                }
+                return false;
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                if let Some(t) = &mut self.timing {
+                    t.occluded += 1;
+                }
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
                 target.surface.configure(&self.device, &target.config);
+                if let Some(t) = &mut self.timing {
+                    t.outdated += 1;
+                }
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Lost => {
