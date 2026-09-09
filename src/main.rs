@@ -1039,14 +1039,55 @@ fn terminal_cell(layout: &Layout, col: usize, row: usize) -> Option<(usize, usiz
     ))
 }
 
+/// 画面の状態を 1 秒に一度だけ記録する。`TERMIT_FRAME_LOG` を指定したときだけ動く。
+///
+/// 「下が空いている」「行が飛んでいる」という報告は、絵だけでは
+/// 描き方の間違いか中身のとおりかを見分けられない。数えて残す。
+fn log_grid(
+    term: &alacritty_terminal::Term<crate::term::EventProxy>,
+    display_offset: usize,
+    layout: &Layout,
+    drawn: std::collections::HashSet<usize>,
+) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("TERMIT_FRAME_LOG").is_ok()) {
+        return;
+    }
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::term::now_ms();
+    let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 1000 {
+        return;
+    }
+    LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    use alacritty_terminal::grid::Dimensions;
+    let grid = term.grid();
+    let missing: Vec<usize> = (0..layout.term_rows)
+        .filter(|r| !drawn.contains(r))
+        .collect();
+    log::info!(
+        "画面: 描く枠 {} 行 / グリッド {} 行 / 履歴 {} 行 / 遡り {} 行 / カーソル {:?} | 字を出した行 {} / 出さなかった行 {:?}",
+        layout.term_rows,
+        grid.screen_lines(),
+        grid.history_size(),
+        display_offset,
+        (grid.cursor.point.line.0, grid.cursor.point.column.0),
+        drawn.len(),
+        &missing[..missing.len().min(12)],
+    );
+}
+
 /// 表示行を画面の何行目かに直す。範囲の外なら `None`。
 ///
 /// `display_iter` が返す行番号は履歴を含む座標で、
 /// 遡っているあいだは `-遡った行数` から始まる。
-/// 遡った分を足すと `0..行数` に収まる。
+/// 直し方は `alacritty_terminal` の `point_to_viewport` に合わせる。
+/// alacritty 本体もコマとカーソルの両方をこれで直しており、
+/// 自前で足し引きすると、いつか食い違う。
 fn screen_row(line: i32, display_offset: usize, rows: usize) -> Option<usize> {
-    let row = line + display_offset as i32;
-    (row >= 0 && (row as usize) < rows).then_some(row as usize)
+    let point = Point::new(alacritty_terminal::index::Line(line), Column(0));
+    let row = alacritty_terminal::term::point_to_viewport(display_offset, point)?.line;
+    (row < rows).then_some(row)
 }
 
 /// 端末領域のセルをグリッドの位置に直す。領域の外なら `None`。
@@ -2268,6 +2309,8 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
     // 探していないときは、1 コマごとに二つの集合を引く必要がない。
     // 空でも鍵を混ぜる費用はかかる。画面の広さぶん、まるごと無駄になる。
     let searching = !state.find_cells.is_empty() || !state.find_current.is_empty();
+    // 出した行を数える。表示の食い違いを突き合わせるための記録に使う。
+    let mut drawn_rows = std::collections::HashSet::new();
 
     for indexed in content.display_iter {
         let cell = indexed.cell;
@@ -2317,6 +2360,7 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         if cell.c == ' ' && bg == default_bg && !underline {
             continue;
         }
+        drawn_rows.insert(row);
         let x = layout.term_col + col;
         let span = if wide { 2 } else { 1 };
         let span = span.min(layout.term_cols.saturating_sub(col)).max(1);
@@ -2335,16 +2379,18 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
             state.renderer.underline_cells(x, row, span, fg);
         }
     }
-    let show_cursor = display_offset == 0 && cursor.shape != CursorShape::Hidden;
-    let cursor_point = cursor.point;
+    // カーソルも同じ道で直す。遡っていても、見える範囲にいれば出す。
+    let cursor_row = screen_row(cursor.point.line.0, display_offset, layout.term_rows);
+    let show_cursor = cursor_row.is_some() && cursor.shape != CursorShape::Hidden;
+    // 何が出ているかを数えて、詰まったときに突き合わせられるようにする。
+    log_grid(&term, display_offset, layout, drawn_rows);
+    let cursor_col = cursor.point.column.0;
     let cursor_shape = cursor.shape;
     drop(term);
 
     if show_cursor {
-        let row = cursor_point.line.0;
-        if row >= 0 && (row as usize) < layout.term_rows {
-            let x = layout.term_col + cursor_point.column.0.min(layout.term_cols - 1);
-            let y = row as usize;
+        if let Some(y) = cursor_row {
+            let x = layout.term_col + cursor_col.min(layout.term_cols - 1);
             let cell = state.renderer.cell();
             state.cursor_px = Some((x as f32 * cell.width, y as f32 * cell.height));
             // 変換中の文字列は、確定するまで子プロセスへ渡さない。
