@@ -382,6 +382,12 @@ impl Counters {
     }
 }
 
+/// 動いている印を見直す間隔。
+///
+/// 出力が止まったことは通知として届かない。止まったと見なせる頃に
+/// 一度描き直して、印を落とす。
+const WORKING_REFRESH: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// 引きずる手が止まったと見なすまでの間。
 ///
 /// これを過ぎたら、待たせていたセッションの桁数も合わせる。
@@ -520,7 +526,17 @@ impl ApplicationHandler<UiEvent> for App {
             .as_ref()
             .and_then(|s| s.manager.selected())
             .map(|s| s.id);
-        let redraw = wants_redraw(&event, selected);
+        // すでに「動いている」と描いてあるセッションなら、
+        // 出力が続いているだけなので描き直さない。
+        let shown_working = match (&event, &self.state) {
+            (UiEvent::Wakeup(id, _), Some(st)) => st
+                .manager
+                .sessions()
+                .iter()
+                .any(|s| s.id == *id && s.shown_working),
+            _ => false,
+        };
+        let redraw = wants_redraw(&event, selected, shown_working);
         if let Some(c) = &mut self.counters {
             match &event {
                 UiEvent::Wakeup(_, _) => c.wakeup += 1,
@@ -1329,11 +1345,16 @@ impl App {
 /// 窓に出ているのは、選んでいるセッションの画面と、左ペインの各行だけである。
 /// 背景のセッションが字を出すたびに描き直すと、見えていないもののために
 /// 窓ぜんぶを塗り直すことになる。エージェントを何本も走らせるほど重くなる。
-fn wants_redraw(event: &UiEvent, selected: Option<crate::session::SessionId>) -> bool {
+fn wants_redraw(
+    event: &UiEvent,
+    selected: Option<crate::session::SessionId>,
+    shown_working: bool,
+) -> bool {
     let shown = |id: crate::session::SessionId| selected == Some(id);
     match event {
         // 画面の中身。見えているのは選んでいるセッションのものだけ。
-        UiEvent::Wakeup(id, _) => shown(*id),
+        // 背景でも、左ペインの印が変わるときは描き直す。
+        UiEvent::Wakeup(id, _) => shown(*id) || !shown_working,
         // 左ペインに出るもの。どのセッションのものでも見えている。
         UiEvent::Title(_, _) | UiEvent::ChildExit(_, _) => true,
         // 作業ディレクトリは左ペインの 1 段目に出る。ほかの OSC は
@@ -1697,10 +1718,28 @@ impl App {
                 c.latency_us.push(d.as_micros() as u64);
             }
         }
-        // 合わせ残しがあるなら、手が止まったころに起こしてもらう。
+        // 次に起こしてもらう時刻。近いほうを採る。
+        let mut wake: Option<std::time::Instant> = None;
+        let mut want = |at: std::time::Instant| {
+            wake = Some(match wake {
+                Some(w) if w <= at => w,
+                _ => at,
+            });
+        };
+        // 合わせ残しがあるなら、手が止まったころに。
         // 引きずり終わりが最後のできごとになることがある。
         if let Some(at) = self.resize_quiet_since {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(at + RESIZE_SETTLE));
+            want(at + RESIZE_SETTLE);
+        }
+        // 動いているセッションがあるなら、印を落とすために時々。
+        // 出力が止まったことは、それ自体では何も知らせてくれない。
+        if let Some(state) = &self.state {
+            if state.manager.sessions().iter().any(|s| s.shown_working) {
+                want(std::time::Instant::now() + WORKING_REFRESH);
+            }
+        }
+        if let Some(at) = wake {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
         }
     }
 
@@ -1953,6 +1992,8 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
     );
 
     let selected = state.manager.selected_index();
+    // 描いた「動いている」状態は覚えておく。変わるときだけ描き直す。
+    let mut shown: Vec<(usize, bool)> = Vec::with_capacity(sl.blocks.len());
     for (n, b) in sl.blocks.iter().enumerate() {
         let s = &state.manager.sessions()[b.index];
         let running = s.is_running();
@@ -1966,6 +2007,8 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
             RunState::Running => None,
             RunState::Exited(code) => Some(code),
         };
+        let working = s.is_working();
+        shown.push((b.index, working));
 
         let hovered =
             state.mouse.x < sl.width && state.mouse.y >= b.top && state.mouse.y < b.top + b.height;
@@ -2031,9 +2074,11 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
             .put_text_px(text_x, y, &name, style(sidebar::SIZE_TITLE, false), fg);
 
         // 実行状態は左端に置く。Warp がアバターを置いている位置にあたる。
+        // 動いているあいだは明るく、待っているあいだは沈める。
         let mark = if exit.is_none() { "●" } else { "○" };
         let mark_color = match exit {
-            None => theme.accent,
+            None if working => theme.accent,
+            None => theme.fg_tertiary,
             Some(0) => theme.fg_tertiary,
             Some(_) => theme.warn,
         };
@@ -2113,6 +2158,12 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
                 style(sidebar::SIZE_BRANCH, false),
                 theme.fg_tertiary,
             );
+        }
+    }
+
+    for (i, working) in shown {
+        if let Some(s) = state.manager.sessions_mut().get_mut(i) {
+            s.shown_working = working;
         }
     }
 
@@ -2628,21 +2679,29 @@ mod tests {
     }
 
     #[test]
-    fn 背景のセッションが字を出しても描き直さない() {
+    fn 背景のセッションが字を出し続けても描き直さない() {
         // 見えているのは選んでいるセッションの画面だけである。
         // ここで描き直すと、エージェントを何本も走らせるほど重くなる。
-        assert!(!wants_redraw(&UiEvent::Wakeup(7, now()), Some(3)));
-        assert!(wants_redraw(&UiEvent::Wakeup(3, now()), Some(3)));
+        assert!(!wants_redraw(&UiEvent::Wakeup(7, now()), Some(3), true));
+        assert!(wants_redraw(&UiEvent::Wakeup(3, now()), Some(3), true));
+    }
+
+    #[test]
+    fn 背景が動き始めたときは印のために一度描き直す() {
+        // まだ「動いている」と描いていないなら、印を点けるために描き直す。
+        // 点けたあとは、出力が続いても描き直さない（上のテスト）。
+        assert!(wants_redraw(&UiEvent::Wakeup(7, now()), Some(3), false));
     }
 
     #[test]
     fn 左ペインに出るものはどのセッションでも描き直す() {
-        assert!(wants_redraw(&UiEvent::Title(7, "x".into()), Some(3)));
-        assert!(wants_redraw(&UiEvent::ChildExit(7, 0), Some(3)));
+        assert!(wants_redraw(&UiEvent::Title(7, "x".into()), Some(3), false));
+        assert!(wants_redraw(&UiEvent::ChildExit(7, 0), Some(3), false));
         // 作業ディレクトリは 1 段目に出る。
         assert!(wants_redraw(
             &UiEvent::Osc(7, OscEvent::Cwd("/tmp".into())),
-            Some(3)
+            Some(3),
+            false
         ));
     }
 
@@ -2656,11 +2715,11 @@ mod tests {
             OscEvent::AgentId("a".into()),
         ] {
             assert!(
-                !wants_redraw(&UiEvent::Osc(7, ev.clone()), Some(3)),
+                !wants_redraw(&UiEvent::Osc(7, ev.clone()), Some(3), false),
                 "{ev:?} は背景では見えない"
             );
             assert!(
-                wants_redraw(&UiEvent::Osc(3, ev.clone()), Some(3)),
+                wants_redraw(&UiEvent::Osc(3, ev.clone()), Some(3), false),
                 "{ev:?} は選んでいれば見える"
             );
         }
@@ -2678,19 +2737,21 @@ mod tests {
             started_at: std::time::SystemTime::now(),
             duration_ms: None,
         };
-        assert!(!wants_redraw(&UiEvent::Command(7, rec(7)), Some(3)));
-        assert!(wants_redraw(&UiEvent::Command(3, rec(3)), Some(3)));
+        assert!(!wants_redraw(&UiEvent::Command(7, rec(7)), Some(3), false));
+        assert!(wants_redraw(&UiEvent::Command(3, rec(3)), Some(3), false));
     }
 
     #[test]
     fn 見た目の変わらない通知では描き直さない() {
         assert!(!wants_redraw(
             &UiEvent::ClipboardStore(3, "x".into()),
-            Some(3)
+            Some(3),
+            false
         ));
         assert!(!wants_redraw(
             &UiEvent::ClipboardLoad(3, std::sync::Arc::new(|s: &str| s.to_string())),
-            Some(3)
+            Some(3),
+            false
         ));
     }
 

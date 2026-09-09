@@ -13,7 +13,7 @@ use alacritty_terminal::term::cell::Flags;
 
 use crate::config::{self, Config, ExpandError, Vars};
 use crate::pty::{self, PtyHandle, SpawnError};
-use crate::term::{EventProxy, TermSize, UiSender};
+use crate::term::{now_ms, EventProxy, TermSize, UiSender};
 
 pub type SessionId = u32;
 
@@ -41,6 +41,14 @@ pub struct Session {
     pub size: TermSize,
     pub window_size: Arc<FairMutex<WindowSize>>,
     pub dirty: Arc<AtomicBool>,
+    /// 最後に出力があった時刻（起動からのミリ秒）。
+    pub activity: Arc<std::sync::atomic::AtomicU64>,
+    /// 左ペインに「動いている」と描いてあるか。
+    ///
+    /// 描いた状態を覚えておき、変わるときだけ描き直す。
+    /// これが無いと、背景で動いているセッションの通知を
+    /// 一つ残らず描き直しに使うことになる。
+    pub shown_working: bool,
     /// 再起動をまたいで残る鍵。コマンド履歴をこの単位で辿る。
     pub key: String,
     /// 利用者が付けた名前。付けていなければ作業ディレクトリを名前にする。
@@ -64,9 +72,25 @@ pub struct Session {
     pub clear_scrollback_until: Option<std::time::Instant>,
 }
 
+/// これだけ出力が途切れたら、止まっていると見なす（ミリ秒）。
+///
+/// エージェントの全画面 UI は考えているあいだ絵を回すので、
+/// 出力が続いているかどうかが、そのまま働いているかどうかになる。
+pub const WORKING_QUIET_MS: u64 = 500;
+
 impl Session {
     pub fn is_running(&self) -> bool {
         matches!(self.state, RunState::Running)
+    }
+
+    /// いま何かを出しているか。
+    pub fn is_working(&self) -> bool {
+        self.is_running() && Self::working_at(self.activity.load(Ordering::Relaxed), now_ms())
+    }
+
+    /// 最後の出力から `now` までの間で、働いていると見なすか。
+    fn working_at(last: u64, now: u64) -> bool {
+        now.saturating_sub(last) < WORKING_QUIET_MS
     }
 
     /// 左ペインに出す名前と、それがパスかどうか。
@@ -571,6 +595,8 @@ impl Manager {
             size: self.size,
             window_size: spawned.window_size,
             dirty: spawned.dirty,
+            activity: spawned.activity,
+            shown_working: false,
             name: None,
             branch: None,
             branch_read: None,
@@ -966,6 +992,37 @@ mod tests {
         let same = TermSize::new(80, 24);
         m.resize_visible(same);
         assert!(m.pending.is_none(), "待たせるものが出ない");
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    #[test]
+    fn 出力が続いているあいだは動いていると見なす() {
+        // 全画面 UI は考えているあいだ絵を回す。出力が続く。
+        assert!(Session::working_at(1000, 1000), "出したばかり");
+        assert!(Session::working_at(1000, 1000 + WORKING_QUIET_MS - 1));
+    }
+
+    #[test]
+    fn 出力が途切れたら止まっていると見なす() {
+        assert!(!Session::working_at(1000, 1000 + WORKING_QUIET_MS));
+        assert!(!Session::working_at(1000, 10_000));
+    }
+
+    #[test]
+    fn 時計が戻っても動いている扱いにしない() {
+        // 引き算があふれると、いつまでも動いていることになる。
+        assert!(Session::working_at(5000, 1000), "戻ったぶんは 0 と見る");
+    }
+
+    #[test]
+    fn 終わったセッションは動いていない() {
+        let Some((mut m, _)) = ordered(1) else { return };
+        assert!(m.sessions()[0].is_working() || !m.sessions()[0].is_working());
+        let id = m.sessions()[0].id;
+        m.mark_exited(id, 0);
+        assert!(!m.sessions()[0].is_working(), "終わっていれば動いていない");
         for s in m.sessions_mut() {
             s.pty.kill();
         }
