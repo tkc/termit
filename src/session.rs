@@ -94,6 +94,8 @@ pub struct Manager {
     selected: usize,
     cell: (u16, u16),
     size: TermSize,
+    /// 引きずるあいだ、まだ全部へ伝えていない大きさ。
+    pending: Option<TermSize>,
     ui_tx: UiSender,
 }
 
@@ -124,6 +126,7 @@ impl Manager {
             selected: 0,
             cell,
             size,
+            pending: None,
             ui_tx,
         }
     }
@@ -206,11 +209,22 @@ impl Manager {
     pub fn select(&mut self, index: usize) {
         if index < self.sessions.len() {
             self.selected = index;
+            self.ensure_visible_size();
+        }
+    }
+
+    /// 出す前に、見えているセッションの桁数を合わせる。
+    ///
+    /// 引きずるあいだ待たせていたものへ切り替わることがある。
+    /// 待たせたまま描くと、違う桁で組んだ画面が出る。
+    fn ensure_visible_size(&mut self) {
+        if let Some(size) = self.pending {
+            self.apply_size(self.selected_index(), size);
         }
     }
     pub fn select_next(&mut self) {
         if !self.sessions.is_empty() {
-            self.selected = (self.selected_index() + 1) % self.sessions.len();
+            self.select((self.selected_index() + 1) % self.sessions.len());
         }
     }
     pub fn select_prev(&mut self) {
@@ -226,22 +240,56 @@ impl Manager {
 
     /// 端末領域のセル数が変わったとき、全ペインへ伝える。
     pub fn resize(&mut self, size: TermSize) {
+        self.size = size;
+        self.pending = None;
+        for i in 0..self.sessions.len() {
+            self.apply_size(i, size);
+        }
+    }
+
+    /// 見えているセッションだけを先に合わせる。
+    ///
+    /// 桁数が変わるとグリッドを組み直す。行が多いほど高くつくので、
+    /// 境目や窓の縁を掴んで引きずるあいだ全部へ伝えていると追いつかない。
+    /// 残りは手が止まってから [`Manager::settle`] で合わせる。
+    pub fn resize_visible(&mut self, size: TermSize) {
         if size == self.size {
             return;
         }
         self.size = size;
-        for s in &mut self.sessions {
-            s.size = size;
-            s.term.lock().resize(size);
-            {
-                let mut ws = s.window_size.lock();
-                ws.num_cols = size.cols as u16;
-                ws.num_lines = size.lines as u16;
-                ws.cell_width = self.cell.0;
-                ws.cell_height = self.cell.1;
-            }
-            s.pty.resize(size, self.cell.0, self.cell.1);
+        self.pending = Some(size);
+        self.apply_size(self.selected_index(), size);
+    }
+
+    /// 待たせていたセッションを、いまの大きさへ合わせる。
+    pub fn settle(&mut self) {
+        let Some(size) = self.pending.take() else {
+            return;
+        };
+        for i in 0..self.sessions.len() {
+            self.apply_size(i, size);
         }
+    }
+
+    /// まだ大きさが違うセッションだけを合わせる。
+    fn apply_size(&mut self, index: usize, size: TermSize) {
+        let cell = self.cell;
+        let Some(s) = self.sessions.get_mut(index) else {
+            return;
+        };
+        if s.size == size {
+            return;
+        }
+        s.size = size;
+        s.term.lock().resize(size);
+        {
+            let mut ws = s.window_size.lock();
+            ws.num_cols = size.cols as u16;
+            ws.num_lines = size.lines as u16;
+            ws.cell_width = cell.0;
+            ws.cell_height = cell.1;
+        }
+        s.pty.resize(size, cell.0, cell.1);
     }
 
     /// 深さ優先で親の直後に子が並ぶ順序を作る。
@@ -563,6 +611,7 @@ impl Manager {
         } else if self.selected >= self.sessions.len() {
             self.selected = self.sessions.len().saturating_sub(1);
         }
+        self.ensure_visible_size();
     }
 
     /// 描画したので、変更ありの印を落とす。
@@ -728,6 +777,102 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         false
+    }
+
+    fn resize_manager(n: usize) -> Option<(Manager, Config)> {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return None;
+        }
+        let config = probe_config();
+        let cwd = std::env::current_dir().unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut m = Manager::new(
+            TermSize::new(80, 24),
+            (8, 17),
+            crate::term::UiSender::Channel(tx),
+        );
+        for _ in 0..n {
+            m.spawn_new(&config, "host", &cwd).expect("作れる");
+        }
+        Some((m, config))
+    }
+
+    /// 引きずるあいだは見えているものだけ組み直すことを確かめる。
+    #[test]
+    fn 引きずるあいだは見えているものだけ合わせる() {
+        let Some((mut m, _)) = resize_manager(4) else {
+            return;
+        };
+        m.select(1);
+        let want = TermSize::new(70, 24);
+        m.resize_visible(want);
+        assert_eq!(m.sessions()[1].size, want, "見えているものは合っている");
+        for i in [0, 2, 3] {
+            assert_eq!(
+                m.sessions()[i].size,
+                TermSize::new(80, 24),
+                "{i} 本目はまだ待っている"
+            );
+        }
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// 手が止まったら残りも合うことを確かめる。
+    #[test]
+    fn 手が止まれば残りも合わせる() {
+        let Some((mut m, _)) = resize_manager(4) else {
+            return;
+        };
+        let want = TermSize::new(70, 24);
+        m.resize_visible(want);
+        m.settle();
+        for i in 0..4 {
+            assert_eq!(m.sessions()[i].size, want, "{i} 本目も合っている");
+        }
+        assert!(m.pending.is_none(), "待たせているものは無い");
+        // 二度目の settle は何もしない。
+        m.settle();
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// 待たせたセッションへ切り替えたら、出す前に合うことを確かめる。
+    #[test]
+    fn 待たせたセッションは選んだ時点で合わせる() {
+        let Some((mut m, _)) = resize_manager(3) else {
+            return;
+        };
+        m.select(0);
+        let want = TermSize::new(70, 24);
+        m.resize_visible(want);
+        assert_ne!(m.sessions()[2].size, want, "まだ待っている");
+
+        m.select(2);
+        assert_eq!(
+            m.sessions()[2].size,
+            want,
+            "選んだ時点で合っていないと、違う桁で描いてしまう"
+        );
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
+    }
+
+    /// 同じ大きさで呼んでも組み直さないことを確かめる。
+    #[test]
+    fn 大きさが変わらなければ何もしない() {
+        let Some((mut m, _)) = resize_manager(2) else {
+            return;
+        };
+        let same = TermSize::new(80, 24);
+        m.resize_visible(same);
+        assert!(m.pending.is_none(), "待たせるものが出ない");
+        for s in m.sessions_mut() {
+            s.pty.kill();
+        }
     }
 
     /// 走っているセッションでも一度で閉じられることを確かめる。
