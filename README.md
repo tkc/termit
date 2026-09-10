@@ -45,7 +45,21 @@ the things that were tried and rejected because they measured worse.
 
 ## Install
 
-Build from source. See **[docs/BUILD.md](docs/BUILD.md)** for the details.
+```sh
+brew install tkc/termit/termit
+```
+
+Or take the tarball from [Releases](https://github.com/tkc/termit/releases).
+The build is not notarised, so macOS quarantines a copy you downloaded:
+
+```sh
+tar xzf termit-0.1.0-macos-arm64.tar.gz
+shasum -a 256 -c SHA256SUMS
+xattr -dr com.apple.quarantine termit-0.1.0-macos-arm64/termit
+termit-0.1.0-macos-arm64/termit
+```
+
+Or build it yourself. See **[docs/BUILD.md](docs/BUILD.md)** for the details.
 
 ```sh
 git clone git@github.com:tkc/termit.git
@@ -54,8 +68,10 @@ cargo build --release
 ./target/release/termit
 ```
 
-macOS only for now. The renderer, the clipboard bridge and the keyboard
-handling all assume it.
+macOS on Apple silicon. Every number in these docs was measured on arm64 and
+nothing was ever run on an Intel Mac, so no Intel binary is published — build
+from source there. The renderer, the clipboard bridge and the keyboard handling
+all assume macOS.
 
 ## Shell integration
 

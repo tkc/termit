@@ -1,0 +1,115 @@
+name: Release
+
+# タグを押すと、そのタグのソースから 1 つだけバイナリを作って公開する。
+# 中身の検査は CI が済ませているので、ここでは「タグと版が一致するか」
+# 「本当に arm64 か」だけを見る。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "作り直すタグ（例 v0.1.0）"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Apple silicon の runner。termit は arm64 でしか測っていない。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check the tag against Cargo.toml
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "tag $TAG does not match Cargo.toml version $CARGO_VERSION" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: cargo test
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          NAME="termit-${VERSION}-macos-arm64"
+          file target/release/termit
+          file target/release/termit | grep -q arm64
+          mkdir -p "dist/$NAME"
+          cp target/release/termit README.md LICENSE "dist/$NAME/"
+          tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+          cd dist
+          shasum -a 256 "$NAME.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SUM=$(awk '{print $1}' "dist/SHA256SUMS")
+          cat > notes.md <<EOF
+          A small terminal for working with coding agents. macOS, Apple silicon.
+
+          ## Install
+
+          \`\`\`sh
+          brew install tkc/termit/termit
+          \`\`\`
+
+          Or take the tarball below:
+
+          \`\`\`sh
+          tar xzf ${NAME}.tar.gz
+          shasum -a 256 -c SHA256SUMS
+          # this build is not notarised, so macOS quarantines a downloaded copy
+          xattr -dr com.apple.quarantine ${NAME}/termit
+          ${NAME}/termit
+          \`\`\`
+
+          \`\`\`
+          ${SUM}  ${NAME}.tar.gz
+          \`\`\`
+
+          Shell integration, which the command history is built from:
+
+          \`\`\`sh
+          termit --shell-integration >> ~/.zshrc
+          \`\`\`
+
+          Built and measured on Apple silicon only. On an Intel Mac, build from source.
+          EOF
+          gh release create "$TAG" \
+            --title "termit $TAG" \
+            --notes-file notes.md \
+            --verify-tag \
+            "dist/${NAME}.tar.gz" "dist/SHA256SUMS"
