@@ -82,13 +82,18 @@ jobs:
 
           ## Install
 
-          Take the tarball below:
+          \`\`\`sh
+          curl -fsSL https://github.com/tkc/termit/releases/download/${TAG}/${NAME}.tar.gz | tar xz
+          ./${NAME}/termit
+          \`\`\`
+
+          This build is not notarised. \`curl\` sets no quarantine flag, so that
+          route just runs. A browser does set one, and macOS then refuses to open
+          the binary at all; if you took the tarball from this page, clear it first:
 
           \`\`\`sh
-          tar xzf ${NAME}.tar.gz
           shasum -a 256 -c SHA256SUMS
-          # this build is not notarised, so macOS quarantines a downloaded copy
-          xattr -dr com.apple.quarantine ${NAME}/termit
+          xattr -dr com.apple.quarantine ${NAME}
           ${NAME}/termit
           \`\`\`
 
