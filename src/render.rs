@@ -819,7 +819,9 @@ impl Renderer {
             right: w as i32,
             bottom: h as i32,
         };
-        let areas: Vec<TextArea<'_>> = self
+        // まとめて Vec に入れず、そのまま繰り返し子として渡す。
+        // 全面なら領域は 7,661 個あり、毎フレーム 0.5MB を確保して捨てることになる。
+        let areas = self
             .cell_draws
             .iter()
             .filter_map(|d| {
@@ -843,8 +845,7 @@ impl Renderer {
                     default_color: d.color,
                     custom_glyphs: &[],
                 })
-            }))
-            .collect();
+            }));
 
         if let Err(e) = self.text_renderer.prepare(
             &self.device,
