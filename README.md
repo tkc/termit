@@ -45,11 +45,7 @@ the things that were tried and rejected because they measured worse.
 
 ## Install
 
-```sh
-brew install tkc/termit/termit
-```
-
-Or take the tarball from [Releases](https://github.com/tkc/termit/releases).
+Take the tarball from [Releases](https://github.com/tkc/termit/releases).
 The build is not notarised, so macOS quarantines a copy you downloaded:
 
 ```sh

@@ -82,11 +82,7 @@ jobs:
 
           ## Install
 
-          \`\`\`sh
-          brew install tkc/termit/termit
-          \`\`\`
-
-          Or take the tarball below:
+          Take the tarball below:
 
           \`\`\`sh
           tar xzf ${NAME}.tar.gz
