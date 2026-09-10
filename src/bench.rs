@@ -22,12 +22,14 @@ pub fn run() {
             cols * rows
         );
         for (label, fill) in [("全面", 1.0f32), ("半分", 0.5), ("1 割", 0.1)] {
+            let mut build = Vec::new();
             let mut prep = Vec::new();
             let mut submit = Vec::new();
             let mut cells = 0usize;
             for frame in 0..FRAMES {
                 r.begin();
                 cells = 0;
+                let t0 = std::time::Instant::now();
                 let limit = (cols as f32 * fill) as usize;
                 for row in 0..rows {
                     for col in 0..limit {
@@ -41,18 +43,21 @@ pub fn run() {
                         cells += 1;
                     }
                 }
+                let b = t0.elapsed();
                 let p = r.bench_prepare();
                 let s = r.bench_submit(theme.bg);
                 if frame >= WARMUP {
+                    build.push(b);
                     prep.push(p);
                     submit.push(s);
                 }
             }
+            let (bm, b90) = stats(&build);
             let (pm, p90) = stats(&prep);
             let (sm, s90) = stats(&submit);
             println!(
-                "  {label:<6} セル {cells:>6}  prepare 中央 {pm:6.2}ms p90 {p90:6.2}ms | submit 中央 {sm:6.2}ms p90 {s90:6.2}ms | 合計 中央 {:6.2}ms",
-                pm + sm
+                "  {label:<6} セル {cells:>6}  組み立て 中央 {bm:6.2}ms p90 {b90:6.2}ms | prepare 中央 {pm:6.2}ms p90 {p90:6.2}ms | submit 中央 {sm:6.2}ms p90 {s90:6.2}ms | 合計 中央 {:6.2}ms",
+                bm + pm + sm
             );
         }
     }
