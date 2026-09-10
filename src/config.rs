@@ -108,12 +108,26 @@ pub struct AgentConfig {
 pub struct Profile {
     /// 使用するイメージ。省略するとホスト上で直接起動する。
     pub image: Option<String>,
+    /// イメージを起動する道具。docker と同じ並びの引数を取るものなら何でもよい。
+    ///
+    /// Apple の `container` は同じ綴りの `-v` `-w` `-e` `--network` を持つ。
+    /// termit は引数を組み立てて起動するだけで、中身のことは知らない。
+    #[serde(default = "default_runner")]
+    pub runner: String,
+    /// イメージ名の直前に差し込む引数。道具ごとの細かい指定に使う。
+    ///
+    /// 例：`["--memory", "2048MB"]`。termit は中身を見ない。
+    #[serde(default)]
+    pub runner_args: Vec<String>,
     #[serde(default = "default_workdir")]
     pub workdir: String,
     #[serde(default)]
     pub mount: Vec<String>,
-    #[serde(default = "default_network")]
-    pub network: String,
+    /// 繋ぐネットワーク。省略すると道具の既定に任せる。
+    ///
+    /// 道具ごとに名前が違う（docker は `bridge`、`container` は `default`）。
+    /// どちらも既定で外へ出られるので、閉じたいときだけ書く。
+    pub network: Option<String>,
     #[serde(default)]
     pub env: Vec<String>,
     #[serde(default)]
@@ -123,18 +137,19 @@ pub struct Profile {
 fn default_workdir() -> String {
     "/work".to_string()
 }
-fn default_network() -> String {
-    // モデル API への接続が切れるとエージェントが動かないため bridge を既定とする。
-    "bridge".to_string()
+fn default_runner() -> String {
+    "docker".to_string()
 }
 
 impl Default for Profile {
     fn default() -> Self {
         Self {
             image: None,
+            runner: default_runner(),
+            runner_args: Vec::new(),
             workdir: default_workdir(),
             mount: Vec::new(),
-            network: default_network(),
+            network: None,
             env: Vec::new(),
             args: Vec::new(),
         }
@@ -243,6 +258,12 @@ impl Config {
                         "profile.{name}.mount \"{m}\" is not in <host>:<container> form"
                     )));
                 }
+            }
+            if p.runner.trim().is_empty() || p.runner.contains(char::is_whitespace) {
+                return Err(ConfigError::Invalid(format!(
+                    "profile.{name}.runner \"{}\" must be a single command name",
+                    p.runner
+                )));
             }
             for e in &p.env {
                 if e.contains('=') {
@@ -459,7 +480,7 @@ pub fn build_argv(profile: &Profile, cwd: &Path, command: &[String]) -> Vec<Stri
     }
     let cwd_str = cwd.to_string_lossy().to_string();
     let mut argv = vec![
-        "docker".to_string(),
+        profile.runner.clone(),
         "run".to_string(),
         "--rm".to_string(),
         "-it".to_string(),
@@ -470,12 +491,15 @@ pub fn build_argv(profile: &Profile, cwd: &Path, command: &[String]) -> Vec<Stri
     }
     argv.push("-w".to_string());
     argv.push(profile.workdir.clone());
-    argv.push("--network".to_string());
-    argv.push(profile.network.clone());
+    if let Some(net) = &profile.network {
+        argv.push("--network".to_string());
+        argv.push(net.clone());
+    }
     for e in &profile.env {
         argv.push("-e".to_string());
         argv.push(e.clone());
     }
+    argv.extend(profile.runner_args.iter().cloned());
     argv.push(profile.image.clone().unwrap_or_default());
     argv.extend(command.iter().cloned());
     argv.extend(profile.args.iter().cloned());
@@ -564,9 +588,10 @@ mod tests {
             image: Some("tex-agent:latest".into()),
             workdir: "/work".into(),
             mount: vec!["{cwd}:/work".into()],
-            network: "bridge".into(),
+            network: Some("bridge".into()),
             env: vec!["ANTHROPIC_API_KEY".into()],
             args: vec!["--dangerously-skip-permissions".into()],
+            ..Profile::default()
         };
         let argv = build_argv(&p, Path::new("/Users/tkc/repo"), &["claude".into()]);
         assert_eq!(
@@ -589,6 +614,75 @@ mod tests {
                 "--dangerously-skip-permissions",
             ]
         );
+    }
+
+    #[test]
+    fn 道具を_container_に替えられる() {
+        let p = Profile {
+            image: Some("agent:latest".into()),
+            runner: "container".into(),
+            runner_args: vec!["--memory".into(), "2048MB".into()],
+            mount: vec!["{cwd}:/work".into()],
+            env: vec!["TERM".into()],
+            ..Profile::default()
+        };
+        let argv = build_argv(&p, Path::new("/repo"), &["claude".into()]);
+        assert_eq!(
+            argv,
+            vec![
+                "container",
+                "run",
+                "--rm",
+                "-it",
+                "-v",
+                "/repo:/work",
+                "-w",
+                "/work",
+                "-e",
+                "TERM",
+                // 道具ごとの指定はイメージの直前に入る。
+                "--memory",
+                "2048MB",
+                "agent:latest",
+                "claude",
+            ]
+        );
+    }
+
+    /// ネットワークの名前は道具ごとに違う。書かなければ何も渡さない。
+    #[test]
+    fn ネットワークを書かなければ渡さない() {
+        let p = Profile {
+            image: Some("img".into()),
+            mount: vec!["{cwd}:/work".into()],
+            ..Profile::default()
+        };
+        let argv = build_argv(&p, Path::new("/repo"), &["sh".into()]);
+        assert!(!argv.contains(&"--network".to_string()));
+    }
+
+    #[test]
+    fn 空白を含む道具の名前を拒む() {
+        let toml = r#"
+[profile.bad]
+image = "img"
+mount = ["{cwd}:/work"]
+runner = "docker run"
+"#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn 道具を省略すると_docker_になる() {
+        let toml = r#"
+[profile.box]
+image = "img"
+mount = ["{cwd}:/work"]
+"#;
+        let c: Config = toml::from_str(toml).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.profile("box").runner, "docker");
     }
 
     #[test]

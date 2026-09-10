@@ -441,6 +441,77 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::time::{Duration, Instant};
 
+    /// プロファイルの道具を通して、実際にコンテナの中の出力が届くことを確かめる。
+    ///
+    /// この機械に `container`（Apple のもの）が入っていないと動かないので、
+    /// 常には走らせない。手元で確かめるときは
+    /// `cargo test --release -- --ignored コンテナの中の出力が届く --nocapture`。
+    #[test]
+    #[ignore]
+    fn コンテナの中の出力が届く() {
+        use crate::config::{build_argv, Profile};
+
+        let profile = Profile {
+            image: Some("docker.io/library/alpine:latest".into()),
+            runner: "container".into(),
+            mount: vec!["{cwd}:/work".into()],
+            env: vec!["TERM".into()],
+            ..Profile::default()
+        };
+        let cwd = std::env::current_dir().expect("作業ディレクトリを取れる");
+        let argv = build_argv(
+            &profile,
+            &cwd,
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                // 端末の大きさが中まで伝わっているかも同時に見る。
+                "sleep 2; echo from-guest; stty size; sleep 2".to_string(),
+            ],
+        );
+        assert_eq!(argv[0], "container");
+
+        let (tx, _rx) = channel();
+        let spawned = spawn(
+            SpawnOptions {
+                id: 9,
+                argv: &argv,
+                cwd: &cwd,
+                size: TermSize::new(120, 40),
+                cell: (8, 17),
+                scrollback: 100,
+                session_key: "container-test".to_string(),
+            },
+            crate::term::UiSender::Channel(tx),
+        )
+        .expect("コンテナを起動できる");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut text = String::new();
+        while Instant::now() < deadline && !text.contains("from-guest") {
+            {
+                let term = spawned.term.lock();
+                let grid = term.grid();
+                text.clear();
+                for line in 0..grid.screen_lines() {
+                    for col in 0..grid.columns() {
+                        text.push(grid[Line(line as i32)][Column(col)].c);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!("--- 画面 ---\n{text}");
+        assert!(
+            text.contains("from-guest"),
+            "コンテナの出力がグリッドに届く"
+        );
+        assert!(
+            text.contains("40 120"),
+            "端末の大きさが中まで伝わる（起動直後の 1 秒は 0 0 になる）"
+        );
+    }
+
     /// PTY で子プロセスを起動し、出力がグリッドに現れ、終了が通知されることを確かめる。
     #[test]
     fn 子プロセスの出力がグリッドに現れる() {

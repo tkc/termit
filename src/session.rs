@@ -127,7 +127,7 @@ pub struct Manager {
 pub enum SessionError {
     Template(ExpandError),
     Spawn(SpawnError),
-    NoDocker(String),
+    NoRunner { profile: String, runner: String },
 }
 
 impl std::fmt::Display for SessionError {
@@ -135,8 +135,11 @@ impl std::fmt::Display for SessionError {
         match self {
             SessionError::Template(e) => write!(f, "cannot build command: {e}"),
             SessionError::Spawn(e) => write!(f, "{e}"),
-            SessionError::NoDocker(p) => {
-                write!(f, "profile.{p} needs docker, but docker was not found")
+            SessionError::NoRunner { profile, runner } => {
+                write!(
+                    f,
+                    "profile.{profile} needs {runner}, but {runner} was not found"
+                )
             }
         }
     }
@@ -564,8 +567,11 @@ impl Manager {
         key: Option<String>,
     ) -> Result<SessionId, SessionError> {
         let profile = config.profile(profile_name);
-        if !profile.is_host() && !docker_available() {
-            return Err(SessionError::NoDocker(profile_name.to_string()));
+        if !profile.is_host() && !runner_available(&profile.runner) {
+            return Err(SessionError::NoRunner {
+                profile: profile_name.to_string(),
+                runner: profile.runner.clone(),
+            });
         }
         let argv = config::build_argv(&profile, cwd, &base);
         let id = self.next_id;
@@ -771,8 +777,9 @@ fn shell_argv(config: &Config) -> Vec<String> {
     argv
 }
 
-fn docker_available() -> bool {
-    std::process::Command::new("docker")
+/// その道具が入っているか。起動して失敗するより先に知らせる。
+fn runner_available(runner: &str) -> bool {
+    std::process::Command::new(runner)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
