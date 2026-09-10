@@ -282,6 +282,8 @@ pub(crate) struct State {
     pending_since: Option<std::time::Instant>,
     /// 描こうとして描けなかった。間を置いて描き直す。
     needs_redraw: bool,
+    /// 窓が完全に隠れているか。隠れているあいだは組み立てもしない。
+    occluded: bool,
     /// セッションの並びが変わった。少し置いてから書き出す。
     state_dirty: bool,
     /// 最後に書き出した時刻。
@@ -492,6 +494,7 @@ impl ApplicationHandler<UiEvent> for App {
             recent_for: None,
             pending_since: None,
             needs_redraw: false,
+            occluded: false,
             state_dirty: false,
             state_saved_at: None,
             shown_title: String::new(),
@@ -615,6 +618,14 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::CloseRequested => {
                 state.save_state(true);
                 event_loop.exit();
+            }
+            WindowEvent::Occluded(hidden) => {
+                // 隠れているあいだは、組み立てても捨てるだけになる。
+                // 出てきたら描き直す。時計で起こす必要はない。
+                state.occluded = hidden;
+                if !hidden {
+                    state.request_redraw();
+                }
             }
             WindowEvent::Resized(size) => {
                 state.renderer.resize(size.width, size.height);
@@ -1795,6 +1806,12 @@ impl App {
         // 最後の 1 つを閉じたら窓ごと閉じる。鍵盤でも鼠でもここを通る。
         if state.manager.is_empty() {
             event_loop.exit();
+            return;
+        }
+        // 窓が隠れているなら、何も組み立てない。
+        // 組み立ててから描く面を取りに行くと、取れなかったぶんが丸ごと無駄になる。
+        if state.occluded {
+            state.needs_redraw = true;
             return;
         }
         // 出すセッションの大きさを、描く前に必ず合わせる。
