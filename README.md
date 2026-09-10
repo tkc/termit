@@ -16,12 +16,32 @@ off from a point in its conversation, and occasionally want one boxed in.
 termit is the smallest terminal that makes those three things one keystroke
 away, and nothing else.
 
+Three rules decide what is in it.
+
+**Only what the work needs.** A feature has to be something this way of
+working does not function without, not something that would be nice to have.
+The list above is short on purpose and is meant to stay short. What was left
+out, and why, is under [Not goals](#not-goals).
+
+**A terminal, and nothing more.** termit spawns processes, relays the pty,
+interprets escape sequences and draws the result. It does not manage
+conversations, drive an agent, or run workflows. It knows nothing about the
+agent beyond the command template you give it in the config, so anything that
+would require the terminal to understand what an agent is *doing* lives outside
+the terminal. That line is also why the agent-specific parts — forking a
+conversation, resuming one — are a string in your config rather than code in
+here.
+
+**Measured, not asserted.** Where there is a choice, the lighter one is taken,
+and every claim about speed here is a number someone can reproduce.
+[`docs/performance.md`](docs/performance.md) has the measurements, the tools
+that produce them (`--bench`, `--throughput`, `--latency-test`, `--probe`), and
+the things that were tried and rejected because they measured worse.
+
 - **Single binary.** `cargo build --release`, no Node, no Python, no bundle.
-- **Small.** ~9 MB binary, ~85 MB resident, ~0.5 ms from a byte arriving on the
-  pty to `present()` returning.
-- **Not a framework.** It spawns processes, relays the pty, and interprets
-  escape sequences. It knows nothing about conversations; everything
-  agent-specific lives in a command template in your config.
+- **Small.** A ~9 MB binary, ~85 MB resident for one pane, and 0.5–1.3 ms from
+  a byte arriving on the pty to `present()` returning
+  ([`docs/performance.md`](docs/performance.md) §9).
 
 ## Install
 
@@ -290,9 +310,10 @@ Chosen by recording what an agent's full-screen UI actually asks for.
 | Window title (`OSC 0` / `OSC 2`) | yes |
 | Clipboard (`OSC 52`) | yes |
 | Device attributes (`CSI c`) | yes |
+| Synchronized output (`?2026`) | yes |
 | Bell | no |
 | Desktop notifications (`OSC 777`) | no |
-| Hyperlinks (`OSC 8`) | no |
+| Hyperlinks (`OSC 8`) | yes |
 | Kitty keyboard protocol | no |
 
 ## Not goals
@@ -301,8 +322,10 @@ Tabs. Arbitrary splits and tiling. Ligatures. Image protocols. A plugin
 system. A built-in editor. A theme store. A settings GUI. A built-in SSH
 client.
 
-The left pane replaces tabs and splits: several agents are several sessions in
-one list.
+Each of these is either a second way to do something the left pane already
+does, or a job that belongs to a program you run *inside* a terminal rather
+than to the terminal itself. The left pane replaces tabs and splits: several
+agents are several sessions in one list.
 
 ## Design notes
 
@@ -310,6 +333,8 @@ The detailed design record is in Japanese.
 
 - [`docs/superpowers/specs/2026-09-08-agent-terminal-design.md`](docs/superpowers/specs/2026-09-08-agent-terminal-design.md) — the specification
 - [`docs/performance.md`](docs/performance.md) — where the time actually goes, measured
+- [`docs/references/performance-techniques.md`](docs/references/performance-techniques.md) — techniques taken from other terminals, each marked adopted, rejected with the measurement, or still open
+- [`docs/references/scrollback.md`](docs/references/scrollback.md) — how five other implementations handle scrollback, and which parts were copied
 - [`docs/warp-metrics.md`](docs/warp-metrics.md) — the sizes and paddings the left pane is based on
 
 ## License
