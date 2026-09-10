@@ -194,7 +194,13 @@ args    = ["--dangerously-skip-permissions"]
 
 **mount**：`docker run -v` に渡すマウント指定。`{cwd}` を展開する。
 
-**network**：`docker run --network` に渡す値。既定は `bridge`。
+**runner**：イメージを起動する道具。既定は `docker`。
+docker と同じ並びの引数を取るものなら何でもよい（Apple の `container` など）。
+
+**runner_args**：イメージ名の直前に差し込む引数。道具ごとの指定に使う。
+
+**network**：`--network` に渡す値。書かなければ渡さない（道具の既定に従う）。
+名前は道具ごとに違う（docker は `bridge`、`container` は `default`）。
 
 **env**：ホストから引き継ぐ環境変数名。値ではなく名前だけを書く。
 
@@ -207,7 +213,6 @@ args    = ["--dangerously-skip-permissions"]
 ```
 docker run --rm -it \
   -v /Users/tkc/repo:/work -w /work \
-  --network bridge \
   -e ANTHROPIC_API_KEY \
   tex-agent:latest \
   claude --session-id <uuid> --dangerously-skip-permissions
@@ -217,8 +222,10 @@ docker run --rm -it \
 コンテナから見えるファイルは `mount` に書いた範囲だけであり、ホストの他のディレクトリ、ホストのプロセス、ホストにインストールされたコマンドには届かない。
 権限確認を省く `--dangerously-skip-permissions` を使えるのは、この範囲の限定が効いているときに限る。
 
-`network` の既定を `bridge` とするのは、モデル API への接続が切れるとエージェントが動かないためである。
-外部へ出る必要のないプロセスには `network = "none"` を明示的に指定する。
+`network` を書かなければ何も渡さないのは、道具ごとに名前が違うためである
+（docker は `bridge`、Apple の `container` は `default`）。
+どちらも既定で外へ出られる。モデル API への接続が切れるとエージェントが動かないので、これでよい。
+外部へ出る必要のないプロセスには docker なら `network = "none"` を明示する。
 
 termit は `network` と `args` の組み合わせを検査しない。
 どの隔離が必要かはエージェントと作業の性質で決まり、端末が判定できる事柄ではない。

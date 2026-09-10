@@ -248,22 +248,42 @@ Turn it off with `restore_sessions = false`.
 ## Sandbox profiles
 
 A profile says where a pane runs. `host` is the default and runs directly.
-Anything with an `image` runs inside `docker run`.
+Anything with an `image` runs inside `<runner> run`.
 
 ```toml
 [profile.sandbox]
 image   = "termit-agent:latest"   # an image with your agent installed
 workdir = "/work"
 mount   = ["{cwd}:/work"]
-network = "bridge"
 env     = ["ANTHROPIC_API_KEY"]
 args    = ["--dangerously-skip-permissions"]
 ```
 
 The isolation comes from the mount scope and the process namespace, not from
-the network. The container only sees what you mounted. `network` defaults to
-`bridge` because an agent that cannot reach its API is not useful; set
-`"none"` for processes that do not need to get out.
+the network. The container only sees what you mounted. Leave `network` unset
+and the runner's own default applies, which reaches the internet — an agent
+that cannot call its API is not useful. Set `network = "none"` under Docker for
+a session that does not need to get out.
+
+`runner` names the command, and defaults to `docker`. Anything that takes the
+same arguments works, because termit only assembles the argument list:
+
+```toml
+[profile.vm]
+image       = "termit-agent:latest"
+runner      = "container"              # Apple's container: one lightweight VM each
+mount       = ["{cwd}:/work"]
+env         = ["ANTHROPIC_API_KEY", "TERM"]
+runner_args = ["--memory", "2048MB"]   # goes in just before the image
+```
+
+`runner_args` is the escape hatch for flags termit knows nothing about. Two
+notes for Apple's `container` specifically, both measured: it gives a container
+4 CPUs and 1024 MB by default, which is a lot per session, and for about the
+first second the terminal size inside is 0x0 before the real size arrives, so a
+full-screen UI that reads its size once at startup can come up at 80 columns.
+Starting the agent through `sh -c 'sleep 1.5; exec claude'` is enough to miss
+that window. `docs/references/sandbox.md` records the measurements.
 
 Profiles are orthogonal to forking: `^]` forks into a profile you pick, so you
 can move a conversation into a container right before something risky.
@@ -334,6 +354,7 @@ The detailed design record is in Japanese.
 - [`docs/superpowers/specs/2026-09-08-agent-terminal-design.md`](docs/superpowers/specs/2026-09-08-agent-terminal-design.md) — the specification
 - [`docs/performance.md`](docs/performance.md) — where the time actually goes, measured
 - [`docs/references/performance-techniques.md`](docs/references/performance-techniques.md) — techniques taken from other terminals, each marked adopted, rejected with the measurement, or still open
+- [`docs/references/sandbox.md`](docs/references/sandbox.md) — how agents are sandboxed elsewhere, what Apple's `container` measured at, and what termit deliberately leaves outside
 - [`docs/references/scrollback.md`](docs/references/scrollback.md) — how five other implementations handle scrollback, and which parts were copied
 - [`docs/warp-metrics.md`](docs/warp-metrics.md) — the sizes and paddings the left pane is based on
 
