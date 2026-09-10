@@ -68,9 +68,14 @@ The binary carries its own diagnostics so you do not need extra tooling.
 termit --probe out.png      # draw one frame offscreen and write it to a PNG
 termit --keytest            # show what each key press arrives as
 termit --bench              # measure the cost of drawing
+termit --throughput         # measure how fast bytes from the pty are consumed
 termit --latency-test       # measure the input round trip, no keyboard needed
 termit --shell-integration  # print the zsh snippet
 ```
+
+`--throughput` feeds nine synthetic workloads modelled on alacritty's vtebench
+through the real read path (OSC scan, then the VT parser, then the grid) without
+opening a window, and reports the scan and the parse separately.
 
 `--probe` renders one frame through the real drawing code without opening a
 window, so you can check layout and glyph placement on a machine where you

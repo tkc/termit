@@ -64,8 +64,24 @@ impl OscScanner {
     /// OSC が届いた時点の画面状態を読める。
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<(usize, OscEvent)> {
         let mut out = Vec::new();
-        for (i, &b) in bytes.iter().enumerate() {
+        let mut i = 0usize;
+        while i < bytes.len() {
+            // 普通の文字のあいだは、次の ESC まで一気に飛ばす。
+            // 出力のほとんどは普通の文字なので、1 バイトずつ見ると無駄が多い。
+            if self.state == State::Ground {
+                match memchr::memchr(0x1b, &bytes[i..]) {
+                    Some(off) => {
+                        self.state = State::Escape;
+                        i += off + 1;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            let b = bytes[i];
             match self.state {
+                // 上で飛ばしているので、ここへは来ない。
+                // それでも元の判定を残す。取りこぼすより安全である。
                 State::Ground => {
                     if b == 0x1b {
                         self.state = State::Escape;
@@ -101,6 +117,7 @@ impl OscScanner {
                     }
                 }
             }
+            i += 1;
         }
         out
     }
@@ -342,6 +359,26 @@ mod tests {
                 OscEvent::CommandFinished(Some(0)),
                 OscEvent::PromptStart
             ]
+        );
+    }
+    /// ESC まで飛ばす近道が、位置を狂わせないことを確かめる。
+    #[test]
+    fn 長い平文のあとのシーケンスも位置が合う() {
+        let mut input = vec![b'a'; 10_000];
+        input.extend_from_slice(b"\x1b]133;C\x07");
+        let got = scan_with_offsets(&input);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 10_008);
+        assert_eq!(got[0].1, OscEvent::CommandExecuted);
+    }
+
+    /// OSC でないエスケープの直後に OSC が来ても取りこぼさない。
+    #[test]
+    fn 別のエスケープに続く_osc_を拾う() {
+        // ESC [ 3 1 m のあとに OSC が続く。
+        assert_eq!(
+            scan(b"\x1b[31mred\x1b]133;A\x07"),
+            vec![OscEvent::PromptStart]
         );
     }
 }

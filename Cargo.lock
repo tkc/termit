@@ -2381,6 +2381,7 @@ dependencies = [
  "glyphon",
  "libc",
  "log",
+ "memchr",
  "pollster",
  "portable-pty",
  "rusqlite",
