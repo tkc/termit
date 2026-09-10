@@ -45,13 +45,22 @@ the things that were tried and rejected because they measured worse.
 
 ## Install
 
-Take the tarball from [Releases](https://github.com/tkc/termit/releases).
-The build is not notarised, so macOS quarantines a copy you downloaded:
+```sh
+V=0.1.0
+curl -fsSL "https://github.com/tkc/termit/releases/download/v$V/termit-$V-macos-arm64.tar.gz" | tar xz
+./termit-$V-macos-arm64/termit
+```
+
+This build is not notarised. Nothing stops it when `curl` fetches it, because
+the quarantine flag is set by whatever downloads the file, and `curl` sets
+nothing. A browser does set it, and then macOS refuses to open the binary at
+all — *"Apple could not verify termit is free of malware"*. If you took the
+tarball from the [releases page](https://github.com/tkc/termit/releases) in a
+browser, clear the flag before running it:
 
 ```sh
-tar xzf termit-0.1.0-macos-arm64.tar.gz
 shasum -a 256 -c SHA256SUMS
-xattr -dr com.apple.quarantine termit-0.1.0-macos-arm64/termit
+xattr -dr com.apple.quarantine termit-0.1.0-macos-arm64
 termit-0.1.0-macos-arm64/termit
 ```
 
