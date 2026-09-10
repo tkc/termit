@@ -21,6 +21,7 @@ mod session;
 mod state;
 mod term;
 mod theme;
+mod throughput;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -89,6 +90,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--latency-test") {
         latency::run();
+        return;
+    }
+    if args.iter().any(|a| a == "--throughput") {
+        throughput::run();
         return;
     }
     if args.iter().any(|a| a == "--bench") {

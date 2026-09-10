@@ -969,6 +969,13 @@ impl Renderer {
     }
 
     /// 描画の指示だけを組み立てて、CPU 側の費用を測る（ベンチ用）。
+    /// 整形の記憶を捨てる（ベンチ用）。
+    ///
+    /// 毎フレーム整形し直す場合の費用を測るために使う。
+    pub fn clear_string_cache(&mut self) {
+        self.strings.clear();
+    }
+
     pub fn bench_prepare(&mut self) -> std::time::Duration {
         let t = std::time::Instant::now();
         self.prepare_frame();
