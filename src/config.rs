@@ -91,7 +91,7 @@ pub struct ShellConfig {
     pub args: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// 新規セッションの起動コマンド。未設定ならシェルを起動する。
@@ -101,6 +101,53 @@ pub struct AgentConfig {
     /// 再開の起動コマンド。次の起動でセッションを作り直すときに使う。
     /// 未設定なら、覚えていたコマンドをそのまま動かす。
     pub resume: Option<String>,
+    /// 題名がこの文字で始まっていたら「動いている」と見なす。
+    ///
+    /// 全画面 UI は考えているあいだ、OSC 0/2 の題名に回る絵を出す。
+    /// 出力が途切れても動いていることが、これで分かる。
+    #[serde(default = "default_working_title")]
+    pub working_title: String,
+    /// 画面の末尾にこれが出ていたら「利用者の返事待ち」と見なす。
+    ///
+    /// 小文字にそろえて比べる。どれか 1 つ当たれば待ちとする。
+    /// termit はエージェントの見た目を知らない。知っているのはこの表だけで、
+    /// 相手の UI が変われば設定を直す。
+    #[serde(default = "default_blocked_when")]
+    pub blocked_when: Vec<String>,
+    /// 待ちを探すために読む、画面の末尾の行数。
+    #[serde(default = "default_blocked_lines")]
+    pub blocked_lines: usize,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            new: None,
+            fork: None,
+            resume: None,
+            working_title: default_working_title(),
+            blocked_when: default_blocked_when(),
+            blocked_lines: default_blocked_lines(),
+        }
+    }
+}
+
+/// 点字の回る絵と半円。エージェントが題名に出すもの。
+fn default_working_title() -> String {
+    "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◑◒◓".to_string()
+}
+
+fn default_blocked_when() -> Vec<String> {
+    vec![
+        "do you want to proceed?".to_string(),
+        "esc to cancel".to_string(),
+        "waiting for permission".to_string(),
+        "do you want to allow".to_string(),
+    ]
+}
+
+fn default_blocked_lines() -> usize {
+    12
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -271,6 +318,19 @@ impl Config {
                         "profile.{name}.env \"{e}\" must name a variable, not set a value"
                     )));
                 }
+            }
+        }
+        if self.agent.blocked_lines == 0 || self.agent.blocked_lines > 200 {
+            return Err(ConfigError::Invalid(format!(
+                "agent.blocked_lines must be between 1 and 200 (got {})",
+                self.agent.blocked_lines
+            )));
+        }
+        for w in &self.agent.blocked_when {
+            if w.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "agent.blocked_when must not contain an empty string".into(),
+                ));
             }
         }
         for (field, tmpl) in [
@@ -668,6 +728,43 @@ mod tests {
 image = "img"
 mount = ["{cwd}:/work"]
 runner = "docker run"
+"#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    /// README に載せた `[agent]` の例がそのまま読めること。
+    /// `deny_unknown_fields` なので、綴りを変えたら落ちる。
+    #[test]
+    fn readme_の_agent_設定を読める() {
+        let toml = r#"
+[agent]
+working_title = "⠋⠙⠹◐"
+blocked_when  = ["do you want to proceed?", "esc to cancel"]
+blocked_lines = 12
+"#;
+        let c: Config = toml::from_str(toml).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.agent.blocked_lines, 12);
+        assert_eq!(c.agent.blocked_when.len(), 2);
+        assert!(c.agent.working_title.contains('◐'));
+    }
+
+    /// 設定ファイルが無いときの既定値でも、判定の材料がそろっていること。
+    #[test]
+    fn 既定でも返事待ちを探す材料がある() {
+        let c = Config::default();
+        c.validate().unwrap();
+        assert!(!c.agent.blocked_when.is_empty());
+        assert!(!c.agent.working_title.is_empty());
+        assert!(c.agent.blocked_lines > 0);
+    }
+
+    #[test]
+    fn 待ちの行数が範囲外なら拒む() {
+        let toml = r#"
+[agent]
+blocked_lines = 0
 "#;
         let c: Config = toml::from_str(toml).unwrap();
         assert!(c.validate().is_err());

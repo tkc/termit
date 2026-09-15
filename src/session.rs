@@ -49,6 +49,15 @@ pub struct Session {
     /// これが無いと、背景で動いているセッションの通知を
     /// 一つ残らず描き直しに使うことになる。
     pub shown_working: bool,
+    /// 題名から読み取った「動いている」。読み取れなければ `None`。
+    ///
+    /// 出力が途切れても、題名の絵が回っていれば動いている。
+    /// 題名は OSC 0/2 で届くので、画面を読む必要がない。
+    pub title_working: Option<bool>,
+    /// 利用者の返事を待っているか。画面の末尾から判定する。
+    pub blocked: bool,
+    /// 左ペインに「待っている」と描いてあるか。
+    pub shown_blocked: bool,
     /// 再起動をまたいで残る鍵。コマンド履歴をこの単位で辿る。
     pub key: String,
     /// 利用者が付けた名前。付けていなければ作業ディレクトリを名前にする。
@@ -84,13 +93,46 @@ impl Session {
     }
 
     /// いま何かを出しているか。
+    ///
+    /// 題名が「動いている」と言っているならそれを信じる。
+    /// 考えているあいだ出力が止まるエージェントがあり、
+    /// 出力の途切れだけでは止まって見えてしまう。
     pub fn is_working(&self) -> bool {
-        self.is_running() && Self::working_at(self.activity.load(Ordering::Relaxed), now_ms())
+        if !self.is_running() {
+            return false;
+        }
+        if self.title_working == Some(true) {
+            return true;
+        }
+        Self::working_at(self.activity.load(Ordering::Relaxed), now_ms())
     }
 
     /// 最後の出力から `now` までの間で、働いていると見なすか。
     fn working_at(last: u64, now: u64) -> bool {
         now.saturating_sub(last) < WORKING_QUIET_MS
+    }
+
+    /// 題名の 1 文字目から「動いている」を読む。分からなければ `None`。
+    ///
+    /// 全画面 UI は考えているあいだ、題名の先頭に回る絵を出す。
+    /// どの文字がそれかは設定に書く。termit は文字を照合するだけで、
+    /// 相手が何というプログラムかは知らない。
+    pub fn title_signal(title: Option<&str>, working_chars: &str) -> Option<bool> {
+        let c = title?.chars().next()?;
+        working_chars.contains(c).then_some(true)
+    }
+
+    /// 画面の末尾に、返事待ちの手がかりがあるか。
+    ///
+    /// 大文字小文字はそろえて比べる。どれか 1 つ当たれば待ちとする。
+    pub fn blocked_in(text: &str, phrases: &[String]) -> bool {
+        if phrases.is_empty() {
+            return false;
+        }
+        let lower = text.to_lowercase();
+        phrases
+            .iter()
+            .any(|p| !p.trim().is_empty() && lower.contains(&p.to_lowercase()))
     }
 
     /// 左ペインに出す名前と、それがパスかどうか。
@@ -609,6 +651,9 @@ impl Manager {
             dirty: spawned.dirty,
             activity: spawned.activity,
             shown_working: false,
+            title_working: None,
+            blocked: false,
+            shown_blocked: false,
             name: None,
             branch: None,
             branch_read: None,
@@ -826,6 +871,24 @@ impl Session {
 ///
 /// 入力の途中で画面がスクロールすると開始点が現在行より下になる。
 /// その場合は現在行だけを読む。
+/// 画面（履歴ではなく、いま出ている枠）の末尾 `lines` 行を文字にする。
+///
+/// 遡って見ているあいだも、判定に使うのは相手が出している今の画面である。
+pub fn screen_tail(term: &alacritty_terminal::Term<EventProxy>, lines: usize) -> String {
+    use alacritty_terminal::grid::Dimensions;
+    let rows = term.grid().screen_lines();
+    if rows == 0 {
+        return String::new();
+    }
+    let cols = term.grid().columns();
+    let start = rows.saturating_sub(lines.max(1));
+    grid_text(
+        term,
+        Point::new(Line(start as i32), Column(0)),
+        Point::new(Line(rows as i32 - 1), Column(cols)),
+    )
+}
+
 pub fn grid_text(term: &alacritty_terminal::Term<EventProxy>, start: Point, end: Point) -> String {
     let grid = term.grid();
     let (start, end) =
@@ -1021,6 +1084,36 @@ mod tests {
     fn 出力が途切れたら止まっていると見なす() {
         assert!(!Session::working_at(1000, 1000 + WORKING_QUIET_MS));
         assert!(!Session::working_at(1000, 10_000));
+    }
+
+    /// 題名の 1 文字目が回る絵なら、出力が途切れていても動いている。
+    #[test]
+    fn 題名の回る絵で動いていると分かる() {
+        let chars = "⠋⠙⠹◐";
+        assert_eq!(Session::title_signal(Some("⠙ Claude"), chars), Some(true));
+        assert_eq!(Session::title_signal(Some("◐ 考え中"), chars), Some(true));
+        // 回る絵でなければ何も言わない。出力の途切れで判断する。
+        assert_eq!(Session::title_signal(Some("✳ claude"), chars), None);
+        assert_eq!(Session::title_signal(Some("zsh"), chars), None);
+        assert_eq!(Session::title_signal(Some(""), chars), None);
+        assert_eq!(Session::title_signal(None, chars), None);
+    }
+
+    /// 返事待ちの手がかりは、大文字小文字をそろえて探す。
+    #[test]
+    fn 画面の末尾から返事待ちを見つける() {
+        let phrases = vec![
+            "do you want to proceed?".to_string(),
+            "esc to cancel".to_string(),
+        ];
+        assert!(Session::blocked_in(
+            "  ❯ 1. Yes\n  2. No\n  Do you want to proceed?",
+            &phrases
+        ));
+        assert!(Session::blocked_in("… ESC to cancel", &phrases));
+        assert!(!Session::blocked_in("esc to interrupt", &phrases));
+        // 表が空なら、この判定そのものを切ったことにする。
+        assert!(!Session::blocked_in("do you want to proceed?", &[]));
     }
 
     #[test]

@@ -133,10 +133,20 @@ takes nothing, because neither shells nor agents use Cmd.
 Everything else goes to the child process untouched.
 
 **The dot on a row** is filled while the session is alive and hollow once it
-has ended. It is bright while the session is producing output — an agent that
-is working keeps its spinner moving, so the bright dot means *busy* and the dim
-one means *waiting for you*. A hollow grey dot ended cleanly, a hollow red one
-did not.
+has ended. Its colour is the session's state:
+
+| Dot | Meaning |
+|---|---|
+| Green | Working — output is flowing, or the program's window title carries a spinner |
+| Yellow | Waiting for **you** — an approval or a question is on screen |
+| Dim | Idle |
+| Hollow grey / red | Ended cleanly / with a non-zero status |
+
+Yellow is the one that matters with several agents open: it separates "stopped
+because it needs an answer" from "stopped because it is done". termit does not
+know what any agent looks like — it matches the phrases and title characters
+listed under `[agent]` in your config, and you can change them when an agent's
+UI changes.
 
 **Dropping files.** Drag a file onto the window and its path is typed into
 the session, followed by a space, so several files dropped together line up as
@@ -325,7 +335,26 @@ restore_sessions = true     # rebuild the session list on the next start
 [shell]
 program = "/bin/zsh"
 args    = ["-l"]
+
+[agent]
+# The dot turns green while the title starts with one of these, even when the
+# program has stopped printing. Agents spin one of them while they think.
+working_title = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◑◒◓"
+# The dot turns yellow when any of these appears in the last lines of the
+# screen. Compared case-insensitively. Empty list turns the check off.
+blocked_when  = [
+  "do you want to proceed?",
+  "esc to cancel",
+  "waiting for permission",
+  "do you want to allow",
+]
+blocked_lines = 12   # how many lines from the bottom to read
 ```
+
+The `[agent]` table is data, not code: termit reads a title and some phrases and
+compares them. Nothing in the binary knows what Claude Code or Codex look like,
+so when an agent changes its wording you edit the config rather than wait for a
+release.
 
 `scrollback` is per session, and a row costs its full width whether or not
 anything is on it — `lines × columns × 24 bytes`. At the default 10000 lines
@@ -375,6 +404,7 @@ The detailed design record is in Japanese.
 - [`docs/superpowers/specs/2026-09-08-agent-terminal-design.md`](docs/superpowers/specs/2026-09-08-agent-terminal-design.md) — the specification
 - [`docs/performance.md`](docs/performance.md) — where the time actually goes, measured
 - [`docs/references/performance-techniques.md`](docs/references/performance-techniques.md) — techniques taken from other terminals, each marked adopted, rejected with the measurement, or still open
+- [`docs/references/agent-state.md`](docs/references/agent-state.md) — how other tools tell a working agent from one that is waiting for you, and which parts of that termit adopted
 - [`docs/references/sandbox.md`](docs/references/sandbox.md) — how agents are sandboxed elsewhere, what Apple's `container` measured at, and what termit deliberately leaves outside
 - [`docs/references/scrollback.md`](docs/references/scrollback.md) — how five other implementations handle scrollback, and which parts were copied
 - [`docs/warp-metrics.md`](docs/warp-metrics.md) — the sizes and paddings the left pane is based on
