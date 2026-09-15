@@ -142,6 +142,7 @@ fn main() {
             .is_ok()
             .then(Counters::default),
         resize_quiet_since: None,
+        agent_state_at: None,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("termit: {e}");
@@ -399,6 +400,8 @@ impl Counters {
 /// 出力が止まったことは通知として届かない。止まったと見なせる頃に
 /// 一度描き直して、印を落とす。
 const WORKING_REFRESH: std::time::Duration = std::time::Duration::from_millis(250);
+/// 返事待ちを調べる間隔。印を出すのに要るだけで、これより短くしても見た目は変わらない。
+const AGENT_STATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// 引きずる手が止まったと見なすまでの間。
 ///
@@ -413,6 +416,8 @@ struct App {
     counters: Option<Counters>,
     /// 最後に大きさが変わった時刻。合わせ残しがあるときだけ入る。
     resize_quiet_since: Option<std::time::Instant>,
+    /// 返事待ちを最後に調べた時刻。毎フレーム画面を読まないための間隔。
+    agent_state_at: Option<std::time::Instant>,
 }
 
 /// 画面の割り付け。すべてセル単位で扱う。
@@ -576,8 +581,13 @@ impl ApplicationHandler<UiEvent> for App {
                 }
             }
             UiEvent::Title(id, title) => {
+                // 題名の先頭に回る絵を出すエージェントがある。
+                // 出力が途切れても動いていることが、これで分かる。
+                let chars = self.config.agent.working_title.clone();
                 if let Some(s) = state.manager.get_mut(id) {
-                    s.window_title = (!title.is_empty()).then_some(title);
+                    let t = (!title.is_empty()).then_some(title);
+                    s.title_working = crate::session::Session::title_signal(t.as_deref(), &chars);
+                    s.window_title = t;
                 }
             }
             UiEvent::ChildExit(id, code) => {
@@ -1819,6 +1829,8 @@ impl App {
             state.needs_redraw = true;
             return;
         }
+        self.refresh_agent_state();
+        let Some(state) = &mut self.state else { return };
         // 出すセッションの大きさを、描く前に必ず合わせる。
         // 引きずるあいだ待たせたものを、そのまま描くと下半分が空く。
         state.manager.ensure_visible_size();
@@ -1916,6 +1928,41 @@ impl App {
         }
         if let Some(at) = wake {
             event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+        }
+    }
+
+    /// 返事待ちの印を更新する。
+    ///
+    /// 承認や質問が出ていると、エージェントは出力を止めて待つ。
+    /// 「動いていない」だけでは、暇なのか返事待ちなのか区別できない。
+    /// 手がかりの表は設定にあり、termit は文字を照合するだけである。
+    ///
+    /// 読むのは出力が止まっているセッションの末尾数行だけで、間隔も置く。
+    /// 毎フレーム全部の画面を読むと、費用が印に見合わない。
+    fn refresh_agent_state(&mut self) {
+        if self.config.agent.blocked_when.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some(at) = self.agent_state_at {
+            if now.duration_since(at) < AGENT_STATE_INTERVAL {
+                return;
+            }
+        }
+        self.agent_state_at = Some(now);
+        let lines = self.config.agent.blocked_lines;
+        let phrases = &self.config.agent.blocked_when;
+        let Some(state) = &mut self.state else { return };
+        for s in state.manager.sessions_mut() {
+            s.blocked = if !s.is_running() || s.is_working() {
+                false
+            } else {
+                let tail = {
+                    let term = s.term.lock();
+                    crate::session::screen_tail(&term, lines)
+                };
+                crate::session::Session::blocked_in(&tail, phrases)
+            };
         }
     }
 
@@ -2183,7 +2230,7 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
 
     let selected = state.manager.selected_index();
     // 描いた「動いている」状態は覚えておく。変わるときだけ描き直す。
-    let mut shown: Vec<(usize, bool)> = Vec::with_capacity(sl.blocks.len());
+    let mut shown: Vec<(usize, bool, bool)> = Vec::with_capacity(sl.blocks.len());
     for (n, b) in sl.blocks.iter().enumerate() {
         let s = &state.manager.sessions()[b.index];
         let running = s.is_running();
@@ -2198,7 +2245,8 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
             RunState::Exited(code) => Some(code),
         };
         let working = s.is_working();
-        shown.push((b.index, working));
+        let blocked = s.blocked;
+        shown.push((b.index, working, blocked));
 
         let hovered =
             state.mouse.x < sl.width && state.mouse.y >= b.top && state.mouse.y < b.top + b.height;
@@ -2266,7 +2314,10 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         // 実行状態は左端に置く。Warp がアバターを置いている位置にあたる。
         // 動いているあいだは明るく、待っているあいだは沈める。
         let mark = if exit.is_none() { "●" } else { "○" };
+        // 待っている＞動いている＞止まっている、の順に強い。
+        // 待ちは黄色。動いている緑とも、異常終了の赤とも違う色にする。
         let mark_color = match exit {
+            None if blocked => theme.ansi[3],
             None if working => theme.accent,
             None => theme.fg_tertiary,
             Some(0) => theme.fg_tertiary,
@@ -2351,9 +2402,10 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         }
     }
 
-    for (i, working) in shown {
+    for (i, working, blocked) in shown {
         if let Some(s) = state.manager.sessions_mut().get_mut(i) {
             s.shown_working = working;
+            s.shown_blocked = blocked;
         }
     }
 
