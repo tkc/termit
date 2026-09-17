@@ -20,6 +20,11 @@ pub enum Action {
     ToggleSidebar,
     Copy,
     Paste,
+    /// 伏せずに、クリップボードのまま貼り付ける。
+    ///
+    /// `[paste] mask` が効いていると、認証情報らしき値が伏せられる。
+    /// `aws configure` に本物を渡したいときの逃げ道。
+    PasteRaw,
     /// 画面とスクロールバックを消し、プロンプトを出し直す。
     ClearScreen,
     /// 画面とスクロールバックの中を探す。
@@ -116,6 +121,12 @@ fn action_from_char(key: &Key, mods: ModifiersState) -> Option<Action> {
             _ => None,
         };
     }
+    // ⌥⌘ の枝。伏せずに貼るためだけに使う。
+    // iTerm2 が Advanced Paste に使っている枠で、Shift を使わないので
+    // 「Shift の同時押しが届かない」環境でも通る。
+    if mods.super_key() && mods.alt_key() && !mods.control_key() {
+        return (c.as_str() == "v").then_some(Action::PasteRaw);
+    }
     // Cmd 側。Shift を併用する組み合わせは ⌘⇧R だけに限る。
     if mods.super_key() && !mods.control_key() && !mods.alt_key() {
         if mods.shift_key() {
@@ -169,6 +180,9 @@ fn action_from_physical(physical: PhysicalKey, mods: ModifiersState) -> Option<A
             KeyCode::KeyR => Some(Action::SearchHistory),
             _ => None,
         };
+    }
+    if mods.super_key() && mods.alt_key() && !mods.control_key() {
+        return (code == KeyCode::KeyV).then_some(Action::PasteRaw);
     }
     if mods.super_key() && !mods.control_key() && !mods.alt_key() {
         let command = match code {
@@ -496,6 +510,28 @@ mod tests {
         assert_eq!(action_for(&ch("k"), phys, cmd), Some(Action::ClearScreen));
         assert_eq!(action_for(&ch("f"), phys, cmd), Some(Action::FindInScreen));
         assert_eq!(action_for(&ch("["), phys, cmd), Some(Action::SelectPrev));
+    }
+
+    /// ⌥⌘V は伏せずに貼る。Shift を使わないので、届かない環境の心配がない。
+    #[test]
+    fn 伏せずに貼る組み合わせを受ける() {
+        let phys = PhysicalKey::Code(KeyCode::KeyV);
+        let alt_cmd = ModifiersState::SUPER | ModifiersState::ALT;
+        assert_eq!(action_for(&ch("v"), phys, alt_cmd), Some(Action::PasteRaw));
+        // ⌥ を離せば、ふだんの貼り付け（伏せるほう）に戻る。
+        assert_eq!(
+            action_for(&ch("v"), phys, ModifiersState::SUPER),
+            Some(Action::Paste)
+        );
+        // 文字が取れない配列でも物理キーで通る。
+        assert_eq!(
+            action_for(&Key::Dead(None), phys, alt_cmd),
+            Some(Action::PasteRaw)
+        );
+        // ⌥⌘ に別のキーを足しても、何も起こさない。
+        // ⌘C（写す）が ⌥ を足したせいで別の意味になる、ということがない。
+        let phys_c = PhysicalKey::Code(KeyCode::KeyC);
+        assert_eq!(action_for(&ch("c"), phys_c, alt_cmd), None);
     }
 
     #[test]

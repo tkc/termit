@@ -19,7 +19,61 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
+    pub paste: PasteConfig,
+    #[serde(default)]
     pub profile: BTreeMap<String, Profile>,
+}
+
+/// 貼り付けるときの扱い。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PasteConfig {
+    /// 認証情報らしき値を伏せてから貼り付けるか。
+    #[serde(default = "default_mask")]
+    pub mask: bool,
+    /// 伏せる場所を指す式。`secret` と名付けた組があれば、そこだけを伏せる。
+    ///
+    /// 何を伏せるかはここにしかない。termit の実行ファイルの中に
+    /// 「AWS の鍵の形」は無く、相手の形が変わればこの表を直す。
+    #[serde(default = "default_redact")]
+    pub redact: Vec<String>,
+}
+
+fn default_mask() -> bool {
+    true
+}
+
+/// 既定で伏せるもの。クラウドの認証情報に絞る。
+///
+/// `password` や `token` のような広い語は入れない。エージェントへ貼る
+/// コードの中の変数名に当たってしまい、貼った内容のほうが壊れる。
+fn default_redact() -> Vec<String> {
+    [
+        // AWS のアクセスキー ID（長期 AKIA、一時 ASIA ほか）。
+        r"\b(?P<secret>(AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16})\b",
+        // JSON の中の値。aws sts の出力と、GCP のサービスアカウントの鍵。
+        // 閉じ引用符まで取るので、鍵の中の改行（\n）も丸ごと伏せる。
+        r#"(?i)"(aws_secret_access_key|secretaccesskey|sessiontoken|private_key|client_secret)"\s*:\s*"(?P<secret>[^"]+)""#,
+        // 裸の値。~/.aws/credentials と export の形。
+        r"(?i)\b(aws_secret_access_key|aws_session_token|account_key)\b\s*[=:]\s*(?P<secret>[A-Za-z0-9/+=_.-]{16,})",
+        // Google の API キーと OAuth の合鍵。
+        // 長さは決め打ちにしない。実物は AIza に続けて 35 文字だが、
+        // そこが 1 文字違うだけで素通りするほうが危ない。
+        r"\b(?P<secret>AIza[0-9A-Za-z_-]{20,})\b",
+        r"\b(?P<secret>ya29\.[0-9A-Za-z_-]+)",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+impl Default for PasteConfig {
+    fn default() -> Self {
+        Self {
+            mask: default_mask(),
+            redact: default_redact(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -319,6 +373,9 @@ impl Config {
                     )));
                 }
             }
+        }
+        if let Err(e) = crate::secret::Redactor::new(&self.paste.redact) {
+            return Err(ConfigError::Invalid(e.to_string()));
         }
         if self.agent.blocked_lines == 0 || self.agent.blocked_lines > 200 {
             return Err(ConfigError::Invalid(format!(
@@ -758,6 +815,56 @@ blocked_lines = 12
         assert!(!c.agent.blocked_when.is_empty());
         assert!(!c.agent.working_title.is_empty());
         assert!(c.agent.blocked_lines > 0);
+    }
+
+    #[test]
+    fn readme_の_paste_設定を読める() {
+        let toml = r#"
+[paste]
+mask = true
+redact = ['(?P<secret>AKIA[0-9A-Z]{16})']
+"#;
+        let c: Config = toml::from_str(toml).unwrap();
+        c.validate().unwrap();
+        assert!(c.paste.mask);
+        assert_eq!(c.paste.redact.len(), 1);
+    }
+
+    /// README に載せた式と、実際に配る既定値がずれていないこと。
+    ///
+    /// 利用者はあれを写して自分の設定を作る。ずれていれば、
+    /// 書いてあるとおりにしたのに守られない、ということが起きる。
+    #[test]
+    fn readme_の式は既定値と同じ() {
+        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("README を読める");
+        // 本文にも `[paste]` と書いてあるので、行として独立したものだけを拾う。
+        let block = readme
+            .split("\n[paste]\n")
+            .nth(1)
+            .and_then(|s| s.split_once("redact = ["))
+            // 式の中にも `]` が出るので、行頭の `]` を表の終わりとする。
+            .map(|(_, rest)| rest.split_once("\n]").expect("表が閉じている").0)
+            .expect("README に [paste] の例がある");
+        let listed: Vec<String> = block
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with('\''))
+            .map(|l| l.trim_end_matches(',').trim_matches('\'').to_string())
+            .collect();
+        assert_eq!(listed, PasteConfig::default().redact);
+    }
+
+    /// 壊れた式は起動時に断る。貼り付けてから気づくのでは遅い。
+    #[test]
+    fn 壊れた式のある設定を拒む() {
+        let toml = r#"
+[paste]
+redact = ["[unclosed"]
+"#;
+        let c: Config = toml::from_str(toml).unwrap();
+        let e = c.validate().unwrap_err();
+        assert!(format!("{e}").contains("paste.redact[0]"), "{e}");
     }
 
     #[test]
