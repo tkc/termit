@@ -321,6 +321,27 @@ disappeared falls back to your home directory.
 
 Turn it off with `restore_sessions = false`.
 
+## Leaving it running
+
+Agents spend much of their time waiting — on a usage limit that resets in a few
+hours, on a build, on a long test run. Claude Code picks its task back up by
+itself when the limit resets, but only while its session is still alive, so the
+useful thing is simply to leave termit open.
+
+A sleeping Mac freezes every process, so the reset comes and goes and nothing
+happens. Launch under `caffeinate` and the machine stays awake exactly as long
+as termit runs:
+
+```sh
+caffeinate -is termit
+```
+
+`-i` prevents idle sleep, `-s` prevents system sleep, and both are released
+when termit exits — nothing is left holding the machine awake. Two conditions
+worth knowing: `-s` applies only on AC power, and neither flag stops a laptop
+from sleeping when you close the lid. If you want the lid shut, run the work
+somewhere that is not your machine.
+
 ## Sandbox profiles
 
 A profile says where a pane runs. `host` is the default and runs directly.
