@@ -2384,6 +2384,7 @@ dependencies = [
  "memchr",
  "pollster",
  "portable-pty",
+ "regex",
  "rusqlite",
  "rustc-hash 2.1.3",
  "serde",

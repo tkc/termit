@@ -17,6 +17,7 @@ mod pty;
 mod rect;
 mod render;
 mod search;
+mod secret;
 mod session;
 mod state;
 mod term;
@@ -126,6 +127,18 @@ fn main() {
         }
     };
 
+    // 貼り付けで伏せる式は、ここで 1 度だけ組み立てる。
+    // 設定の検査も同じものを通しているので、ここまで来れば必ず成功する。
+    let redactor = match secret::Redactor::new(&config.paste.redact) {
+        Ok(r) if config.paste.mask => r,
+        // 伏せない設定なら、式を持たない。判定そのものが走らなくなる。
+        Ok(_) => secret::Redactor::default(),
+        Err(e) => {
+            eprintln!("termit: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let event_loop = EventLoop::<UiEvent>::with_user_event()
         .build()
         .expect("イベントループを作れない");
@@ -143,6 +156,7 @@ fn main() {
             .then(Counters::default),
         resize_quiet_since: None,
         agent_state_at: None,
+        redactor,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("termit: {e}");
@@ -418,6 +432,8 @@ struct App {
     resize_quiet_since: Option<std::time::Instant>,
     /// 返事待ちを最後に調べた時刻。毎フレーム画面を読まないための間隔。
     agent_state_at: Option<std::time::Instant>,
+    /// 貼り付けで伏せる式。起動時に 1 度だけ組み立てる。
+    redactor: crate::secret::Redactor,
 }
 
 /// 画面の割り付け。すべてセル単位で扱う。
@@ -1017,9 +1033,27 @@ impl App {
                 }
             }
             Action::Paste => {
+                if let Some(text) = clipboard::paste() {
+                    // 認証情報らしき値を伏せてから渡す。伏せたことは必ず出す。
+                    // 黙って書き換えると、貼ったものが違う理由が分からない。
+                    // 伏せない設定なら、大きなクリップボードを写し取らない。
+                    let (text, hits) = if self.redactor.is_empty() {
+                        (text, 0)
+                    } else {
+                        self.redactor.redact(&text)
+                    };
+                    if let Some(s) = state.manager.selected() {
+                        let mode = *s.term.lock().mode();
+                        s.pty.write(bracketed(&text, mode));
+                    }
+                    state.status = (hits > 0).then(|| redacted_notice(hits));
+                }
+            }
+            Action::PasteRaw => {
                 if let (Some(s), Some(text)) = (state.manager.selected(), clipboard::paste()) {
                     let mode = *s.term.lock().mode();
                     s.pty.write(bracketed(&text, mode));
+                    state.status = None;
                 }
             }
             Action::ClearScreen => {
@@ -2027,6 +2061,12 @@ mod sidebar {
 /// 文字を使う。全画面 UI は選んだ行を書き直した時点で選択を捨てるため、
 /// これが無いと、選べているのに何も写らないという形になる。
 /// 控えは持ち主のセッションでだけ使う。
+/// 伏せたことを知らせる文。⌥⌘V が逃げ道であることも併せて出す。
+fn redacted_notice(hits: usize) -> String {
+    let what = if hits == 1 { "secret" } else { "secrets" };
+    format!("pasted with {hits} {what} redacted — ⌥⌘V pastes it unchanged")
+}
+
 fn copy_text(
     live: Option<String>,
     picked: Option<&(crate::session::SessionId, String)>,

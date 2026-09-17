@@ -8,6 +8,10 @@ description = "エージェント向けの軽量ターミナル"
 [dependencies]
 # 普通の文字のあいだを飛ばすため。OSC の走査に使う。
 memchr = "2"
+# 貼り付けで伏せる場所を指す式に使う。env_logger が既に連れてきているので、
+# 直接使っても組み立ての費用は増えない。後戻りしない実装なので、
+# 利用者の書いた式で端末が固まることがない。
+regex = "1"
 alacritty_terminal = "0.26"
 portable-pty = "0.9"
 libc = "0.2"
