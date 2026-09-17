@@ -182,6 +182,16 @@ see your region cannot answer the question you pasted. Two limits worth knowing:
   arrives in a credentials file or an API response.
 - Broad words like `password` and `token` are deliberately **not** in the
   defaults. They would fire on the code you paste for review and damage it.
+- **Redaction is tied to `⌘V`.** A program that reads your clipboard itself
+  never goes through it — Claude Code's `Ctrl+V` image paste does exactly that,
+  through its own native clipboard module. Paste with `⌘V` and termit sees it;
+  paste with `Ctrl+V` and it does not.
+
+A program can also *ask* the terminal for your clipboard with `OSC 52 ?`.
+termit refuses, because that request needs no keystroke from you — text
+arriving on the terminal is enough to trigger it, so `cat`ing a hostile file
+would be enough to lift what you copied. Writing to the clipboard stays
+allowed: an agent inside a container has no other way to hand you something.
 
 **Dropping files.** Drag a file onto the window and its path is typed into
 the session, followed by a space, so several files dropped together line up as
@@ -430,7 +440,8 @@ Chosen by recording what an agent's full-screen UI actually asks for.
 | Alternate screen (`?1049`) | yes |
 | Alternate scroll (`?1007`) | yes |
 | Window title (`OSC 0` / `OSC 2`) | yes |
-| Clipboard (`OSC 52`) | yes |
+| Clipboard write (`OSC 52`) | yes |
+| Clipboard **read** (`OSC 52` `?`) | no, deliberately |
 | Device attributes (`CSI c`) | yes |
 | Synchronized output (`?2026`) | yes |
 | Bell | no |

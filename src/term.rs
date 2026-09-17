@@ -185,9 +185,66 @@ pub fn now_ms() -> u64 {
 pub fn new_term(size: TermSize, scrollback: usize, proxy: EventProxy) -> Term<EventProxy> {
     let config = TermConfig {
         scrolling_history: scrollback,
+        // OSC 52 は書き込みだけ受け、読み出しは断る。
+        //
+        // 読み出しの要求は、画面に流れた文字列だけで起こせる。利用者は何もしていない
+        // のにクリップボードの中身が相手へ渡るので、仕掛けのあるファイルを `cat` する
+        // だけで、写したものを持ち出せてしまう。貼り付けと違い、伏せる機会もない。
+        // 書き込みのほうは断らない。コンテナの中のエージェントが写す手段が他に無い。
+        //
+        // これは `alacritty_terminal` の既定と同じ値だが、既定に任せず書いておく。
+        // 向こうの既定が変われば、termit は黙って読み出しを許すことになる。
+        osc52: alacritty_terminal::term::Osc52::OnlyCopy,
         ..TermConfig::default()
     };
     Term::new(config, &size, proxy)
+}
+
+/// OSC 52 の扱い。書き込みは受け、読み出しは断る。
+#[cfg(test)]
+mod osc52_policy_tests {
+    use super::*;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    /// 台本を端末へ流し、上がってきた通知を集める。
+    fn feed(bytes: &[u8]) -> Vec<UiEvent> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ptx, _prx) = std::sync::mpsc::channel();
+        let ws = Arc::new(FairMutex::new(WindowSize {
+            num_lines: 10,
+            num_cols: 80,
+            cell_width: 8,
+            cell_height: 16,
+        }));
+        let proxy = EventProxy::new(1, ptx, UiSender::Channel(tx), ws);
+        let mut term = new_term(TermSize::new(80, 10), 100, proxy);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, bytes);
+        rx.try_iter().collect()
+    }
+
+    /// 利用者は何も操作していない。画面に文字列が流れただけである。
+    /// ここが開くと、仕掛けのあるファイルを `cat` するだけで写したものが出ていく。
+    #[test]
+    fn 読み出し要求には答えない() {
+        let got = feed(b"\x1b]52;c;?\x07");
+        assert!(
+            !got.iter()
+                .any(|e| matches!(e, UiEvent::ClipboardLoad(_, _))),
+            "クリップボードの読み出しに答えてしまった"
+        );
+    }
+
+    /// 書き込みは断らない。コンテナの中のエージェントが写す手段が他に無い。
+    #[test]
+    fn 書き込みは受ける() {
+        let got = feed(b"\x1b]52;c;aGVsbG8=\x07");
+        let stored = got.iter().find_map(|e| match e {
+            UiEvent::ClipboardStore(_, text) => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(stored.as_deref(), Some("hello"));
+    }
 }
 
 /// 全画面 UI の描き直しで選択が消えることを確かめる。
