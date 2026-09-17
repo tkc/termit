@@ -50,17 +50,29 @@ fn default_mask() -> bool {
 fn default_redact() -> Vec<String> {
     [
         // AWS のアクセスキー ID（長期 AKIA、一時 ASIA ほか）。
-        r"\b(?P<secret>(AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16})\b",
+        r"\b(?P<secret>(A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16})\b",
+        // クラウドの環境変数。名前に秘密を示す語があるものだけを伏せる。
+        //
+        // Claude Code は `AWS_|GOOGLE_|AZURE_` で始まる変数の値をすべて伏せるが、
+        // あれは Anthropic 宛の telemetry 用で、伏せすぎても誰も困らない。
+        // こちらはエージェントに読ませる経路なので、`AWS_REGION=us-east-1` や
+        // `AWS_PROFILE=default` まで消すと、質問そのものが成り立たなくなる。
+        r#"(?i)\b(?:AWS|GOOGLE|GCP|GCLOUD|AZURE)_\w*(?:SECRET|KEY|TOKEN|PASSWORD|CREDENTIAL)\w*\s*[=:]\s*"?(?P<secret>[^"\s,;]{8,})"?"#,
         // JSON の中の値。aws sts の出力と、GCP のサービスアカウントの鍵。
         // 閉じ引用符まで取るので、鍵の中の改行（\n）も丸ごと伏せる。
         r#"(?i)"(aws_secret_access_key|secretaccesskey|sessiontoken|private_key|client_secret)"\s*:\s*"(?P<secret>[^"]+)""#,
-        // 裸の値。~/.aws/credentials と export の形。
-        r"(?i)\b(aws_secret_access_key|aws_session_token|account_key)\b\s*[=:]\s*(?P<secret>[A-Za-z0-9/+=_.-]{16,})",
-        // Google の API キーと OAuth の合鍵。
-        // 長さは決め打ちにしない。実物は AIza に続けて 35 文字だが、
-        // そこが 1 文字違うだけで素通りするほうが危ない。
+        // クラウド名が付かない形。Azure の接続文字列の AccountKey など。
+        r"(?i)\b(account_key|accountkey)\b\s*[=:]\s*(?P<secret>[A-Za-z0-9/+=_.-]{16,})",
+        // PEM の秘密鍵。塊ごと伏せる。JSON に入った鍵は上の式が拾うが、
+        // ファイルの中身をそのまま貼った場合はこちらが要る。
+        // 終わりの印を必ず求める。無いまま末尾まで伏せると、
+        // 「BEGIN …」と書いてあるだけの文章を巻き込む。
+        r"(?s)(?P<secret>-----BEGIN[ A-Z0-9_-]{0,100}?PRIVATE KEY(?: BLOCK)?-----.*?-----END[ A-Z0-9_-]{0,100}?PRIVATE KEY(?: BLOCK)?-----)",
+        // Google の API キー、OAuth の合鍵、OAuth の client secret。
+        // 長さは決め打ちにしない。1 文字違うだけで素通りするほうが危ない。
         r"\b(?P<secret>AIza[0-9A-Za-z_-]{20,})\b",
         r"\b(?P<secret>ya29\.[0-9A-Za-z_-]+)",
+        r"\b(?P<secret>GOCSPX-[0-9A-Za-z_-]{20,})",
     ]
     .iter()
     .map(|s| s.to_string())
