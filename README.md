@@ -166,9 +166,15 @@ actually want it — typing a key into `aws configure`, say. `⌘C` is untouched
 copying out of termit gives you exactly what is on screen.
 
 What counts as a credential lives in `[agent]`'s neighbour `[paste]` in your
-config, not in the binary. The defaults cover AWS access key IDs, AWS secret
-keys and session tokens (bare or in `aws sts` JSON), GCP service-account
-private keys, and Google API keys and OAuth tokens. Two limits worth knowing:
+config, not in the binary. The defaults cover AWS access key IDs; any
+`AWS_`/`GOOGLE_`/`GCP_`/`GCLOUD_`/`AZURE_` variable whose name carries SECRET,
+KEY, TOKEN, PASSWORD or CREDENTIAL; AWS secret keys and session tokens in
+`aws sts` JSON; PEM private keys, whole; and Google API keys, OAuth tokens and
+client secrets.
+
+Plain cloud settings survive on purpose — `AWS_REGION=us-east-1` and
+`AWS_PROFILE=default` reach the agent unchanged, because an agent that cannot
+see your region cannot answer the question you pasted. Two limits worth knowing:
 
 - **A bare AWS secret key cannot be detected.** It is 40 characters of base64
   with no marker; a rule that catches it also catches passwords, hashes and
@@ -372,11 +378,14 @@ mask   = true
 # name and the quotes around it survive; a rule with no `secret` group replaces
 # the whole match. A broken regex is reported at startup, not at paste time.
 redact = [
-  '\b(?P<secret>(AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16})\b',
+  '\b(?P<secret>(A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16})\b',
+  '(?i)\b(?:AWS|GOOGLE|GCP|GCLOUD|AZURE)_\w*(?:SECRET|KEY|TOKEN|PASSWORD|CREDENTIAL)\w*\s*[=:]\s*"?(?P<secret>[^"\s,;]{8,})"?',
   '(?i)"(aws_secret_access_key|secretaccesskey|sessiontoken|private_key|client_secret)"\s*:\s*"(?P<secret>[^"]+)"',
-  '(?i)\b(aws_secret_access_key|aws_session_token|account_key)\b\s*[=:]\s*(?P<secret>[A-Za-z0-9/+=_.-]{16,})',
+  '(?i)\b(account_key|accountkey)\b\s*[=:]\s*(?P<secret>[A-Za-z0-9/+=_.-]{16,})',
+  '(?s)(?P<secret>-----BEGIN[ A-Z0-9_-]{0,100}?PRIVATE KEY(?: BLOCK)?-----.*?-----END[ A-Z0-9_-]{0,100}?PRIVATE KEY(?: BLOCK)?-----)',
   '\b(?P<secret>AIza[0-9A-Za-z_-]{20,})\b',
   '\b(?P<secret>ya29\.[0-9A-Za-z_-]+)',
+  '\b(?P<secret>GOCSPX-[0-9A-Za-z_-]{20,})',
 ]
 
 [agent]
