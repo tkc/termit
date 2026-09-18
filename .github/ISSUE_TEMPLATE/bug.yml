@@ -1,0 +1,30 @@
+name: 不具合
+description: 動きがおかしい
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        思いついた時点で 1 行だけでも構いません。足りない分は消化するときに埋めます。
+  - type: textarea
+    id: what
+    attributes:
+      label: 何が起きたか
+      placeholder: ⌘W でセッションが閉じない
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 手がかり
+      description: |
+        あれば。スクリーンショット、または記録の 1 行。
+        `TERMIT_FRAME_LOG=1 RUST_LOG=info termit`（描画・読み取り）
+        `TERMIT_KEYLOG=/tmp/keys.log termit`（押したキーとその解釈）
+      placeholder: |
+        描く面を取れなかった: 間に合わず=0 隠れて=26 作り直し=0
+  - type: input
+    id: build
+    attributes:
+      label: どの版か
+      placeholder: v0.1.0 / main の 920b7ad
