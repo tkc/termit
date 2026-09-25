@@ -121,8 +121,7 @@ takes nothing, because neither shells nor agents use Cmd.
 | `⌘[` / `⌘]` | Select the previous / next session |
 | `⌘1`…`⌘9`, then `⌘A` `⌘G` `⌘J` `⌘L` `⌘O` `⌘P` `⌘S` `⌘T` `⌘U` `⌘X` `⌘Y` `⌘Z` | Jump to that session |
 | `⌘W` | Close the session (stops it if it is still running) |
-| `⌘C` / `⌘V` | Copy / paste (paste redacts credentials — see below) |
-| `⌥⌘V` | Paste unchanged, without redacting |
+| `⌘C` / `⌘V` | Copy / paste |
 | `⌘=` / `⌘-` | Font size |
 | `Shift+PageUp` / `PageDown` | Scroll a page |
 | Wheel / two fingers | Scroll the scrollback; hold `Shift` to keep it from the program |
@@ -149,49 +148,44 @@ know what any agent looks like — it matches the phrases and title characters
 listed under `[agent]` in your config, and you can change them when an agent's
 UI changes.
 
-**Pasting credentials.** `⌘V` scans the clipboard and replaces anything that
-looks like a cloud credential with `[redacted]` before it reaches the session.
-This is aimed at one accident: you copy a block of logs, JSON or `~/.aws/credentials`
-to ask an agent about it, and a live key rides along into the model's context.
-The surrounding text is kept, so the agent still sees what you meant to show it:
+**Credentials on screen.** Anything on screen that looks like a cloud
+credential is drawn as `••••`:
 
 ```
-aws_secret_access_key = [redacted]
-"private_key": "[redacted]"
+export AWS_SECRET_ACCESS_KEY=••••••••••••••••••••••••••••••••••••••••
+"private_key": "••••••••••••••••••••"
 ```
 
-The bottom bar says `pasted with 2 secrets redacted — ⌥⌘V pastes it unchanged`,
-so it never happens silently, and `⌥⌘V` gives you the real thing when you
-actually want it — typing a key into `aws configure`, say. `⌘C` is untouched:
-copying out of termit gives you exactly what is on screen.
+The masking is **display only**. The grid keeps the real text and the pty
+receives the real bytes, so an `export` you paste at a prompt works exactly as
+typed, `⌘C` copies the real value, and a program reading its own output is
+unaffected. What it takes away is the credential being *visible* — in a
+screenshot, a screen share, over your shoulder, or when you scroll back an hour
+later and find it still sitting there.
 
-What counts as a credential lives in `[agent]`'s neighbour `[paste]` in your
-config, not in the binary. The defaults cover AWS access key IDs; any
+The same width is kept, one bullet per cell, so a full-screen UI's alignment
+does not shift.
+
+What counts as a credential lives in `[screen]` in your config, not in the
+binary. The defaults cover AWS access key IDs; any
 `AWS_`/`GOOGLE_`/`GCP_`/`GCLOUD_`/`AZURE_` variable whose name carries SECRET,
 KEY, TOKEN, PASSWORD or CREDENTIAL; AWS secret keys and session tokens in
 `aws sts` JSON; PEM private keys, whole; and Google API keys, OAuth tokens and
-client secrets.
+client secrets. Plain cloud settings are left alone on purpose —
+`AWS_REGION=us-east-1` stays readable, because a masked region helps nobody.
 
-Plain cloud settings survive on purpose — `AWS_REGION=us-east-1` and
-`AWS_PROFILE=default` reach the agent unchanged, because an agent that cannot
-see your region cannot answer the question you pasted. Two limits worth knowing:
+Three limits worth knowing:
 
 - **A bare AWS secret key cannot be detected.** It is 40 characters of base64
-  with no marker; a rule that catches it also catches passwords, hashes and
-  git SHAs. It is caught when it appears next to its name, which is how it
-  arrives in a credentials file or an API response.
+  with no marker; a rule that catches it also catches passwords, hashes and git
+  SHAs. It is caught when it appears next to its name, which is how it arrives
+  in a credentials file or an API response. Claude Code's own detector has the
+  same limitation for the same reason.
+- **Masking is not confidentiality.** The bytes are still in the grid, in the
+  scrollback, and in the command history database. Someone with your machine
+  can read them; someone looking at your screen cannot.
 - Broad words like `password` and `token` are deliberately **not** in the
-  defaults. They would fire on the code you paste for review and damage it.
-- **Redaction is tied to `⌘V`.** A program that reads your clipboard itself
-  never goes through it — Claude Code's `Ctrl+V` image paste does exactly that,
-  through its own native clipboard module. Paste with `⌘V` and termit sees it;
-  paste with `Ctrl+V` and it does not.
-
-A program can also *ask* the terminal for your clipboard with `OSC 52 ?`.
-termit refuses, because that request needs no keystroke from you — text
-arriving on the terminal is enough to trigger it, so `cat`ing a hostile file
-would be enough to lift what you copied. Writing to the clipboard stays
-allowed: an agent inside a container has no other way to hand you something.
+  defaults. They would fire on ordinary code and turn it into bullets.
 
 **Dropping files.** Drag a file onto the window and its path is typed into
 the session, followed by a space, so several files dropped together line up as
@@ -402,12 +396,12 @@ restore_sessions = true     # rebuild the session list on the next start
 program = "/bin/zsh"
 args    = ["-l"]
 
-[paste]
-# Redact credentials on ⌘V. ⌥⌘V always pastes unchanged.
+[screen]
+# Mask credentials on screen. Display only: the pty still gets the real bytes.
 mask   = true
-# Each rule is a regex. The part named `secret` is what gets replaced, so the
-# name and the quotes around it survive; a rule with no `secret` group replaces
-# the whole match. A broken regex is reported at startup, not at paste time.
+# Each rule is a regex. The part named `secret` is what gets masked, so the name
+# and the quotes around it stay readable; a rule with no `secret` group masks the
+# whole match. A broken regex is reported at startup.
 redact = [
   '\b(?P<secret>(A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16})\b',
   '(?i)\b(?:AWS|GOOGLE|GCP|GCLOUD|AZURE)_\w*(?:SECRET|KEY|TOKEN|PASSWORD|CREDENTIAL)\w*\s*[=:]\s*"?(?P<secret>[^"\s,;]{8,})"?',
@@ -488,7 +482,7 @@ The detailed design record is in Japanese.
 - [`docs/superpowers/specs/2026-09-08-agent-terminal-design.md`](docs/superpowers/specs/2026-09-08-agent-terminal-design.md) — the specification
 - [`docs/performance.md`](docs/performance.md) — where the time actually goes, measured
 - [`docs/references/performance-techniques.md`](docs/references/performance-techniques.md) — techniques taken from other terminals, each marked adopted, rejected with the measurement, or still open
-- [`docs/references/paste.md`](docs/references/paste.md) — what iTerm2 does at the paste boundary, and which half of it termit took
+- [`docs/references/paste.md`](docs/references/paste.md) — where to mask a credential: why it moved from the paste boundary to the draw path, and what iTerm2 and Claude Code do at each
 - [`docs/references/agent-state.md`](docs/references/agent-state.md) — how other tools tell a working agent from one that is waiting for you, and which parts of that termit adopted
 - [`docs/references/sandbox.md`](docs/references/sandbox.md) — how agents are sandboxed elsewhere, what Apple's `container` measured at, and what termit deliberately leaves outside
 - [`docs/references/scrollback.md`](docs/references/scrollback.md) — how five other implementations handle scrollback, and which parts were copied

@@ -134,6 +134,7 @@ pub fn run(out_path: &str) {
         pending_since: None,
         needs_redraw: false,
         occluded: false,
+        redactor: crate::secret::Redactor::default(),
         state_dirty: false,
         state_saved_at: None,
         shown_title: String::new(),

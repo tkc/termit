@@ -19,16 +19,19 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
-    pub paste: PasteConfig,
+    pub screen: ScreenConfig,
     #[serde(default)]
     pub profile: BTreeMap<String, Profile>,
 }
 
-/// 貼り付けるときの扱い。
+/// 画面に出すときの扱い。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PasteConfig {
-    /// 認証情報らしき値を伏せてから貼り付けるか。
+pub struct ScreenConfig {
+    /// 認証情報らしき値を、画面の上で伏せるか。
+    ///
+    /// 伏せるのは見た目だけである。グリッドの中身も PTY へ流す値も本物のままなので、
+    /// `export AWS_SECRET_ACCESS_KEY=…` を貼れば普通に効く。
     #[serde(default = "default_mask")]
     pub mask: bool,
     /// 伏せる場所を指す式。`secret` と名付けた組があれば、そこだけを伏せる。
@@ -79,7 +82,7 @@ fn default_redact() -> Vec<String> {
     .collect()
 }
 
-impl Default for PasteConfig {
+impl Default for ScreenConfig {
     fn default() -> Self {
         Self {
             mask: default_mask(),
@@ -386,7 +389,7 @@ impl Config {
                 }
             }
         }
-        if let Err(e) = crate::secret::Redactor::new(&self.paste.redact) {
+        if let Err(e) = crate::secret::Redactor::new(&self.screen.redact) {
             return Err(ConfigError::Invalid(e.to_string()));
         }
         if self.agent.blocked_lines == 0 || self.agent.blocked_lines > 200 {
@@ -830,16 +833,16 @@ blocked_lines = 12
     }
 
     #[test]
-    fn readme_の_paste_設定を読める() {
+    fn readme_の_screen_設定を読める() {
         let toml = r#"
-[paste]
+[screen]
 mask = true
 redact = ['(?P<secret>AKIA[0-9A-Z]{16})']
 "#;
         let c: Config = toml::from_str(toml).unwrap();
         c.validate().unwrap();
-        assert!(c.paste.mask);
-        assert_eq!(c.paste.redact.len(), 1);
+        assert!(c.screen.mask);
+        assert_eq!(c.screen.redact.len(), 1);
     }
 
     /// README に載せた式と、実際に配る既定値がずれていないこと。
@@ -850,33 +853,33 @@ redact = ['(?P<secret>AKIA[0-9A-Z]{16})']
     fn readme_の式は既定値と同じ() {
         let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
             .expect("README を読める");
-        // 本文にも `[paste]` と書いてあるので、行として独立したものだけを拾う。
+        // 本文にも `[screen]` と書いてあるので、行として独立したものだけを拾う。
         let block = readme
-            .split("\n[paste]\n")
+            .split("\n[screen]\n")
             .nth(1)
             .and_then(|s| s.split_once("redact = ["))
             // 式の中にも `]` が出るので、行頭の `]` を表の終わりとする。
             .map(|(_, rest)| rest.split_once("\n]").expect("表が閉じている").0)
-            .expect("README に [paste] の例がある");
+            .expect("README に [screen] の例がある");
         let listed: Vec<String> = block
             .lines()
             .map(str::trim)
             .filter(|l| l.starts_with('\''))
             .map(|l| l.trim_end_matches(',').trim_matches('\'').to_string())
             .collect();
-        assert_eq!(listed, PasteConfig::default().redact);
+        assert_eq!(listed, ScreenConfig::default().redact);
     }
 
     /// 壊れた式は起動時に断る。貼り付けてから気づくのでは遅い。
     #[test]
     fn 壊れた式のある設定を拒む() {
         let toml = r#"
-[paste]
+[screen]
 redact = ["[unclosed"]
 "#;
         let c: Config = toml::from_str(toml).unwrap();
         let e = c.validate().unwrap_err();
-        assert!(format!("{e}").contains("paste.redact[0]"), "{e}");
+        assert!(format!("{e}").contains("screen.redact[0]"), "{e}");
     }
 
     #[test]
