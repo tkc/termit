@@ -1,20 +1,23 @@
-//! 貼り付ける文字列から、認証情報らしき値を伏せる。
+//! 画面に出す文字列のうち、認証情報らしき値の位置を返す。
 //!
-//! 何を伏せるかは設定（`[paste] redact`）にある。ここにあるのは
+//! 伏せるのは**見た目だけ**である。グリッドの中身も、PTY へ流れる値も
+//! 本物のままなので、`export AWS_SECRET_ACCESS_KEY=…` を貼れば普通に効く。
+//! 肩越しの視線・画面共有・スクリーンショット・遡った画面から消えるだけである。
+//!
+//! 何を伏せるかは設定（`[screen] redact`）にある。ここにあるのは
 //! 「式に当てはめて、`secret` と名付けた部分を置き換える」という手続きだけで、
 //! AWS や Google の鍵の形は 1 つも書かれていない。相手の形が変われば設定を直す。
 //!
-//! iTerm2 も同じ考え方で、貼り付けに正規表現の置換を持たせている
-//! （`iTermPasteHelper.m` の `sanitizePasteEvent:`）。違いは、あちらが
-//! 道具だけを配るのに対し、termit は既定の式を持つことである。
-//! 道具だけ配っても、書く人がいなければ誰も守られない。
+//! Claude Code も同じことをしている。実行ファイルの中の `redactForDisplay` は、
+//! 確信度 `high` の規則だけを使う。人が読む画面では、誤検知のほうが害だからである
+//! （出ていくデータには広い規則も併せて使う）。termit の既定の式もその `high` 相当に絞る。
 
-use regex::{Captures, Regex};
+use std::ops::Range;
 
-/// 伏せた跡に置く文字列。
-///
-/// 読む側（エージェント）に「消されている」と分かる形にする。
-/// 伏せ字だけだと、その文字が値そのものだと解釈されることがある。
+use regex::Regex;
+
+/// 試験で伏せた跡に置く文字列。画面では `MASK_CHAR` を 1 コマずつ置く。
+#[cfg(test)]
 const REDACTED: &str = "[redacted]";
 
 /// 設定の式をまとめて持つ。起動時に 1 度だけ組み立てる。
@@ -36,7 +39,7 @@ impl std::fmt::Display for BadPattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "paste.redact[{}] is not a valid regex: {}\n  {}",
+            "screen.redact[{}] is not a valid regex: {}\n  {}",
             self.index, self.pattern, self.message
         )
     }
@@ -66,46 +69,67 @@ impl Redactor {
         self.rules.is_empty()
     }
 
-    /// 伏せた文字列と、伏せた件数を返す。
+    /// 伏せる範囲を、バイトの位置で返す。重なりは畳んで、前から順に並べる。
     ///
-    /// 式に `secret` という名前の組があれば、**その部分だけ**を置き換える。
-    /// 名前や引用符は残るので、貼り付けた先には形が伝わる。
-    /// 組が無ければ、当たった全体を置き換える。
-    pub fn redact(&self, text: &str) -> (String, usize) {
-        let mut out = text.to_string();
-        let mut hits = 0usize;
-        for re in &self.rules {
-            out = re
-                .replace_all(&out, |caps: &Captures| {
-                    let whole = caps.get(0).expect("当たり全体は必ずある");
-                    let (from, to) = match caps.name("secret") {
-                        Some(m) => (m.start() - whole.start(), m.end() - whole.start()),
-                        None => (0, whole.len()),
-                    };
-                    let s = whole.as_str();
-                    // 既に伏せてあるものを数え直さない。式は重なることがあり
-                    // （`AWS_SECRET…=AKIA…` は語頭の式と名前の式の両方に当たる）、
-                    // そのたびに数えると「2 件伏せた」と嘘の件数が出る。
-                    if &s[from..to] == REDACTED {
-                        return s.to_string();
-                    }
-                    hits += 1;
-                    format!("{}{REDACTED}{}", &s[..from], &s[to..])
-                })
-                .into_owned();
+    /// 式に `secret` という名前の組があれば**その部分だけ**を指す。
+    /// 名前や引用符は画面に残るので、何が伏せてあるのかは読み取れる。
+    /// 組が無ければ、当たった全体を指す。
+    pub fn spans(&self, text: &str) -> Vec<Range<usize>> {
+        if self.rules.is_empty() || text.is_empty() {
+            return Vec::new();
         }
-        (out, hits)
+        let mut out: Vec<Range<usize>> = Vec::new();
+        for re in &self.rules {
+            for caps in re.captures_iter(text) {
+                let m = match caps.name("secret") {
+                    Some(m) => m,
+                    None => caps.get(0).expect("当たり全体は必ずある"),
+                };
+                if m.start() < m.end() {
+                    out.push(m.start()..m.end());
+                }
+            }
+        }
+        if out.len() > 1 {
+            // 式どうしは重なる（`AWS_SECRET…=AKIA…` は語頭の式にも変数名の式にも当たる）。
+            // 畳んでおかないと、描く側が同じコマを二度見ることになる。
+            out.sort_by_key(|r| (r.start, r.end));
+            let mut merged: Vec<Range<usize>> = Vec::with_capacity(out.len());
+            for r in out {
+                match merged.last_mut() {
+                    Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                    _ => merged.push(r),
+                }
+            }
+            return merged;
+        }
+        out
+    }
+
+    /// 伏せた文字列を組み立てる。読みやすさのため、試験でだけ使う。
+    #[cfg(test)]
+    pub fn redact(&self, text: &str) -> (String, usize) {
+        let spans = self.spans(text);
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0usize;
+        for r in &spans {
+            out.push_str(&text[at..r.start]);
+            out.push_str(REDACTED);
+            at = r.end;
+        }
+        out.push_str(&text[at..]);
+        (out, spans.len())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PasteConfig;
+    use crate::config::ScreenConfig;
 
     /// 既定の式で試す。設定の既定値そのものが正しいことを確かめたい。
     fn default_redactor() -> Redactor {
-        Redactor::new(&PasteConfig::default().redact).expect("既定の式は組み立てられる")
+        Redactor::new(&ScreenConfig::default().redact).expect("既定の式は組み立てられる")
     }
 
     #[test]
@@ -258,18 +282,6 @@ mod tests {
         assert_eq!(n, 1, "1 つの秘密は 1 件と数える");
     }
 
-    /// 二度通しても結果が変わらず、二度目は 0 件であること。
-    #[test]
-    fn 二度伏せても変わらない() {
-        let r = default_redactor();
-        let (once, n1) =
-            r.redact("aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
-        let (twice, n2) = r.redact(&once);
-        assert_eq!(once, twice);
-        assert_eq!(n1, 1);
-        assert_eq!(n2, 0);
-    }
-
     #[test]
     fn 式が無ければ素通りする() {
         let r = Redactor::new(&[]).unwrap();
@@ -281,6 +293,31 @@ mod tests {
     }
 
     /// `secret` の組が無い式は、当たり全体を伏せる。
+    /// 重なった式は畳んでから返すこと。描く側が同じコマを二度見ない。
+    #[test]
+    fn 重なった範囲を畳む() {
+        let r = default_redactor();
+        // 語頭の式にも、変数名の式にも当たる行。
+        let spans = r.spans("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let s = &spans[0];
+        assert_eq!(
+            &"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"[s.clone()],
+            "AKIAIOSFODNN7EXAMPLE"
+        );
+    }
+
+    /// 範囲は前から順に並ぶこと。描く側が走査しながら使える。
+    #[test]
+    fn 範囲は前から順に並ぶ() {
+        let r = default_redactor();
+        let text = "a AKIAIOSFODNN7EXAMPLE b AIzaSyD_abcdefghijklmnopqrstuvwxyz01234 c";
+        let spans = r.spans(text);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert!(spans[0].end <= spans[1].start);
+        assert_eq!(&text[spans[0].clone()], "AKIAIOSFODNN7EXAMPLE");
+    }
+
     #[test]
     fn 組の無い式は当たり全体を伏せる() {
         let r = Redactor::new(&[r"hunter2".to_string()]).unwrap();
@@ -294,6 +331,6 @@ mod tests {
     fn 壊れた式は場所を言って断る() {
         let e = Redactor::new(&["ok".to_string(), "[unclosed".to_string()]).unwrap_err();
         assert_eq!(e.index, 1);
-        assert!(e.to_string().contains("paste.redact[1]"), "{e}");
+        assert!(e.to_string().contains("screen.redact[1]"), "{e}");
     }
 }

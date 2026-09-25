@@ -127,10 +127,10 @@ fn main() {
         }
     };
 
-    // 貼り付けで伏せる式は、ここで 1 度だけ組み立てる。
+    // 画面で伏せる式は、ここで 1 度だけ組み立てる。
     // 設定の検査も同じものを通しているので、ここまで来れば必ず成功する。
-    let redactor = match secret::Redactor::new(&config.paste.redact) {
-        Ok(r) if config.paste.mask => r,
+    let redactor = match secret::Redactor::new(&config.screen.redact) {
+        Ok(r) if config.screen.mask => r,
         // 伏せない設定なら、式を持たない。判定そのものが走らなくなる。
         Ok(_) => secret::Redactor::default(),
         Err(e) => {
@@ -156,7 +156,7 @@ fn main() {
             .then(Counters::default),
         resize_quiet_since: None,
         agent_state_at: None,
-        redactor,
+        redactor_seed: redactor,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("termit: {e}");
@@ -304,6 +304,8 @@ pub(crate) struct State {
     needs_redraw: bool,
     /// 窓が完全に隠れているか。隠れているあいだは組み立てもしない。
     occluded: bool,
+    /// 画面で伏せる式。起動時に 1 度だけ組み立てる。
+    pub(crate) redactor: crate::secret::Redactor,
     /// セッションの並びが変わった。少し置いてから書き出す。
     state_dirty: bool,
     /// 最後に書き出した時刻。
@@ -432,8 +434,8 @@ struct App {
     resize_quiet_since: Option<std::time::Instant>,
     /// 返事待ちを最後に調べた時刻。毎フレーム画面を読まないための間隔。
     agent_state_at: Option<std::time::Instant>,
-    /// 貼り付けで伏せる式。起動時に 1 度だけ組み立てる。
-    redactor: crate::secret::Redactor,
+    /// 画面を作るときに State へ渡す式。組み立ては起動時に済ませてある。
+    redactor_seed: crate::secret::Redactor,
 }
 
 /// 画面の割り付け。すべてセル単位で扱う。
@@ -521,6 +523,7 @@ impl ApplicationHandler<UiEvent> for App {
             pending_since: None,
             needs_redraw: false,
             occluded: false,
+            redactor: std::mem::take(&mut self.redactor_seed),
             state_dirty: false,
             state_saved_at: None,
             shown_title: String::new(),
@@ -1033,27 +1036,11 @@ impl App {
                 }
             }
             Action::Paste => {
-                if let Some(text) = clipboard::paste() {
-                    // 認証情報らしき値を伏せてから渡す。伏せたことは必ず出す。
-                    // 黙って書き換えると、貼ったものが違う理由が分からない。
-                    // 伏せない設定なら、大きなクリップボードを写し取らない。
-                    let (text, hits) = if self.redactor.is_empty() {
-                        (text, 0)
-                    } else {
-                        self.redactor.redact(&text)
-                    };
-                    if let Some(s) = state.manager.selected() {
-                        let mode = *s.term.lock().mode();
-                        s.pty.write(bracketed(&text, mode));
-                    }
-                    state.status = (hits > 0).then(|| redacted_notice(hits));
-                }
-            }
-            Action::PasteRaw => {
+                // 貼り付けは素通しである。認証情報は画面の上で伏せるだけで、
+                // PTY へは本物が流れる。`export AWS_SECRET_ACCESS_KEY=…` は普通に効く。
                 if let (Some(s), Some(text)) = (state.manager.selected(), clipboard::paste()) {
                     let mode = *s.term.lock().mode();
                     s.pty.write(bracketed(&text, mode));
-                    state.status = None;
                 }
             }
             Action::ClearScreen => {
@@ -1204,6 +1191,59 @@ fn hyperlink_at(state: &mut State, layout: &Layout) -> Option<HoveredLink> {
         id: None,
         span: Some(span),
     })
+}
+
+/// 画面の上で伏せる文字。丸 1 つで 1 コマ。
+///
+/// 同じ幅のものに置き換える。桁がずれると、全画面 UI の枠線が崩れる。
+const MASK_CHAR: char = '\u{2022}';
+
+/// 画面のうち、伏せるコマの位置を返す。鍵は履歴を含む行番号と桁。
+///
+/// 行ごとに文字を組み立てて式に当て、当たったバイトの範囲を桁へ直す。
+/// 認証情報は「名前と値」の形で行として現れるので、1 コマずつでは判定できない。
+fn masked_cells(
+    term: &alacritty_terminal::Term<crate::term::EventProxy>,
+    display_offset: usize,
+    rows: usize,
+    cols: usize,
+    redactor: &crate::secret::Redactor,
+) -> std::collections::HashSet<(i32, usize)> {
+    use alacritty_terminal::grid::Dimensions;
+    let mut out = std::collections::HashSet::new();
+    if redactor.is_empty() {
+        return out;
+    }
+    let grid = term.grid();
+    let cols = grid.columns().min(cols);
+    // 見えている行だけを見る。遡っていれば、その位置の行になる。
+    let first = -(display_offset as i32);
+    for row in 0..rows.min(grid.screen_lines()) {
+        let line = first + row as i32;
+        let grid_line = alacritty_terminal::index::Line(line);
+        let mut text = String::with_capacity(cols);
+        // バイトの位置から桁へ戻すための対応表。
+        let mut at: Vec<usize> = Vec::with_capacity(cols + 1);
+        for col in 0..cols {
+            let cell = &grid[grid_line][alacritty_terminal::index::Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            for _ in 0..cell.c.len_utf8() {
+                at.push(col);
+            }
+            text.push(cell.c);
+        }
+        at.push(cols);
+        for span in redactor.spans(&text) {
+            let from = at.get(span.start).copied().unwrap_or(cols);
+            let to = at.get(span.end).copied().unwrap_or(cols);
+            for col in from..to.min(cols) {
+                out.insert((line, col));
+            }
+        }
+    }
+    out
 }
 
 /// 表示行を画面の何行目かに直す。範囲の外なら `None`。
@@ -2061,12 +2101,6 @@ mod sidebar {
 /// 文字を使う。全画面 UI は選んだ行を書き直した時点で選択を捨てるため、
 /// これが無いと、選べているのに何も写らないという形になる。
 /// 控えは持ち主のセッションでだけ使う。
-/// 伏せたことを知らせる文。⌥⌘V が逃げ道であることも併せて出す。
-fn redacted_notice(hits: usize) -> String {
-    let what = if hits == 1 { "secret" } else { "secrets" };
-    format!("pasted with {hits} {what} redacted — ⌥⌘V pastes it unchanged")
-}
-
 fn copy_text(
     live: Option<String>,
     picked: Option<&(crate::session::SessionId, String)>,
@@ -2535,6 +2569,15 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
     let mut drawn_rows = std::collections::HashSet::new();
     // 指しているリンクは、押せることが分かるよう下線を引く。
     let hovered = state.hovered_link.clone();
+    // 伏せるコマを先に出しておく。1 コマずつ式に当てることはできない。
+    // 認証情報は「名前と値」のように行として現れるので、行ごとに見る。
+    let masked = masked_cells(
+        &term,
+        display_offset,
+        layout.term_rows,
+        layout.term_cols,
+        &state.redactor,
+    );
 
     for indexed in content.display_iter {
         let cell = indexed.cell;
@@ -2595,6 +2638,13 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
             continue;
         }
         drawn_rows.insert(row);
+        // 伏せるコマは、同じ幅の丸に置き換える。桁がずれると全画面 UI が崩れる。
+        // 置き換えるのは描くものだけで、グリッドの中身は本物のままである。
+        let c = if masked.contains(&(line, col)) {
+            MASK_CHAR
+        } else {
+            cell.c
+        };
         let x = layout.term_col + col;
         let span = if wide { 2 } else { 1 };
         let span = span.min(layout.term_cols.saturating_sub(col)).max(1);
@@ -2604,7 +2654,7 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         state.renderer.put_char(
             x,
             row,
-            cell.c,
+            c,
             fg,
             cell.flags.contains(Flags::BOLD),
             cell.flags.contains(Flags::ITALIC),
@@ -2962,6 +3012,150 @@ mod tests {
 
     fn now() -> std::time::Instant {
         std::time::Instant::now()
+    }
+
+    /// 画面の上で伏せるコマを、行から正しく割り出せること。
+    ///
+    /// バイトの位置を桁へ戻すところが要である。全角が混ざると両者はずれる。
+    mod 伏せる位置 {
+        use super::*;
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line as GLine};
+        use alacritty_terminal::vte::ansi::Processor;
+        use std::sync::mpsc::channel;
+
+        fn term_of(script: &[u8]) -> alacritty_terminal::Term<crate::term::EventProxy> {
+            let (tx, _rx) = channel();
+            let (ptx, _prx) = channel();
+            let ws = std::sync::Arc::new(alacritty_terminal::sync::FairMutex::new(
+                alacritty_terminal::event::WindowSize {
+                    num_lines: 6,
+                    num_cols: 80,
+                    cell_width: 8,
+                    cell_height: 16,
+                },
+            ));
+            let proxy =
+                crate::term::EventProxy::new(1, ptx, crate::term::UiSender::Channel(tx), ws);
+            let mut term = crate::term::new_term(crate::term::TermSize::new(80, 6), 50, proxy);
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut term, script);
+            term
+        }
+
+        /// 伏せた結果を、目で読める 1 行にする。
+        fn shown(script: &[u8]) -> String {
+            let term = term_of(script);
+            let r = crate::secret::Redactor::new(&crate::config::ScreenConfig::default().redact)
+                .expect("既定の式は組み立てられる");
+            let masked = masked_cells(&term, 0, 6, 80, &r);
+            let grid = term.grid();
+            let mut out = String::new();
+            for col in 0..grid.columns() {
+                let cell = &grid[GLine(0)][Column(col)];
+                // 全角の 2 桁目は詰め物である。読める形にするため飛ばす。
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                out.push(if masked.contains(&(0, col)) {
+                    MASK_CHAR
+                } else {
+                    cell.c
+                });
+            }
+            out.trim_end().to_string()
+        }
+
+        #[test]
+        #[ignore]
+        fn 計測_伏せる位置の費用() {
+            // 現実に近い画面：47 行 x 163 桁、ところどころに認証情報。
+            let mut script = Vec::new();
+            for i in 0..47 {
+                if i % 8 == 3 {
+                    script.extend_from_slice(
+                        b"export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                    );
+                } else {
+                    script.extend_from_slice(
+                        b"    let mut out = String::with_capacity(text.len()); // fill the row with code",
+                    );
+                }
+                script.extend_from_slice(b"\r\n");
+            }
+            let (tx, _rx) = channel();
+            let (ptx, _prx) = channel();
+            let ws = std::sync::Arc::new(alacritty_terminal::sync::FairMutex::new(
+                alacritty_terminal::event::WindowSize {
+                    num_lines: 47,
+                    num_cols: 163,
+                    cell_width: 8,
+                    cell_height: 17,
+                },
+            ));
+            let proxy =
+                crate::term::EventProxy::new(1, ptx, crate::term::UiSender::Channel(tx), ws);
+            let mut term = crate::term::new_term(crate::term::TermSize::new(163, 47), 100, proxy);
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut term, &script);
+            let r = crate::secret::Redactor::new(&crate::config::ScreenConfig::default().redact)
+                .unwrap();
+
+            for _ in 0..20 {
+                let _ = masked_cells(&term, 0, 47, 163, &r);
+            }
+            let mut ts = Vec::new();
+            for _ in 0..100 {
+                let t = std::time::Instant::now();
+                let m = masked_cells(&term, 0, 47, 163, &r);
+                ts.push(t.elapsed().as_secs_f64() * 1000.0);
+                assert!(!m.is_empty());
+            }
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "47 行 x 163 桁: 中央 {:.3}ms  p90 {:.3}ms  最大 {:.3}ms",
+                ts[50], ts[90], ts[99]
+            );
+        }
+
+        #[test]
+        fn 値だけを伏せ_名前は残す() {
+            let line =
+                shown(b"export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+            assert!(line.starts_with("export AWS_SECRET_ACCESS_KEY="), "{line}");
+            assert!(!line.contains("wJalr"), "{line}");
+            assert_eq!(
+                line.matches(MASK_CHAR).count(),
+                40,
+                "値の桁数だけ伏せる: {line}"
+            );
+        }
+
+        /// 全角が前にあると、バイトの位置と桁がずれる。
+        /// ずれたまま使うと、値ではなく別の場所を消してしまう。
+        #[test]
+        fn 全角があっても位置がずれない() {
+            let line = shown("鍵は AKIAIOSFODNN7EXAMPLE です".as_bytes());
+            assert!(line.starts_with("鍵は "), "{line}");
+            assert!(line.ends_with(" です"), "{line}");
+            assert!(!line.contains("AKIA"), "{line}");
+            assert_eq!(line.matches(MASK_CHAR).count(), 20, "{line}");
+        }
+
+        #[test]
+        fn 秘密でない行は触らない() {
+            assert_eq!(
+                shown(b"export AWS_REGION=us-east-1"),
+                "export AWS_REGION=us-east-1"
+            );
+        }
+
+        #[test]
+        fn 式が無ければ何も伏せない() {
+            let term = term_of(b"AKIAIOSFODNN7EXAMPLE");
+            let off = crate::secret::Redactor::default();
+            assert!(masked_cells(&term, 0, 6, 80, &off).is_empty());
+        }
     }
 
     #[test]
