@@ -176,6 +176,8 @@ impl Default for Ticks {
 /// 範囲を絞った中のスクロール）を数えてしまうこともない。
 /// 達していれば差が出ないので、行ごとの道で数えたほうを答えにする。行ごとに
 /// 数えるのは、改行・NEL・SU・行削除・画面消去（ED 2）・行末のタブである。
+/// 同じ読みがスクロールバックを捨てた（ED 3）ときも差が出ないので、そこでも
+/// 行ごとの道を採る。
 ///
 /// 上限に達してからは、数え漏らしと数え過ぎが残る。行ごとの道は画面の形しか
 /// 見ていないからである。
@@ -189,6 +191,14 @@ impl Default for Ticks {
 ///   `scroll_region.end` で、履歴が伸びるのは `region.start == 0` のときだけである。
 ///   `scroll_up` は画面の高さで、`delete_lines` はカーソルが 0 行目かどうかで、
 ///   `folds` は範囲を見ずに数える。範囲は `Term` の外から読めないので追えない。
+///   同じ読みが上限を跨ぐか履歴を捨てるかしたときは、差のほうを採れないので、
+///   この多めに数えた `hooked` がそのまま答えになる。
+/// - ED 3 でスクロールバックを捨てた読みは、差がこの読みの押し出しを表さないので
+///   行ごとの道へ落ちる。消えた行はもう引かれないが、押し出した数を捨てると
+///   その後の通し番号がそのぶん低く出てしまうので、数えたほうは残す。
+///   履歴を捨てる道はほかに RIS（`\x1bc`）が有り、こちらは印を付けていない。
+///   始めた時点の履歴が 0 でない限り差が縮むので捕まるが、同じ読みで押し出して
+///   から RIS したときは数えを落とす。`reset` を打つ場面しかないので置いてある。
 /// - `Term::resize` の折り返し直しは行の位置を動かすので、大きさを変えると
 ///   古い通し番号は少しずれる。
 pub struct Counting<'a> {
@@ -202,6 +212,12 @@ pub struct Counting<'a> {
     hooked: u64,
     /// 始めた時点のカーソル行。この読みが作る行はここから始まる。
     start_line: i32,
+    /// この読みのあいだにスクロールバックが捨てられた（ED 3）。
+    ///
+    /// 履歴行数の差がこの読みの押し出しを表さなくなる。始めた時点の履歴が 0 でも
+    /// （この読みが押し出してから消した）差は 0 になるので、`after < before` では
+    /// 捕まらない。捨てた瞬間に印を付けておく。
+    dropped: bool,
 }
 
 impl<'a> Counting<'a> {
@@ -218,6 +234,7 @@ impl<'a> Counting<'a> {
             cap,
             hooked: 0,
             start_line,
+            dropped: false,
         }
     }
 
@@ -239,7 +256,13 @@ impl<'a> Counting<'a> {
             Some(before) if !self.alt() => {
                 let after = self.history();
                 let delta = after.saturating_sub(before) as u64;
-                if after >= self.cap {
+                if self.dropped || after < before {
+                    // スクロールバックが捨てられた（ED 3）か、ほかの理由で履歴が
+                    // 縮んだ。どちらも差はこの読みの押し出しを表さないので、行ごとに
+                    // 数えたほうを採る。消えた行はもう引かれないが、押し出した数を
+                    // 捨てると、この読みより後の行の通し番号がそのぶん低く出てしまう。
+                    delta.max(self.hooked)
+                } else if after >= self.cap {
                     // この 1 回で上限に届いた。届いたあとの押し出しは差に出ない。
                     // 1 回の読みは 64KB まで入るので、改行だけなら何千行にもなる。
                     delta.max(self.hooked)
@@ -354,6 +377,11 @@ impl Handler for Counting<'_> {
         } else {
             0
         };
+        // ED 3 は履歴を丸ごと捨てる（`Term` は履歴が有るときだけ捨てる）。
+        // 捨てられたら、この読みの数え上げは差からは出せない。
+        if matches!(mode, ClearMode::Saved) && self.history() > 0 {
+            self.dropped = true;
+        }
         self.counted(lines, |term| term.clear_screen(mode));
     }
 
@@ -537,6 +565,31 @@ mod tests {
         let (pushed, history) = feed(20, 4, 100, &script);
         assert_eq!(pushed, 4);
         assert_eq!(history, 4);
+    }
+
+    #[test]
+    fn スクロールバックを消した読みの数えを捨てない() {
+        // 4 行の画面に 10 行流して 6 行押し出し、同じ読みでスクロールバックを
+        // 消す。履歴が 0 に戻るので差は出ないが、押し出した 6 行は数えたままに
+        // する。`clear` は terminfo の E3 が有れば必ずこれを出すので、毎日通る道
+        // である。捨てると、その読みより後の行の通し番号が 6 低く出る。
+        let mut script = plain_lines(10);
+        script.extend(b"\x1b[3J");
+        let (pushed, history) = feed(20, 4, 100, &script);
+        assert_eq!(pushed, 6, "消す前に押し出した 6 行を捨てない");
+        assert_eq!(history, 0, "スクロールバックは消えている");
+    }
+
+    #[test]
+    fn 前の読みの履歴を消しても数えは残る() {
+        // 1 つめの読みで 6 行押し出し、2 つめの読みが 3 行押し出してから消す。
+        // 履歴行数は 6 から 0 へ縮むので、差は負になる。総数は 9 のままである。
+        let first = plain_lines(10);
+        let mut second = b"\r\n\r\n\r\n".to_vec();
+        second.extend(b"\x1b[3J");
+        let (pushed, history) = feed_reads(20, 4, 100, &[&first, &second]);
+        assert_eq!(pushed, 9, "両方の読みの押し出しが残る");
+        assert_eq!(history, 0, "スクロールバックは消えている");
     }
 
     #[test]
