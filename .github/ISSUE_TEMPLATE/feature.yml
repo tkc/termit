@@ -1,0 +1,27 @@
+name: ほしい機能
+description: できるようにしたいこと
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        思いついた時点で 1 行だけでも構いません。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 困っていること
+      description: 解決策ではなく、困りごとのほうを書きます。作り方は消化するときに決めます。
+      placeholder: エージェントが 6 本動いていると、どれが返事待ちか分からない
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 端末の仕事か
+      description: |
+        termit は「プロセスを起こす・PTY を中継する・エスケープ列を解釈する・描く」までを担います。
+        迷ったら「わからない」で構いません。消化するときに一緒に考えます。
+      options:
+        - 端末の仕事だと思う
+        - 端末の外でもできるかもしれない
+        - わからない

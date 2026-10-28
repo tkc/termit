@@ -482,6 +482,7 @@ The detailed design record is in Japanese.
 - [`docs/superpowers/specs/2026-09-08-agent-terminal-design.md`](docs/superpowers/specs/2026-09-08-agent-terminal-design.md) — the specification
 - [`docs/performance.md`](docs/performance.md) — where the time actually goes, measured
 - [`docs/references/performance-techniques.md`](docs/references/performance-techniques.md) — techniques taken from other terminals, each marked adopted, rejected with the measurement, or still open
+- [`docs/issue-workflow.md`](docs/issue-workflow.md) — collecting work as issues during the day and clearing them in one sitting
 - [`docs/references/paste.md`](docs/references/paste.md) — where to mask a credential: why it moved from the paste boundary to the draw path, and what iTerm2 and Claude Code do at each
 - [`docs/references/agent-state.md`](docs/references/agent-state.md) — how other tools tell a working agent from one that is waiting for you, and which parts of that termit adopted
 - [`docs/references/sandbox.md`](docs/references/sandbox.md) — how agents are sandboxed elsewhere, what Apple's `container` measured at, and what termit deliberately leaves outside
