@@ -17,6 +17,7 @@ mod probe;
 mod pty;
 mod rect;
 mod render;
+mod scan;
 mod search;
 mod secret;
 mod session;

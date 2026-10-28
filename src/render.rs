@@ -8,6 +8,7 @@
 //! 全角文字が別のフォントへ落ちたときに以降の桁がずれる。
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use alacritty_terminal::vte::ansi::Rgb;
@@ -609,6 +610,52 @@ impl Renderer {
         }
     }
 
+    /// 幅に収まるよう、当たりを残して前後から落とす。落とした側に省略記号を付ける。
+    ///
+    /// `hit` は `text` の**バイト**位置。返す範囲は、返す文字列の中での当たりの
+    /// **バイト**位置で、先頭の省略記号のぶんだけずれる。当たりが残せる幅より
+    /// 長ければ、収まる分だけに切って返す。
+    // 呼ぶのは結果の行を描く仕事。それまで読み手がいない。
+    #[allow(dead_code)]
+    pub fn fit_center(
+        &mut self,
+        text: &str,
+        style: TextStyle,
+        max_px: f32,
+        hit: Range<usize>,
+    ) -> (String, Range<usize>) {
+        if max_px <= 0.0 || text.is_empty() {
+            return (String::new(), 0..0);
+        }
+        let full = self.measure_px(text, style);
+        if full <= max_px {
+            return (text.to_string(), hit);
+        }
+        let chars: Vec<char> = text.chars().collect();
+        // 文字の添字からバイト位置への表。末尾の次も持つ。
+        let mut byte_at: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        byte_at.push(text.len());
+        // バイト位置を文字の添字へ直す。窓の計算は文字の添字で行う。
+        let hit_chars = text[..hit.start].chars().count()..text[..hit.end].chars().count();
+        let mut keep = ((chars.len() as f32) * (max_px / full)).floor() as usize;
+        keep = keep.min(chars.len().saturating_sub(1));
+        loop {
+            let candidate = build_window(text, &chars, &byte_at, &hit_chars, &hit, keep);
+            if self.measure_px(&candidate.0, style) <= max_px || keep == 0 {
+                // もう 1 文字入るなら入れる。
+                if keep + 1 < chars.len() {
+                    let more = build_window(text, &chars, &byte_at, &hit_chars, &hit, keep + 1);
+                    if self.measure_px(&more.0, style) <= max_px {
+                        keep += 1;
+                        continue;
+                    }
+                }
+                return candidate;
+            }
+            keep -= 1;
+        }
+    }
+
     /// その大きさの 1 行の高さ。
     pub fn line_height_px(&self, size_pt: f32) -> f32 {
         (size_pt * self.scale * 1.30).round()
@@ -1114,6 +1161,35 @@ fn build(chars: &[char], keep: usize, drop_tail: bool) -> String {
     }
 }
 
+/// 当たりを中心に `keep` 字を残し、落とした側に省略記号を付ける。
+///
+/// `hit_chars` は文字の添字、`hit` は `text` のバイト位置。戻りの範囲は
+/// 組み立てた文字列のバイト位置で、残した窓に収まる分に切ってある。
+#[allow(dead_code)]
+fn build_window(
+    text: &str,
+    chars: &[char],
+    byte_at: &[usize],
+    hit_chars: &Range<usize>,
+    hit: &Range<usize>,
+    keep: usize,
+) -> (String, Range<usize>) {
+    let (win, head, tail) = crate::scan::window_around(chars, hit_chars.clone(), keep);
+    let (from, to) = (byte_at[win.start], byte_at[win.end]);
+    let mut s = String::new();
+    if head {
+        s.push('…');
+    }
+    let shift = s.len();
+    s.push_str(&text[from..to]);
+    if tail {
+        s.push('…');
+    }
+    let start = hit.start.clamp(from, to) - from + shift;
+    let end = hit.end.clamp(from, to) - from + shift;
+    (s, start..end)
+}
+
 fn rgba(c: Rgb, a: f32) -> [f32; 4] {
     [
         c.r as f32 / 255.0,
@@ -1158,7 +1234,7 @@ fn has_family(fs: &FontSystem, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_cols, GlyphCache, GlyphKey, STYLES};
+    use super::{build_window, char_cols, GlyphCache, GlyphKey, STYLES};
 
     #[test]
     fn 全角文字は二桁を占める() {
@@ -1211,5 +1287,19 @@ mod tests {
                 assert!(i < cache.ascii.len(), "{c} の位置 {i} が範囲内");
             }
         }
+    }
+
+    #[test]
+    fn 当たりを残した文字列では省略記号のぶんだけ当たりの位置がずれる() {
+        let text = "あいうえお SES かきくけこ";
+        let chars: Vec<char> = text.chars().collect();
+        let mut byte_at: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        byte_at.push(text.len());
+        let hit = text.find("SES").unwrap();
+        let hit = hit..hit + 3;
+        let hit_chars = 6..9;
+        let (s, range) = build_window(text, &chars, &byte_at, &hit_chars, &hit, 7);
+        assert!(s.starts_with('…') && s.ends_with('…'));
+        assert_eq!(&s[range], "SES");
     }
 }
