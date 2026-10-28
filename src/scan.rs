@@ -133,16 +133,22 @@ impl Default for Limits {
     }
 }
 
+/// 打った語から `find_hit` に渡す針を作る。
+///
+/// 針も 1 文字ずつ小文字にする。`find_hit` は干し草を `char::to_lowercase` で
+/// 小文字にするので、こちらだけ `str::to_lowercase` を使うと食い違う。
+/// ギリシャ語の語末シグマがそれで、`str` は語末の 'Σ' を 'ς' にするが
+/// `char` は必ず 'σ' にする。打った語が黙って当たらなくなる。
+pub fn needle(query: &str) -> String {
+    query.chars().flat_map(char::to_lowercase).collect()
+}
+
 /// 全セッションのスクロールバックを、新しい方から探す。
 ///
 /// 走るのは別スレッドである（仕様 §10）。1 フレームの余白は 0.3ms ほどしかなく、
 /// 10000 行の走査はそこに入らない。
 pub fn scan(targets: &[Target], query: &str, redactor: &Redactor, limits: Limits) -> Vec<Hit> {
-    // 針も 1 文字ずつ小文字にする。`find_hit` は干し草を `char::to_lowercase` で
-    // 小文字にするので、こちらだけ `str::to_lowercase` を使うと食い違う。
-    // ギリシャ語の語末シグマがそれで、`str` は語末の 'Σ' を 'ς' にするが
-    // `char` は必ず 'σ' にする。打った語が黙って当たらなくなる。
-    let needle: String = query.chars().flat_map(char::to_lowercase).collect();
+    let needle = needle(query);
     if needle.trim().is_empty() {
         return Vec::new();
     }
@@ -346,7 +352,11 @@ pub fn row_text(
 /// 当たった行だけ伏せ字を通し、伏せたあとの文字列でもう一度探す。鍵の中にしか
 /// ない当たりはここで消える。端末で `••••` に見えている鍵が、結果の一覧に
 /// 素のまま出ることはない（仕様 §6）。
-fn matched(redactor: &Redactor, text: &str, needle: &str) -> Option<(String, Range<usize>)> {
+pub(crate) fn matched(
+    redactor: &Redactor,
+    text: &str,
+    needle: &str,
+) -> Option<(String, Range<usize>)> {
     find_hit(text, needle)?;
     let (shown, _) = redactor.redact(text);
     let hit = find_hit(&shown, needle)?;
@@ -363,6 +373,12 @@ mod tests {
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
     use std::sync::mpsc::channel;
     use std::time::Duration;
+
+    #[test]
+    fn 語末のシグマを文字ごとに小文字にする() {
+        assert_eq!(needle("ΑΣ"), "ασ");
+        assert_eq!(needle("SES"), "ses");
+    }
 
     const COLS: usize = 60;
     const ROWS: usize = 6;

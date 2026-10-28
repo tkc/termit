@@ -2033,8 +2033,7 @@ impl App {
         };
         let query = across.query.clone();
         // 閉じたセッションの件なら、何も動かさず窓も閉じない。
-        let ids: Vec<_> = state.manager.sessions().iter().map(|s| s.id).collect();
-        let Some(index) = position_of(&ids, hit.id) else {
+        let Some(index) = state.manager.sessions().iter().position(|s| s.id == hit.id) else {
             return;
         };
         state.manager.select(index);
@@ -2044,29 +2043,35 @@ impl App {
         state.find = Some(find);
         state.across = None;
 
-        let Some(serial) = hit.serial.filter(|_| hit.kind == scan::HitKind::Line) else {
-            return;
-        };
-        let needle = query.to_lowercase();
-        // 錠は 1 度の短い読みだけで放す。`pushed` はグリッドと同じ錠の下で読む。
-        let target = state.manager.selected().and_then(|session| {
+        let serial = hit.serial.filter(|_| hit.kind == scan::HitKind::Line);
+        let needle = scan::needle(&query);
+        use alacritty_terminal::grid::Dimensions as _;
+        // 錠は 1 度の短い読みだけで放す。`pushed` は走査と同じ読み方で、錠の中で読む。
+        // 読み手は `term` を放してから `pushed` を書くので 1 読みぶんずれうるが、
+        // そのずれは下の行の再確認で捕まえる。
+        let landed = state.manager.selected().map(|session| {
             let term = session.term.lock();
             let pushed = session.pushed.load(std::sync::atomic::Ordering::Relaxed);
-            use alacritty_terminal::grid::Dimensions as _;
             let grid = term.grid();
-            let history = grid.history_size();
-            let line = jump_target(Some(serial), pushed, history)?;
-            if line > grid.screen_lines() as i32 - 1 {
-                return None;
-            }
-            // 出力が流れていても番号から引き直した行を読む。語がもう無ければ
-            // 数え違い・書き換えなので、送らずに `find_step` へ任せる。
-            let mut text = String::new();
-            scan::row_text(grid, line, &mut text);
-            scan::find_hit(&text, &needle).map(|_| line)
+            let land = landing(
+                serial,
+                pushed,
+                grid.history_size(),
+                grid.screen_lines() as i32,
+            );
+            let row = match land {
+                Landing::Row(line) => {
+                    // 走査と同じ述語（素の行でも伏せ字のあとでも当たる）で確かめる。
+                    let mut text = String::new();
+                    scan::row_text(grid, line, &mut text);
+                    scan::matched(&state.redactor, &text, &needle).map(|_| line)
+                }
+                _ => None,
+            };
+            (land, row)
         });
-        match target {
-            Some(line) => {
+        match landed {
+            Some((Landing::Row(_), Some(line))) => {
                 if let Some(session) = state.manager.selected() {
                     session.term.lock().scroll_to_point(Point::new(
                         alacritty_terminal::index::Line(line),
@@ -2074,7 +2079,10 @@ impl App {
                     ));
                 }
             }
-            None => self.find_step(Direction::Left),
+            // 数え違い・書き換え。
+            Some((Landing::Search | Landing::Row(_), _)) => self.find_step(Direction::Left),
+            // 送り先が無い。語を渡すだけで画面は動かさない。
+            Some((Landing::Nothing, _)) | None => {}
         }
     }
 
@@ -4468,14 +4476,28 @@ mod tests {
     }
 }
 
-/// 通し番号がいまどの行位置か。番号が無い件と、履歴から消えた件は `None`。
-fn jump_target(serial: Option<i64>, pushed: u64, history: usize) -> Option<i32> {
-    serial.and_then(|serial| lines::line_of(serial, pushed, history))
+/// `Enter` を押したとき、その件をどう扱うか。
+#[derive(Debug, PartialEq, Eq)]
+enum Landing {
+    /// 送り先が無い。セッションを切り替えて語を渡すだけ（仕様 §12）。
+    /// 名前・題名・枝の件と、履歴から消えた行。
+    Nothing,
+    /// 数え違い。`⌘F` に探させる。
+    Search,
+    /// この行を見に行く。まだ語が有れば送り、無ければ `Search` と同じにする。
+    Row(i32),
 }
 
-/// `id` のセッションが並びの何番目か。閉じていれば `None`。
-fn position_of(ids: &[crate::session::SessionId], id: crate::session::SessionId) -> Option<usize> {
-    ids.iter().position(|&i| i == id)
+/// 通し番号を、いまの `pushed` で行位置へ引き直して扱いを決める。
+fn landing(serial: Option<i64>, pushed: u64, history: usize, screen_lines: i32) -> Landing {
+    let Some(serial) = serial else {
+        return Landing::Nothing;
+    };
+    match lines::line_of(serial, pushed, history) {
+        None => Landing::Nothing,
+        Some(line) if line > screen_lines - 1 => Landing::Search,
+        Some(line) => Landing::Row(line),
+    }
 }
 
 #[cfg(test)]
@@ -4483,24 +4505,20 @@ mod search_view_tests {
     use super::*;
 
     #[test]
+    fn 消えた行は送らずに語だけ渡す() {
+        assert_eq!(landing(None, 100, 10000, 24), Landing::Nothing);
+        assert_eq!(landing(Some(97), 120, 10, 24), Landing::Nothing);
+    }
+
+    #[test]
     fn 流れた行は通し番号から引き直す() {
-        assert_eq!(jump_target(Some(97), 100, 10000), Some(-3));
-        // 30 行流れたあとは、同じ番号が 30 行ぶん上にある。
-        assert_eq!(jump_target(Some(97), 130, 10000), Some(-33));
+        assert_eq!(landing(Some(97), 120, 10000, 24), Landing::Row(-23));
+        assert_eq!(landing(Some(120), 120, 10000, 24), Landing::Row(0));
     }
 
     #[test]
-    fn 消えた行なら送らずに語だけ渡す() {
-        assert_eq!(jump_target(None, 100, 10000), None);
-        assert_eq!(jump_target(Some(97), 120, 10), None);
-        assert_eq!(jump_target(Some(97), 120, 10000), Some(-23));
-    }
-
-    #[test]
-    fn 閉じたセッションの件は何もしない() {
-        let ids = [1, 3];
-        assert_eq!(position_of(&ids, 3), Some(1));
-        assert_eq!(position_of(&ids, 2), None);
+    fn 画面より下に出た件は数え違いとして扱う() {
+        assert_eq!(landing(Some(200), 120, 10000, 24), Landing::Search);
     }
 
     fn view(selected: usize, offset: usize) -> SearchState {
