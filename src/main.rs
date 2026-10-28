@@ -1201,19 +1201,7 @@ impl App {
                 state.search = None;
                 state.find = Some(search::ScreenSearch::new());
             }
-            Action::FindAcrossSessions => {
-                state.picker = None;
-                state.search = None;
-                state.find = None;
-                // 掴んでいた行は放す。結果の一覧に並べ替えは効かせない（仕様 §13）。
-                state.mouse.sidebar_drag = None;
-                state.across = Some(CrossSearch::default());
-                // ペインを閉じていたら開く。窓が見えないまま鍵を奪わない。
-                if !state.sidebar {
-                    state.sidebar = true;
-                    self.reflow();
-                }
-            }
+            Action::FindAcrossSessions => self.enter_across(),
             Action::SearchHistory => {
                 state.picker = None;
                 state.find = None;
@@ -1599,12 +1587,9 @@ impl App {
                 }
                 SidebarHit::Close(i) => state.manager.close(i),
                 SidebarHit::SearchBox => {
-                    // 窓に入る（仕様 §9）。入っているなら、そのままにする。
+                    // 窓に入る（仕様 §9）。入っているなら、打った語を捨てない。
                     if state.across.is_none() {
-                        state.find = None;
-                        // 掴んでいた行は放す。結果の一覧に並べ替えは効かせない。
-                        state.mouse.sidebar_drag = None;
-                        state.across = Some(CrossSearch::default());
+                        self.enter_across();
                     }
                     // 並び順は変わらない。保存を予約しない。
                     return;
@@ -2018,6 +2003,30 @@ impl App {
         };
         if let Some(m) = found {
             session.term.lock().scroll_to_point(*m.start());
+        }
+    }
+
+    /// 全セッション検索の窓に入る（仕様 §9）。
+    ///
+    /// 入る口は `⌘⇧F` と、窓を押すことの 2 つある。窓を押す側は `on_click` が
+    /// 先に重ねた一覧を閉じて帰るので、前提が違っても今は無事だが、閉じる順を
+    /// いつか動かせばそこが破れる。片方だけ直すことにならないよう、入る手順は
+    /// ここに 1 つだけ置く。
+    fn enter_across(&mut self) {
+        let Some(state) = &mut self.state else { return };
+        // 重ねた一覧は閉じる。`on_key` は picker・rename → across → find・search の
+        // 順に見るので、どちらに残しても「覆いは描かれているのに鍵が届かない」側が
+        // 出る。`rename` だけは残す（名前を打ち終える Esc がそちらへ行く）。
+        state.picker = None;
+        state.search = None;
+        state.find = None;
+        // 掴んでいた行は放す。結果の一覧に並べ替えは効かせない（仕様 §13）。
+        state.mouse.sidebar_drag = None;
+        state.across = Some(CrossSearch::default());
+        // ペインを閉じていたら開く。窓が見えないまま鍵を奪わない。
+        if !state.sidebar {
+            state.sidebar = true;
+            self.reflow();
         }
     }
 
