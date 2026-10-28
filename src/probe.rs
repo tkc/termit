@@ -210,7 +210,9 @@ pub fn run(out_path: &str) {
             // 文字を取り違える。
             let ids: Vec<u32> = state.manager.sessions().iter().map(|s| s.id).collect();
             let query = "SES";
-            let needle = query.to_lowercase();
+            // 走査と同じ針の作り方をする。`str::to_lowercase` は語末シグマで
+            // `find_hit` の `char` ごとの小文字化と食い違う（`scan::needle`）。
+            let needle = crate::scan::needle(query);
             let rows: &[(u32, crate::scan::HitKind, &str)] = &[
                 // 前後どちらも落とさないと入らない長い行。
                 (

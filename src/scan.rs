@@ -328,6 +328,11 @@ fn scan_lines(
 ///
 /// 全角の後ろ半分は実体を持たないコマなので飛ばす（`session.rs` の `grid_text` と
 /// 同じ規則）。走査と、選んで飛ぶときの確かめが同じ読み方をするよう、ここに 1 つだけ置く。
+///
+/// `Flags::WRAPLINE` は見ないので、折り返しを跨ぐ語は当たらない。`⌘F` の渡す先
+/// （alacritty の `search_next`）はグリッドを流れとして歩くので見つける。穴として
+/// 受け入れて README に書いた。繋いで読むには、当たったバイト位置をどの行へ戻すか
+/// という別の工事が要る。
 pub fn row_text(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
     row: i32,
@@ -526,8 +531,11 @@ mod tests {
     }
 
     #[test]
-    fn 全体の上限で止まる() {
+    fn 全体の上限で切り詰める() {
         // 全行が当たる語で走らせる。2 本で 40 件ぶん拾えるところを 10 件で切る。
+        // 止めるのではなく切り詰める。セッションに時刻の順が無いので、集めてから
+        // 並べ替えないと「新しい順の 10 件」にならない。1 本あたりの上限が
+        // 歩く量を抑えている。
         let a = target(1, &numbered("ses a", 50), None);
         let b = target(2, &numbered("ses b", 50), None);
         let limits = Limits {

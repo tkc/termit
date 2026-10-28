@@ -142,6 +142,11 @@ history comes back to the search when the program exits. A hit on such a
 screen switches to the session and hands the word to `⌘F`; it cannot jump to
 the line.
 
+It reads one grid row at a time, so a word broken across a wrap — the line ran
+past the right edge and continued on the next row — is invisible to it. `⌘F`
+walks the grid as a stream and does find such a word, so the same search finds
+it once you are in the session.
+
 **The dot on a row** is filled while the session is alive and hollow once it
 has ended. Its colour is the session's state:
 
