@@ -104,7 +104,9 @@ pub struct Hit {
     pub kind: HitKind,
     /// 当たった行の通し番号。名前・題名・枝と、代替画面の行なら `None`。
     pub serial: Option<i64>,
-    /// その行が現れた時刻。目盛りが残っていなければ `None`。
+    /// その行が現れた時刻。行でない件（名前・題名・枝）だけが `None` である。
+    ///
+    /// `Ticks` はどの行にも必ず時刻を答えるので、行の件が `None` になることは無い。
     pub at: Option<Instant>,
     /// 伏せ字を通したあとの行の文字列。
     pub text: String,
@@ -165,12 +167,10 @@ pub fn scan(targets: &[Target], query: &str, redactor: &Redactor, limits: Limits
 /// 一覧の並び。名前・題名・枝を先頭に置き、残りを新しい順に並べる。
 ///
 /// 先頭に置くのは、それが時刻を持たないからではなく、行ではないからである。
-/// 時刻の引けない行は逆に後ろへ回す。分からない行を、分かっている新しい行の上に
-/// 出さないためである。`Ticks` は本を開いた時刻を必ず答えるので、いま行が時刻なしで
-/// 届くことはない。この分岐は守りとして置いてある。
+/// 時刻を見るのは行の件どうしだけで、そこには必ず時刻が付いている
+/// （`Ticks::time_of` は答えを返さないことがない）。
 fn newest_first(a: &Hit, b: &Hit) -> Ordering {
     let pinned = |h: &Hit| h.kind != HitKind::Line;
-    // 時刻は `None` が小さいので、新しい順に並べれば後ろへ回る。
     pinned(b).cmp(&pinned(a)).then_with(|| b.at.cmp(&a.at))
 }
 
@@ -308,10 +308,11 @@ fn scan_lines(
                     kind: HitKind::Line,
                     serial,
                     // 番号の引けない行には、この本が最後に押し出した時刻を付ける。
-                    at: match serial {
+                    // 行には必ず時刻が付く。`None` になるのは行でない件だけである。
+                    at: Some(match serial {
                         Some(serial) => ticks.time_of(serial),
                         None => ticks.newest(),
-                    },
+                    }),
                     text,
                     hit,
                 });
@@ -458,35 +459,6 @@ mod tests {
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!(hits[0].id, 2, "新しい本が先に来る");
         assert_eq!(hits[1].id, 1);
-    }
-
-    /// 並べ替えだけを見たい当たり。
-    fn hit(kind: HitKind, at: Option<Instant>) -> Hit {
-        Hit {
-            id: 1,
-            kind,
-            serial: at.map(|_| 0),
-            at,
-            text: String::new(),
-            hit: 0..0,
-        }
-    }
-
-    #[test]
-    fn 時刻の無い行は後ろへ回す() {
-        // 先頭に来るのは名前・題名・枝だけで、時刻の引けない行は後ろへ回る。
-        // `Ticks` が作った時刻を必ず答えるので、`scan` を通って時刻の無い行が
-        // 出ることはない。並べ替えの守りを直に試す。
-        let t0 = Instant::now();
-        let mut hits = [
-            hit(HitKind::Line, None),
-            hit(HitKind::Line, Some(t0)),
-            hit(HitKind::Name, None),
-        ];
-        hits.sort_by(newest_first);
-        assert_eq!(hits[0].kind, HitKind::Name, "名前は先頭に残る");
-        assert_eq!(hits[1].at, Some(t0), "時刻の分かる行が先");
-        assert_eq!(hits[2].at, None, "時刻の引けない行は後ろ");
     }
 
     #[test]

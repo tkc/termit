@@ -137,15 +137,16 @@ impl Ticks {
     /// 目盛りを捨てたぶんの時刻は分からない。残っている最古の時刻を返す。
     /// その行がそれより古いことは確かである。
     /// 目盛りが 1 つも無ければ、本を開いた時刻を返す。
-    pub fn time_of(&self, serial: i64) -> Option<Instant> {
+    ///
+    /// どの行にも必ず時刻が付く。引けないことは無いので `Option` にしない。
+    /// 包むと、呼ぶ側が「行でない」と「時刻が引けない」を取り違える。
+    pub fn time_of(&self, serial: i64) -> Instant {
         let after = self
             .marks
             .partition_point(|&(pushed, _)| (pushed as i64) <= serial);
-        Some(
-            self.marks
-                .get(after.saturating_sub(1))
-                .map_or(self.created_at, |&(_, at)| at),
-        )
+        self.marks
+            .get(after.saturating_sub(1))
+            .map_or(self.created_at, |&(_, at)| at)
     }
 
     /// いちばん新しい目盛りの時刻。
@@ -153,8 +154,8 @@ impl Ticks {
     /// 代替画面の行は通し番号が引けない（`pushed` が進まないので、付けた番号は
     /// 本画面の無関係な行を指す）。その行には、この本が最後に行を押し出した
     /// 時刻を代わりに付ける。1 行も押し出していなければ、本を開いた時刻になる。
-    pub fn newest(&self) -> Option<Instant> {
-        Some(self.marks.back().map_or(self.created_at, |&(_, at)| at))
+    pub fn newest(&self) -> Instant {
+        self.marks.back().map_or(self.created_at, |&(_, at)| at)
     }
 }
 
@@ -681,11 +682,11 @@ mod tests {
         ticks.push(10, t0);
         ticks.push(20, t1);
         ticks.push(30, t2);
-        assert_eq!(ticks.time_of(25), Some(t1));
-        assert_eq!(ticks.time_of(30), Some(t2));
+        assert_eq!(ticks.time_of(25), t1);
+        assert_eq!(ticks.time_of(30), t2);
         assert_eq!(
             ticks.time_of(5),
-            Some(t0),
+            t0,
             "一番古い目盛りより前なら、残っている最古の時刻を返す"
         );
     }
@@ -696,10 +697,10 @@ mod tests {
         let before = Instant::now();
         let ticks = Ticks::new();
         let after = Instant::now();
-        let at = ticks.time_of(0).expect("作った時刻を返す");
+        let at = ticks.time_of(0);
         assert!(at >= before && at <= after, "本を開いた時刻である");
-        assert_eq!(ticks.time_of(-5), Some(at), "履歴側の行にも同じ時刻が付く");
-        assert_eq!(ticks.newest(), Some(at), "最後の目盛りも作った時刻になる");
+        assert_eq!(ticks.time_of(-5), at, "履歴側の行にも同じ時刻が付く");
+        assert_eq!(ticks.newest(), at, "最後の目盛りも作った時刻になる");
     }
 
     #[test]
@@ -710,7 +711,7 @@ mod tests {
         let mut ticks = Ticks::new();
         let first = Instant::now() + Duration::from_secs(1200);
         ticks.mark_read(0, 76, 0, first);
-        assert_eq!(ticks.time_of(30), Some(first), "出力はその読みの時刻になる");
+        assert_eq!(ticks.time_of(30), first, "出力はその読みの時刻になる");
     }
 
     #[test]
@@ -722,8 +723,8 @@ mod tests {
         let mut ticks = Ticks::new();
         ticks.push(0, t0);
         ticks.push(76, t1);
-        assert_eq!(ticks.time_of(150), Some(t1), "2 つめの出力で出た行");
-        assert_eq!(ticks.time_of(30), Some(t0), "1 つめの出力で出た行");
+        assert_eq!(ticks.time_of(150), t1, "2 つめの出力で出た行");
+        assert_eq!(ticks.time_of(30), t0, "1 つめの出力で出た行");
     }
 
     #[test]
@@ -737,9 +738,9 @@ mod tests {
         let mut ticks = Ticks::new();
         ticks.mark_read(0, 76, 0, t0);
         ticks.mark_read(76, 176, 24, t1);
-        assert_eq!(ticks.time_of(80), Some(t0), "1 つめの読みが画面に残した行");
-        assert_eq!(ticks.time_of(100), Some(t1), "2 つめの読みが書き始めた行");
-        assert_eq!(ticks.time_of(150), Some(t1), "2 つめの読みで出た行");
+        assert_eq!(ticks.time_of(80), t0, "1 つめの読みが画面に残した行");
+        assert_eq!(ticks.time_of(100), t1, "2 つめの読みが書き始めた行");
+        assert_eq!(ticks.time_of(150), t1, "2 つめの読みで出た行");
     }
 
     #[test]
@@ -754,8 +755,8 @@ mod tests {
         ticks.mark_read(0, 76, 0, t0);
         ticks.mark_read(76, 76, 0, prompt);
         ticks.mark_read(76, 176, 0, t1);
-        assert_eq!(ticks.time_of(150), Some(t1), "`ls` の出力で出た行");
-        assert_eq!(ticks.time_of(30), Some(t0), "1 つめの出力で出た行");
+        assert_eq!(ticks.time_of(150), t1, "`ls` の出力で出た行");
+        assert_eq!(ticks.time_of(30), t0, "1 つめの出力で出た行");
     }
 
     #[test]
@@ -764,7 +765,7 @@ mod tests {
         let mut ticks = Ticks::new();
         ticks.push(10, t0);
         ticks.push(10, t0 + Duration::from_secs(1));
-        assert_eq!(ticks.time_of(10), Some(t0), "先に見た時刻を残す");
+        assert_eq!(ticks.time_of(10), t0, "先に見た時刻を残す");
     }
 
     #[test]
@@ -773,11 +774,11 @@ mod tests {
         let mut ticks = Ticks::new();
         ticks.push(10, t0);
         ticks.push(20, t0 + Duration::from_millis(500));
-        assert_eq!(ticks.time_of(20), Some(t0), "1 秒経っていないので積まない");
+        assert_eq!(ticks.time_of(20), t0, "1 秒経っていないので積まない");
         ticks.push(30, t0 + Duration::from_secs(1));
         assert_eq!(
             ticks.time_of(30),
-            Some(t0 + Duration::from_secs(1)),
+            t0 + Duration::from_secs(1),
             "1 秒経てば積む"
         );
     }
@@ -791,7 +792,7 @@ mod tests {
         }
         assert_eq!(
             ticks.time_of(0),
-            Some(t0 + Duration::from_secs(100)),
+            t0 + Duration::from_secs(100),
             "溢れた 100 件は捨て、残っている最古の時刻を返す"
         );
     }
