@@ -116,6 +116,7 @@ takes nothing, because neither shells nor agents use Cmd.
 | `^R` | Search command history |
 | `⌘N` / `⌘D` / `⌘E` | New / fork / fork with a chosen profile |
 | `⌘F` | Find in the screen and scrollback |
+| `⌘⇧F` | Search every session's screen and scrollback from the left pane; `Enter` jumps to the hit |
 | `⌘I` (or `⌘⇧R`) | Rename the session |
 | `⌘K` | Clear the screen and scrollback |
 | `⌘[` / `⌘]` | Select the previous / next session |
@@ -131,6 +132,15 @@ takes nothing, because neither shells nor agents use Cmd.
 | Drop a file on the window | Paste its path |
 
 Everything else goes to the child process untouched.
+
+**Searching across sessions** (`⌘⇧F`) walks every session on a worker thread,
+so typing never waits on it. It has one hole: a session sitting in the
+alternate screen (`vim`, `less`, most full-screen agent UIs) can only be
+searched over the screen it is showing right now. Its real scrollback is parked
+in alacritty's `inactive_grid`, and nothing outside the crate can read it. The
+history comes back to the search when the program exits. A hit on such a
+screen switches to the session and hands the word to `⌘F`; it cannot jump to
+the line.
 
 **The dot on a row** is filled while the session is alive and hollow once it
 has ended. Its colour is the session's state:

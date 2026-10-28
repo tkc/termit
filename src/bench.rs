@@ -3,13 +3,31 @@
 //! 遅さの原因を「描画の指示を組み立てる費用（CPU）」と
 //! 「GPU へ投げて待つ費用」に切り分けるために使う。
 
-use std::time::Duration;
+use std::sync::atomic::AtomicU64;
+use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use alacritty_terminal::event::WindowSize;
+use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+use crate::config::ScreenConfig;
+use crate::lines::Ticks;
 use crate::render::Renderer;
+use crate::scan::{self, Limits, Target};
+use crate::secret::Redactor;
+use crate::term::{EventProxy, TermSize, UiSender};
 use crate::theme::Theme;
 
 const FRAMES: usize = 20;
 const WARMUP: usize = 4;
+
+/// 走査の測定回数。1 回が数十 ms から数百 ms かかるので、フレームの `FRAMES` より
+/// 少なくする。p90 は 15 回なら上から 2 番目の値になる。
+const SCAN_RUNS: usize = 15;
+/// 捨てる最初の回数。ページと分岐予測を温める。
+const SCAN_WARMUP: usize = 2;
 
 pub fn run() {
     let theme = Theme::default();
@@ -62,6 +80,7 @@ pub fn run() {
         }
     }
     row_estimate();
+    scan_cost();
     println!("\n60fps の予算は 16.7ms。入力から表示までの体感は、これに vsync 待ちが加わる。");
 }
 
@@ -115,5 +134,92 @@ fn row_estimate() {
     println!(
         "  行ごと 領域 {rows:>6}  整形+組み立て 中央 {bm:6.2}ms p90 {b90:6.2}ms | prepare 中央 {pm:6.2}ms p90 {p90:6.2}ms | 合計 中央 {:6.2}ms",
         bm + pm
+    );
+}
+
+/// 横断検索の走査（`scan::scan`）の費用。仕様 §10 の「先に測る」。
+///
+/// 14 本 × 10000 行の履歴を、実際の `Term` に流して作る。シェルは起動しない
+/// （14 本ぶんの本物の出力は遅すぎる）。行の中身は毎行変え、当たりは 1 本に 1 つだけ
+/// 置く。当たりは上限（全体 200）に遠く届かないので、走査は早じまいせず
+/// **全部の行を歩く**。これは最悪の場合であり、普通の場合ではない。
+fn scan_cost() {
+    const SESSIONS: usize = 14;
+    const HISTORY: usize = 10_000;
+    const COLS: usize = 80;
+    const LINES: usize = 24;
+    // どの行にも現れない語。
+    const WORD: &str = "zebraquux";
+
+    let targets: Vec<Target> = (0..SESSIONS)
+        .map(|s| {
+            let (pty_tx, _pty_rx) = channel();
+            let (ui_tx, _ui_rx) = channel();
+            let ws = Arc::new(FairMutex::new(WindowSize {
+                num_lines: LINES as u16,
+                num_cols: COLS as u16,
+                cell_width: 8,
+                cell_height: 16,
+            }));
+            let proxy = EventProxy::new(s as u32, pty_tx, UiSender::Channel(ui_tx), ws);
+            let mut term = crate::term::new_term(TermSize::new(COLS, LINES), HISTORY, proxy);
+            let mut parser: Processor<StdSyncHandler> = Processor::new();
+            // 画面の行数ぶん余分に流し、履歴をちょうど満たす。
+            let total = HISTORY + LINES;
+            let mut play = String::new();
+            // 1 行は 80 桁に収める。折り返すと履歴の行数が減り、当たりが履歴の外へ出る。
+            for i in 0..total {
+                // 本ごと・行ごとに違う文字列にする。
+                let mix = ((i as u64).wrapping_mul(2_654_435_761)
+                    ^ (s as u64).wrapping_mul(40_503))
+                    & 0xffff_ffff;
+                if i == 5_000 + s {
+                    play.push_str(&format!("[{s:02}] {i:05} found {WORD} {mix:x}\r\n"));
+                } else {
+                    play.push_str(&format!(
+                        "[{s:02}] {i:05} $ cargo build -p crate{} {mix:x} warning: unused\r\n",
+                        i % 97
+                    ));
+                }
+            }
+            parser.advance(&mut term, play.as_bytes());
+            Target {
+                id: s as u32,
+                term: Arc::new(FairMutex::new(term)),
+                pushed: Arc::new(AtomicU64::new(0)),
+                ticks: Arc::new(Mutex::new(Ticks::new())),
+                name: format!("session-{s}"),
+                title: None,
+                branch: None,
+            }
+        })
+        .collect();
+    let redactor =
+        Redactor::new(&ScreenConfig::default().redact).expect("既定の式は組み立てられる");
+    let limits = Limits::default();
+
+    println!(
+        "\n=== 横断検索の走査（{SESSIONS} 本 x {HISTORY} 行 = {} 行、当たりは 1 本に 1 つ）===",
+        SESSIONS * HISTORY
+    );
+    let mut times = Vec::new();
+    let mut found = 0usize;
+    for run in 0..SCAN_WARMUP + SCAN_RUNS {
+        let t0 = Instant::now();
+        let hits = scan::scan(&targets, WORD, &redactor, limits);
+        let d = t0.elapsed();
+        found = hits.len();
+        if run >= SCAN_WARMUP {
+            times.push(d);
+        }
+    }
+    // 当たりが 1 本に 1 つ見つからなければ、早じまいか行の取り違えで、測りたいものを測っていない。
+    if found != SESSIONS {
+        println!("  警告: 当たりが {found} 件で {SESSIONS} 件にならない。この数字は使えない");
+    }
+    let (m, p90) = stats(&times);
+    println!(
+        "  走査 当たり {found:>3} 件  1 回あたり 中央 {m:7.2}ms p90 {p90:7.2}ms ({SCAN_RUNS} 回, 捨て {SCAN_WARMUP} 回, chunk {})",
+        limits.chunk
     );
 }
