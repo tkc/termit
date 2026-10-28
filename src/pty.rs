@@ -402,6 +402,8 @@ fn spawn_reader(
                 let bytes = &buf[..n];
                 let events = scanner.feed(bytes);
                 let mut out: Vec<UiEvent> = Vec::new();
+                // この読みで出る行は、これより後の番号を持つ。目盛りに入れる数である。
+                let before = counted;
                 {
                     let mut term = term.lock();
                     let mut pos = 0usize;
@@ -421,11 +423,15 @@ fn spawn_reader(
                     counted = counting.finish();
                 }
                 // 行数と時刻は、錠を手放してから 1 読みにつき 1 回だけ残す。
+                //
+                // 目盛りへ入れるのは読む前の数である。読んだ後の数を入れると、
+                // この読みで出た行の番号がどれも目盛りより大きくなり、一つ前の
+                // 目盛り（間が空いていれば何分も前の時刻）に落ちてしまう。
                 pushed.store(counted, Ordering::Relaxed);
                 ticks
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(counted, std::time::Instant::now());
+                    .push(before, std::time::Instant::now());
                 for ev in out {
                     if ui_tx.send_event(ev).is_err() {
                         return;

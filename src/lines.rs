@@ -44,6 +44,9 @@ pub fn line_of(serial: i64, pushed: u64, history_size: usize) -> Option<i32> {
 }
 
 /// 覚えておく目盛りの数。1 秒に 1 つ積むので、約 68 分ぶんになる。
+///
+/// 1 件は `(u64, Instant)` の 24 バイトで、セッションあたり約 96KB になる
+/// （`size_of` で確かめた）。
 pub const TICKS: usize = 4096;
 
 /// 目盛りの間隔。仕様は 1 秒の分解能で足りるとしている。
@@ -104,14 +107,18 @@ impl Ticks {
 /// 達していれば差が出ないので、行ごとの道で数えたほうを答えにする。行ごとに
 /// 数えるのは、改行・NEL・SU・行削除・画面消去（ED 2）・行末のタブである。
 ///
-/// 数え漏らしが残る。
+/// 上限に達してからは、数え漏らしと数え過ぎが残る。行ごとの道は画面の形しか
+/// 見ていないからである。
 ///
 /// - 行末の折り返しは `Term` が自分の `linefeed` を呼ぶので、こちらの `linefeed`
 ///   を通らない。上限に届くまでは差に出るので数えられるが、上限に達してからは
 ///   数えられない。1 文字ごとに見れば数えられるが、それは `input` を 1 割ほど
 ///   遅くするので採らない（仕様 §4 の非目標）。
-/// - 上限にちょうど届く 1 回ぶんでは、届いたあとの押し出しを数えない。
-///   取りこぼしはその 1 回ぶんで止まる。
+/// - DECSTBM で送り範囲を絞った本画面では、履歴へ入らない送りを数えてしまう。
+///   `at_bottom` は画面の最下行を見るが `Term::linefeed` が見るのは
+///   `scroll_region.end` で、履歴が伸びるのは `region.start == 0` のときだけである。
+///   `scroll_up` は画面の高さで、`delete_lines` はカーソルが 0 行目かどうかで、
+///   `folds` は範囲を見ずに数える。範囲は `Term` の外から読めないので追えない。
 /// - `Term::resize` の折り返し直しは行の位置を動かすので、大きさを変えると
 ///   古い通し番号は少しずれる。
 pub struct Counting<'a> {
@@ -142,10 +149,20 @@ impl<'a> Counting<'a> {
     /// 数え終えて、押し出した行の合計を返す。
     pub fn finish(self) -> u64 {
         let counted = match self.before {
-            // 上限に達していれば、もう履歴は伸びない。行ごとに数えたほうを採る。
+            // すでに上限に達していれば、履歴は伸びない。行ごとに数えたほうを採る。
             Some(before) if before >= self.cap => self.hooked,
-            // 伸びる側にいれば、差が正確である。
-            Some(before) if !self.alt() => self.history().saturating_sub(before) as u64,
+            Some(before) if !self.alt() => {
+                let after = self.history();
+                let delta = after.saturating_sub(before) as u64;
+                if after >= self.cap {
+                    // この 1 回で上限に届いた。届いたあとの押し出しは差に出ない。
+                    // 1 回の読みは 64KB まで入るので、改行だけなら何千行にもなる。
+                    delta.max(self.hooked)
+                } else {
+                    // 伸びる側にいるあいだは、差が正確である。
+                    delta
+                }
+            }
             // 途中で画面が入れ替わっていれば、差は本画面のものではない。
             _ => self.hooked,
         };
@@ -349,16 +366,27 @@ mod tests {
         crate::term::new_term(size, scrollback, proxy)
     }
 
-    /// 台本を端末へ流し、数えた行数と、端末が実際に抱えた履歴行数を返す。
+    /// 台本を 1 回の読みとして流し、数えた行数と、端末が抱えた履歴行数を返す。
     ///
-    /// 上限に届くまでは履歴行数が答え合わせになる。読み手と同じように、
-    /// 1 回の読みごとに `Counting` を作り直す。区切りは改行に置き、
-    /// 行単位で届く出力を真似る。
+    /// 読み手は 64KB の器へ読み、OSC の終端でだけ区切る。改行の多い出力なら
+    /// 1 回の読みに何千行も入るので、1 回で流すのが本物に近い。
+    /// 上限に届くまでは履歴行数が答え合わせになる。
     fn feed(cols: usize, lines: usize, scrollback: usize, script: &[u8]) -> (u64, usize) {
+        feed_reads(cols, lines, scrollback, &[script])
+    }
+
+    /// 台本を行ごとの読みに分けて流す。
+    fn feed_by_line(cols: usize, lines: usize, scrollback: usize, script: &[u8]) -> (u64, usize) {
+        let reads: Vec<&[u8]> = script.split_inclusive(|&b| b == b'\n').collect();
+        feed_reads(cols, lines, scrollback, &reads)
+    }
+
+    /// 読みの列を、読み手と同じように 1 回ずつ流す。
+    fn feed_reads(cols: usize, lines: usize, scrollback: usize, reads: &[&[u8]]) -> (u64, usize) {
         let mut term = make_term(cols, lines, scrollback);
         let mut parser: Processor<StdSyncHandler> = Processor::new();
         let mut pushed = 0u64;
-        for read in script.split_inclusive(|&b| b == b'\n') {
+        for read in reads {
             let mut counting = Counting::new(&mut term, pushed, scrollback);
             parser.advance(&mut counting, read);
             pushed = counting.finish();
@@ -482,6 +510,21 @@ mod tests {
     }
 
     #[test]
+    fn 読みをまたいでも数え続ける() {
+        // 読み手は読みごとに `Counting` を作り直し、前の読みまでの数を渡して続ける。
+        // 上限より下なら、1 回で流しても分けて流しても同じ数になる。
+        let mut script = plain_lines(10);
+        script.extend(b"\r\n");
+        script.extend([b'z'; 47]);
+        script.extend(b"\r\n");
+        script.extend(plain_lines(5));
+        let (one, history) = feed(10, 4, 100, &script);
+        let (many, _) = feed_by_line(10, 4, 100, &script);
+        assert_eq!(one, history as u64, "1 回で流しても履歴行数と一致する");
+        assert_eq!(many, one, "読みに分けても同じ数になる");
+    }
+
+    #[test]
     fn 通し番号から行位置を出す() {
         assert_eq!(serial(100, 0), 100);
         assert_eq!(serial(100, -3), 97);
@@ -508,6 +551,19 @@ mod tests {
             "一番古い目盛りより前なら、残っている最古の時刻を返す"
         );
         assert_eq!(Ticks::new().time_of(1), None, "目盛りが無ければ時刻も無い");
+    }
+
+    #[test]
+    fn 間の空いた出力は前の出力の時刻にならない() {
+        // 1 つめの出力で 76 行押し出し、10 分おいて 2 つめの出力で 100 行押し出した。
+        // 目盛りに入れるのは読む前の数なので、2 つめで出た行は 2 つめの時刻になる。
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(600);
+        let mut ticks = Ticks::new();
+        ticks.push(0, t0);
+        ticks.push(76, t1);
+        assert_eq!(ticks.time_of(150), Some(t1), "2 つめの出力で出た行");
+        assert_eq!(ticks.time_of(30), Some(t0), "1 つめの出力で出た行");
     }
 
     #[test]
