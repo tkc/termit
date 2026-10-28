@@ -615,8 +615,6 @@ impl Renderer {
     /// `hit` は `text` の**バイト**位置。返す範囲は、返す文字列の中での当たりの
     /// **バイト**位置で、先頭の省略記号のぶんだけずれる。当たりが残せる幅より
     /// 長ければ、収まる分だけに切って返す。
-    // 呼ぶのは結果の行を描く仕事。それまで読み手がいない。
-    #[allow(dead_code)]
     pub fn fit_center(
         &mut self,
         text: &str,
@@ -1165,7 +1163,6 @@ fn build(chars: &[char], keep: usize, drop_tail: bool) -> String {
 ///
 /// `hit_chars` は文字の添字、`hit` は `text` のバイト位置。戻りの範囲は
 /// 組み立てた文字列のバイト位置で、残した窓に収まる分に切ってある。
-#[allow(dead_code)]
 fn build_window(
     text: &str,
     chars: &[char],

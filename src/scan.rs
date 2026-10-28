@@ -60,7 +60,6 @@ pub fn find_hit(text: &str, needle_lower: &str) -> Option<Range<usize>> {
 /// 当たりの前後へ均等に伸ばし、片側が尽きたら残りをもう片側へ回す。
 /// 当たりが `keep` より長ければ、当たりの頭から `keep` 字を残す。
 /// 戻り値の 2 つの真偽は、頭を落としたか・尾を落としたか。
-#[allow(dead_code)]
 pub fn window_around(chars: &[char], hit: Range<usize>, keep: usize) -> (Range<usize>, bool, bool) {
     let len = chars.len();
     if keep >= len {
@@ -100,12 +99,12 @@ pub enum HitKind {
 
 /// 1 件の当たり。1 件は 1 当たりで、セッション単位にはまとめない（仕様 §5）。
 #[derive(Debug, Clone)]
-// 読むのは結果を描く仕事と、選んで飛ぶ仕事。それまで読み手がいない。
-#[allow(dead_code)]
 pub struct Hit {
     pub id: SessionId,
     pub kind: HitKind,
     /// 当たった行の通し番号。名前・題名・枝と、代替画面の行なら `None`。
+    // 読むのは選んで飛ぶ仕事。それまで試験のほかに読み手がいない。
+    #[allow(dead_code)]
     pub serial: Option<i64>,
     /// その行が現れた時刻。目盛りが残っていなければ `None`。
     pub at: Option<Instant>,
