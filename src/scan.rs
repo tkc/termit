@@ -9,6 +9,7 @@
 //! 単位に注意する。`find_hit` が返すのは元の文字列の**バイト**位置、
 //! `window_around` が受け取り返すのは**文字**の添字である。
 
+use std::cmp::Ordering;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -154,18 +155,22 @@ pub fn scan(targets: &[Target], query: &str, redactor: &Redactor, limits: Limits
     for target in targets {
         scan_one(target, &needle, redactor, limits, &mut hits);
     }
-    // 新しい順に並べる。先頭に置くのは名前・題名・枝で、時刻が無いからではなく
-    // 行ではないからである。行の時刻は引けないこともある（目盛りの無い本、
-    // 目盛りを 1 つも持たない代替画面の本）。その行は後ろへ回す。
-    // 分からない行を、分かっている新しい行の上に出さない。
     // 安定な並べ替えなので、同じ時刻のあいだは走った順＝本ごとの新しい順が残る。
-    hits.sort_by(|a, b| {
-        let pinned = |h: &Hit| h.kind != HitKind::Line;
-        // 時刻は `None` が小さいので、新しい順に並べれば後ろへ回る。
-        pinned(b).cmp(&pinned(a)).then_with(|| b.at.cmp(&a.at))
-    });
+    hits.sort_by(newest_first);
     hits.truncate(limits.total);
     hits
+}
+
+/// 一覧の並び。名前・題名・枝を先頭に置き、残りを新しい順に並べる。
+///
+/// 先頭に置くのは、それが時刻を持たないからではなく、行ではないからである。
+/// 時刻の引けない行は逆に後ろへ回す。分からない行を、分かっている新しい行の上に
+/// 出さないためである。`Ticks` は本を開いた時刻を必ず答えるので、いま行が時刻なしで
+/// 届くことはない。この分岐は守りとして置いてある。
+fn newest_first(a: &Hit, b: &Hit) -> Ordering {
+    let pinned = |h: &Hit| h.kind != HitKind::Line;
+    // 時刻は `None` が小さいので、新しい順に並べれば後ろへ回る。
+    pinned(b).cmp(&pinned(a)).then_with(|| b.at.cmp(&a.at))
 }
 
 /// 1 本を走る。名前・題名・枝を見てから、行を遡る。
@@ -371,13 +376,20 @@ mod tests {
         crate::term::new_term(size, scrollback, proxy)
     }
 
-    /// 台本を流した `Target` を 1 本作る。目盛りは呼ぶ側が渡す。
+    /// 台本を流した `Target` を 1 本作る。
     ///
+    /// `at` を渡すとその時刻の目盛りを 1 つだけ置く。目盛りが 1 つならどの行も
+    /// その時刻になるので、本どうしの新しさを比べるのに足りる。`None` なら
+    /// 目盛りの無い本になり、行の時刻は `Ticks` の作った時刻になる。
     /// 押し出した行数は走査では読むだけなので、試験では 0 のままにする。
-    fn target_with(id: SessionId, play: &[u8], ticks: Ticks) -> Target {
+    fn target(id: SessionId, play: &[u8], at: Option<Instant>) -> Target {
         let mut term = make_term(COLS, ROWS, 10_000);
         let mut parser: Processor<StdSyncHandler> = Processor::new();
         parser.advance(&mut term, play);
+        let mut ticks = Ticks::new();
+        if let Some(at) = at {
+            ticks.mark_read(0, 1, at);
+        }
         Target {
             id,
             term: Arc::new(FairMutex::new(term)),
@@ -387,21 +399,6 @@ mod tests {
             title: None,
             branch: None,
         }
-    }
-
-    /// 台本を流した `Target`。
-    ///
-    /// `at` を渡すとその時刻の目盛りを 1 つだけ置く。目盛りが 1 つならどの行も
-    /// その時刻になるので、本どうしの新しさを比べるのに足りる。`None` なら
-    /// 目盛りの無い本になり、行から時刻が引けない。
-    /// 環は `Ticks::empty` から作る。`Ticks::new` の種が入っていると、
-    /// 置いた目盛りが「同じ行数は積まない」で落ちてしまう。
-    fn target(id: SessionId, play: &[u8], at: Option<Instant>) -> Target {
-        let mut ticks = Ticks::empty();
-        if let Some(at) = at {
-            ticks.mark_read(0, 1, at);
-        }
-        target_with(id, play, ticks)
     }
 
     /// 伏せる式を 1 つも持たない `Redactor`。行の走りだけを見たいとき。
@@ -441,26 +438,58 @@ mod tests {
         assert_eq!(hits[1].id, 1);
     }
 
+    /// 並べ替えだけを見たい当たり。
+    fn hit(kind: HitKind, at: Option<Instant>) -> Hit {
+        Hit {
+            id: 1,
+            kind,
+            serial: at.map(|_| 0),
+            at,
+            text: String::new(),
+            hit: 0..0,
+        }
+    }
+
     #[test]
     fn 時刻の無い行は後ろへ回す() {
-        // 時刻の引けない行を、分かっている新しい行の上に出さない。
-        // 先頭に来るのは名前・題名・枝だけである。
+        // 先頭に来るのは名前・題名・枝だけで、時刻の引けない行は後ろへ回る。
+        // `Ticks` が作った時刻を必ず答えるので、`scan` を通って時刻の無い行が
+        // 出ることはない。並べ替えの守りを直に試す。
         let t0 = Instant::now();
-        let dated = target(1, &play(&["ses 時刻あり"]), Some(t0));
-        let mut undated = target(2, &play(&["ses 時刻なし"]), None);
-        undated.name = "ses の本".to_string();
-        let hits = scan(&[dated, undated], "ses", &plain(), Limits::default());
-        assert_eq!(hits.len(), 3, "{hits:?}");
+        let mut hits = [
+            hit(HitKind::Line, None),
+            hit(HitKind::Line, Some(t0)),
+            hit(HitKind::Name, None),
+        ];
+        hits.sort_by(newest_first);
         assert_eq!(hits[0].kind, HitKind::Name, "名前は先頭に残る");
         assert_eq!(hits[1].at, Some(t0), "時刻の分かる行が先");
-        assert_eq!(hits[2].at, None, "{hits:?}");
+        assert_eq!(hits[2].at, None, "時刻の引けない行は後ろ");
+    }
+
+    #[test]
+    fn 名前は新しい行より先に来る() {
+        // 行の時刻がいくら新しくても、名前・題名・枝の件を押し下げない。
+        let t0 = Instant::now();
+        let mut named = target(1, &play(&["ses 新しい行"]), Some(t0));
+        named.name = "ses の本".to_string();
+        let hits = scan(
+            std::slice::from_ref(&named),
+            "ses",
+            &plain(),
+            Limits::default(),
+        );
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].kind, HitKind::Name);
+        assert_eq!(hits[1].at, Some(t0));
     }
 
     #[test]
     fn 一度も流れていない本の行にも時刻が付く() {
-        // 開いたばかりの本は 1 行も押し出していないが、`Ticks::new` の種で
-        // 行から時刻が引ける。引けないと一覧の並びが決まらない。
-        let t = target_with(1, &play(&["ses one"]), Ticks::new());
+        // 開いたばかりの本は 1 行も押し出していない。目盛りが無くても、
+        // `Ticks` が本を開いた時刻を答えるので行から時刻が引ける。
+        // 引けないと一覧の並びが決まらない。
+        let t = target(1, &play(&["ses one"]), None);
         let hits = scan(std::slice::from_ref(&t), "ses", &plain(), Limits::default());
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert!(hits[0].at.is_some(), "{hits:?}");

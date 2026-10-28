@@ -61,38 +61,29 @@ const TICK_GAP: Duration = Duration::from_secs(1);
 pub struct Ticks {
     /// `(そのときまでに押し出した行数, 時刻)`。行数の昇順に並ぶ。
     marks: VecDeque<(u64, Instant)>,
+    /// この本を開いた時刻。目盛りが 1 つも無いあいだの答えになる。
+    ///
+    /// 一度も行を押し出していない本（開いたばかり・静かな本・流れる前に代替画面へ
+    /// 入った本）でも、行から時刻が引けるようにする。引けないと、その行は
+    /// 全セッション検索で時刻の無い件になってしまう。
+    ///
+    /// これを目盛りとして**積んではいけない**。積むと、最初に押し出した読みの目盛りが
+    /// 「同じ行数は積まない」で落ちて、その読みで出た行が本を開いた時刻になる。
+    /// 20 分プロンプトで待ってから打った命令の出力が 20 分前の時刻になり、
+    /// ただ喋り続けていた本より下に沈む。探している行はたいていそれである。
+    created_at: Instant,
 }
 
 impl Ticks {
-    /// 目盛りを 1 つ入れた環を作る。
+    /// 目盛りを 1 つも持たない環を作る。作った時刻だけを覚えておく。
     ///
-    /// 種を入れるのは、一度も行を押し出していない本（開いたばかり・静かな本・
-    /// 流れる前に代替画面へ入った本）の行にも時刻を付けるためである。空の環では
-    /// `time_of` が `None` を返し、その行が全セッション検索で時刻の無い件になって
-    /// しまう。種の時刻は本を開いた時刻なので、静かな古い行を本当に新しい行より
-    /// 上に出すことはない。
-    ///
-    /// 代わりに、最初に**押し出した**読みの目盛りが `push` の「同じ行数は積まない」で
-    /// 落ちる。本を開いた数ミリ秒後に来るのはプロンプトの読みで、あれは 1 行も
-    /// 押し出さないので目盛りを取らない。最初に押し出すのは画面より長い出力を出した
-    /// 読みで、それは何分も後かもしれない。その読みで出た行は、本当の時刻ではなく
-    /// 本を開いた時刻になる。それ以降の読みは正しく日付が付く。
-    /// 古く見えるぶんには倒れるので、静かな古い行が本当に新しい行より上へ出ることはない。
+    /// 目盛りは行を押し出した読みが積む。環が空のあいだ `time_of` と `newest` は
+    /// 作った時刻を返すので、一度も押し出していない本の行にも時刻が付く。
+    /// 最初に押し出した読みの目盛りは、環が空なので必ず積まれる。
     pub fn new() -> Self {
         Self {
-            marks: VecDeque::from([(0, Instant::now())]),
-        }
-    }
-
-    /// 目盛りを 1 つも持たない環。
-    ///
-    /// 環そのものの決まり（積む・捨てる・引く）を確かめる試験のためにある。
-    /// `new` の種が入っていると、試験が置いた目盛りが「同じ行数は積まない」や
-    /// 「1 秒おきに積む」で落ちてしまう。種の入らない道はここだけにしてある。
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
-        Self {
             marks: VecDeque::new(),
+            created_at: Instant::now(),
         }
     }
 
@@ -131,20 +122,25 @@ impl Ticks {
     ///
     /// 目盛りを捨てたぶんの時刻は分からない。残っている最古の時刻を返す。
     /// その行がそれより古いことは確かである。
+    /// 目盛りが 1 つも無ければ、本を開いた時刻を返す。
     pub fn time_of(&self, serial: i64) -> Option<Instant> {
         let after = self
             .marks
             .partition_point(|&(pushed, _)| (pushed as i64) <= serial);
-        self.marks.get(after.saturating_sub(1)).map(|&(_, at)| at)
+        Some(
+            self.marks
+                .get(after.saturating_sub(1))
+                .map_or(self.created_at, |&(_, at)| at),
+        )
     }
 
     /// いちばん新しい目盛りの時刻。
     ///
     /// 代替画面の行は通し番号が引けない（`pushed` が進まないので、付けた番号は
     /// 本画面の無関係な行を指す）。その行には、この本が最後に行を押し出した
-    /// 時刻を代わりに付ける。
+    /// 時刻を代わりに付ける。1 行も押し出していなければ、本を開いた時刻になる。
     pub fn newest(&self) -> Option<Instant> {
-        self.marks.back().map(|&(_, at)| at)
+        Some(self.marks.back().map_or(self.created_at, |&(_, at)| at))
     }
 }
 
@@ -599,7 +595,7 @@ mod tests {
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_secs(1);
         let t2 = t0 + Duration::from_secs(2);
-        let mut ticks = Ticks::empty();
+        let mut ticks = Ticks::new();
         ticks.push(10, t0);
         ticks.push(20, t1);
         ticks.push(30, t2);
@@ -610,22 +606,29 @@ mod tests {
             Some(t0),
             "一番古い目盛りより前なら、残っている最古の時刻を返す"
         );
-        assert_eq!(
-            Ticks::empty().time_of(1),
-            None,
-            "目盛りが無ければ時刻も無い"
-        );
     }
 
     #[test]
-    fn 作った時点の時刻を種にする() {
+    fn 目盛りが無ければ作った時刻を返す() {
         // 一度も行を押し出していない本でも、行から時刻が引けること。
-        // 引けないと、その本の行が全セッション検索で時刻の無い件になってしまう。
+        let before = Instant::now();
         let ticks = Ticks::new();
-        assert!(ticks.time_of(0).is_some(), "画面の行にも時刻が付く");
-        assert!(ticks.time_of(-5).is_some(), "履歴側の行にも時刻が付く");
-        assert_eq!(ticks.newest(), ticks.time_of(0), "目盛りは 1 つだけ");
-        assert_eq!(Ticks::empty().newest(), None);
+        let after = Instant::now();
+        let at = ticks.time_of(0).expect("作った時刻を返す");
+        assert!(at >= before && at <= after, "本を開いた時刻である");
+        assert_eq!(ticks.time_of(-5), Some(at), "履歴側の行にも同じ時刻が付く");
+        assert_eq!(ticks.newest(), Some(at), "最後の目盛りも作った時刻になる");
+    }
+
+    #[test]
+    fn 最初に押し出した読みの目盛りが残る() {
+        // 20 分プロンプトで待ってから打った命令の出力は、その読みの時刻になること。
+        // 作った時刻を目盛りとして積むと、この読みの目盛りが「同じ行数は積まない」で
+        // 落ちて、出力が 20 分前の時刻になってしまう。探している行はたいていそれである。
+        let mut ticks = Ticks::new();
+        let first = Instant::now() + Duration::from_secs(1200);
+        ticks.mark_read(0, 76, first);
+        assert_eq!(ticks.time_of(30), Some(first), "出力はその読みの時刻になる");
     }
 
     #[test]
@@ -634,7 +637,7 @@ mod tests {
         // 目盛りに入れるのは読む前の数なので、2 つめで出た行は 2 つめの時刻になる。
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_secs(600);
-        let mut ticks = Ticks::empty();
+        let mut ticks = Ticks::new();
         ticks.push(0, t0);
         ticks.push(76, t1);
         assert_eq!(ticks.time_of(150), Some(t1), "2 つめの出力で出た行");
@@ -649,7 +652,7 @@ mod tests {
         let t0 = Instant::now();
         let prompt = t0 + Duration::from_secs(1);
         let t1 = t0 + Duration::from_secs(600);
-        let mut ticks = Ticks::empty();
+        let mut ticks = Ticks::new();
         ticks.mark_read(0, 76, t0);
         ticks.mark_read(76, 76, prompt);
         ticks.mark_read(76, 176, t1);
@@ -660,7 +663,7 @@ mod tests {
     #[test]
     fn 同じ行数の目盛りは積まない() {
         let t0 = Instant::now();
-        let mut ticks = Ticks::empty();
+        let mut ticks = Ticks::new();
         ticks.push(10, t0);
         ticks.push(10, t0 + Duration::from_secs(1));
         assert_eq!(ticks.time_of(10), Some(t0), "先に見た時刻を残す");
@@ -669,7 +672,7 @@ mod tests {
     #[test]
     fn 目盛りは一秒おきに積む() {
         let t0 = Instant::now();
-        let mut ticks = Ticks::empty();
+        let mut ticks = Ticks::new();
         ticks.push(10, t0);
         ticks.push(20, t0 + Duration::from_millis(500));
         assert_eq!(ticks.time_of(20), Some(t0), "1 秒経っていないので積まない");
@@ -684,7 +687,7 @@ mod tests {
     #[test]
     fn 目盛りは古いものから捨てる() {
         let t0 = Instant::now();
-        let mut ticks = Ticks::empty();
+        let mut ticks = Ticks::new();
         for i in 0..(TICKS as u64 + 100) {
             ticks.push(i, t0 + Duration::from_secs(i));
         }
