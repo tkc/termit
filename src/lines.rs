@@ -8,8 +8,8 @@
 //! 行数 `pushed` を足せば、その行に一度しか付かない番号になる（`serial`）。
 //! 逆に、覚えておいた番号からいまの行位置も出せる（`line_of`）。
 //!
-//! 番号を引く側（`serial`・`line_of`・`Ticks::time_of`）の読み手は左ペインの検索で、
-//! まだ入っていない。数える側だけを先に置いている。
+//! 番号を引く側（`serial`・`line_of`・`Ticks::time_of`）の読み手は、左ペインの
+//! 全セッション検索（`scan.rs`）である。
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -28,13 +28,11 @@ use alacritty_terminal::Term;
 use crate::term::EventProxy;
 
 /// 行位置 `line` の通し番号。画面の最上段がちょうど `pushed` になる。
-#[allow(dead_code)]
 pub fn serial(pushed: u64, line: i32) -> i64 {
     pushed as i64 + i64::from(line)
 }
 
 /// 通し番号 `serial` がいまどの行位置にあるか。履歴から押し出されていれば `None`。
-#[allow(dead_code)]
 pub fn line_of(serial: i64, pushed: u64, history_size: usize) -> Option<i32> {
     let line = serial - pushed as i64;
     if line < -(history_size as i64) {
@@ -59,15 +57,43 @@ pub const TICKS: usize = 4096;
 const TICK_GAP: Duration = Duration::from_secs(1);
 
 /// 通し番号と時刻の対応。古いものから捨てる環である。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Ticks {
     /// `(そのときまでに押し出した行数, 時刻)`。行数の昇順に並ぶ。
     marks: VecDeque<(u64, Instant)>,
 }
 
 impl Ticks {
+    /// 目盛りを 1 つ入れた環を作る。
+    ///
+    /// 種を入れるのは、一度も行を押し出していない本（開いたばかり・静かな本・
+    /// 流れる前に代替画面へ入った本）の行にも時刻を付けるためである。空の環では
+    /// `time_of` が `None` を返し、その行が全セッション検索で時刻の無い件になって
+    /// しまう。種の時刻は本を開いた時刻なので、静かな古い行を本当に新しい行より
+    /// 上に出すことはない。
+    ///
+    /// 代わりに、最初に**押し出した**読みの目盛りが `push` の「同じ行数は積まない」で
+    /// 落ちる。本を開いた数ミリ秒後に来るのはプロンプトの読みで、あれは 1 行も
+    /// 押し出さないので目盛りを取らない。最初に押し出すのは画面より長い出力を出した
+    /// 読みで、それは何分も後かもしれない。その読みで出た行は、本当の時刻ではなく
+    /// 本を開いた時刻になる。それ以降の読みは正しく日付が付く。
+    /// 古く見えるぶんには倒れるので、静かな古い行が本当に新しい行より上へ出ることはない。
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            marks: VecDeque::from([(0, Instant::now())]),
+        }
+    }
+
+    /// 目盛りを 1 つも持たない環。
+    ///
+    /// 環そのものの決まり（積む・捨てる・引く）を確かめる試験のためにある。
+    /// `new` の種が入っていると、試験が置いた目盛りが「同じ行数は積まない」や
+    /// 「1 秒おきに積む」で落ちてしまう。種の入らない道はここだけにしてある。
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            marks: VecDeque::new(),
+        }
     }
 
     /// 1 回の読みを目盛りに残す。`before` は読む前、`after` は読んだ後の行数。
@@ -105,12 +131,26 @@ impl Ticks {
     ///
     /// 目盛りを捨てたぶんの時刻は分からない。残っている最古の時刻を返す。
     /// その行がそれより古いことは確かである。
-    #[allow(dead_code)]
     pub fn time_of(&self, serial: i64) -> Option<Instant> {
         let after = self
             .marks
             .partition_point(|&(pushed, _)| (pushed as i64) <= serial);
         self.marks.get(after.saturating_sub(1)).map(|&(_, at)| at)
+    }
+
+    /// いちばん新しい目盛りの時刻。
+    ///
+    /// 代替画面の行は通し番号が引けない（`pushed` が進まないので、付けた番号は
+    /// 本画面の無関係な行を指す）。その行には、この本が最後に行を押し出した
+    /// 時刻を代わりに付ける。
+    pub fn newest(&self) -> Option<Instant> {
+        self.marks.back().map(|&(_, at)| at)
+    }
+}
+
+impl Default for Ticks {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -559,7 +599,7 @@ mod tests {
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_secs(1);
         let t2 = t0 + Duration::from_secs(2);
-        let mut ticks = Ticks::new();
+        let mut ticks = Ticks::empty();
         ticks.push(10, t0);
         ticks.push(20, t1);
         ticks.push(30, t2);
@@ -570,7 +610,22 @@ mod tests {
             Some(t0),
             "一番古い目盛りより前なら、残っている最古の時刻を返す"
         );
-        assert_eq!(Ticks::new().time_of(1), None, "目盛りが無ければ時刻も無い");
+        assert_eq!(
+            Ticks::empty().time_of(1),
+            None,
+            "目盛りが無ければ時刻も無い"
+        );
+    }
+
+    #[test]
+    fn 作った時点の時刻を種にする() {
+        // 一度も行を押し出していない本でも、行から時刻が引けること。
+        // 引けないと、その本の行が全セッション検索で時刻の無い件になってしまう。
+        let ticks = Ticks::new();
+        assert!(ticks.time_of(0).is_some(), "画面の行にも時刻が付く");
+        assert!(ticks.time_of(-5).is_some(), "履歴側の行にも時刻が付く");
+        assert_eq!(ticks.newest(), ticks.time_of(0), "目盛りは 1 つだけ");
+        assert_eq!(Ticks::empty().newest(), None);
     }
 
     #[test]
@@ -579,7 +634,7 @@ mod tests {
         // 目盛りに入れるのは読む前の数なので、2 つめで出た行は 2 つめの時刻になる。
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_secs(600);
-        let mut ticks = Ticks::new();
+        let mut ticks = Ticks::empty();
         ticks.push(0, t0);
         ticks.push(76, t1);
         assert_eq!(ticks.time_of(150), Some(t1), "2 つめの出力で出た行");
@@ -594,7 +649,7 @@ mod tests {
         let t0 = Instant::now();
         let prompt = t0 + Duration::from_secs(1);
         let t1 = t0 + Duration::from_secs(600);
-        let mut ticks = Ticks::new();
+        let mut ticks = Ticks::empty();
         ticks.mark_read(0, 76, t0);
         ticks.mark_read(76, 76, prompt);
         ticks.mark_read(76, 176, t1);
@@ -605,7 +660,7 @@ mod tests {
     #[test]
     fn 同じ行数の目盛りは積まない() {
         let t0 = Instant::now();
-        let mut ticks = Ticks::new();
+        let mut ticks = Ticks::empty();
         ticks.push(10, t0);
         ticks.push(10, t0 + Duration::from_secs(1));
         assert_eq!(ticks.time_of(10), Some(t0), "先に見た時刻を残す");
@@ -614,7 +669,7 @@ mod tests {
     #[test]
     fn 目盛りは一秒おきに積む() {
         let t0 = Instant::now();
-        let mut ticks = Ticks::new();
+        let mut ticks = Ticks::empty();
         ticks.push(10, t0);
         ticks.push(20, t0 + Duration::from_millis(500));
         assert_eq!(ticks.time_of(20), Some(t0), "1 秒経っていないので積まない");
@@ -629,7 +684,7 @@ mod tests {
     #[test]
     fn 目盛りは古いものから捨てる() {
         let t0 = Instant::now();
-        let mut ticks = Ticks::new();
+        let mut ticks = Ticks::empty();
         for i in 0..(TICKS as u64 + 100) {
             ticks.push(i, t0 + Duration::from_secs(i));
         }

@@ -9,7 +9,6 @@
 //! 単位に注意する。`find_hit` が返すのは元の文字列の**バイト**位置、
 //! `window_around` が受け取り返すのは**文字**の添字である。
 
-use std::cmp::Ordering;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -19,6 +18,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Line;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::Term;
 
 use crate::lines::{self, Ticks};
@@ -104,7 +104,7 @@ pub enum HitKind {
 pub struct Hit {
     pub id: SessionId,
     pub kind: HitKind,
-    /// 当たった行の通し番号。名前・題名・枝なら `None`。
+    /// 当たった行の通し番号。名前・題名・枝と、代替画面の行なら `None`。
     pub serial: Option<i64>,
     /// その行が現れた時刻。目盛りが残っていなければ `None`。
     pub at: Option<Instant>,
@@ -154,13 +154,15 @@ pub fn scan(targets: &[Target], query: &str, redactor: &Redactor, limits: Limits
     for target in targets {
         scan_one(target, &needle, redactor, limits, &mut hits);
     }
-    // 新しい順に並べる。時刻の無い件（名前・題名・枝）は先頭へ置く。
-    // 安定な並べ替えなので、時刻が同じあいだは走った順＝本ごとの新しい順が残る。
-    hits.sort_by(|a, b| match (a.at, b.at) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(a), Some(b)) => b.cmp(&a),
+    // 新しい順に並べる。先頭に置くのは名前・題名・枝で、時刻が無いからではなく
+    // 行ではないからである。行の時刻は引けないこともある（目盛りの無い本、
+    // 目盛りを 1 つも持たない代替画面の本）。その行は後ろへ回す。
+    // 分からない行を、分かっている新しい行の上に出さない。
+    // 安定な並べ替えなので、同じ時刻のあいだは走った順＝本ごとの新しい順が残る。
+    hits.sort_by(|a, b| {
+        let pinned = |h: &Hit| h.kind != HitKind::Line;
+        // 時刻は `None` が小さいので、新しい順に並べれば後ろへ回る。
+        pinned(b).cmp(&pinned(a)).then_with(|| b.at.cmp(&a.at))
     });
     hits.truncate(limits.total);
     hits
@@ -227,14 +229,18 @@ fn scan_lines(
             return;
         }
         // この塊で当たったぶん。時刻は錠を放してから付ける。
-        let mut found: Vec<(i64, String, Range<usize>)> = Vec::new();
+        let mut found: Vec<(Option<i64>, String, Range<usize>)> = Vec::new();
         // この塊の先にまだ遡る行があるか。
         let more;
         {
             let term = target.term.lock();
+            // 代替画面に履歴は無い（`history_size()` が 0 になる）。`vim` や `less` が
+            // 開いているあいだは、いま出ている画面しか探せない。穴として受け入れる
+            // （仕様 §7）。そのうえ `pushed` は代替画面では進まないので、この画面の行に
+            // 通し番号を付けると本画面の無関係な履歴行を指してしまう。付けずに置く。
+            // 番号の無い件は、そのセッションへ切り替えて `⌘F` に語を渡すだけになる。
+            let alt = term.mode().contains(TermMode::ALT_SCREEN);
             let grid = term.grid();
-            // 代替画面の履歴行数は 0 である。`vim` や `less` が開いているあいだは
-            // いま出ている画面しか探せない。穴として受け入れる（仕様 §7）。
             let history = grid.history_size();
             let top = grid.screen_lines() as i32 - 1;
             // 行位置に足して通し番号にする数。グリッドと同じ錠の下で読む。
@@ -288,7 +294,7 @@ fn scan_lines(
                     continue;
                 }
                 last = Some(shown.clone());
-                found.push((row_serial, shown, hit));
+                found.push(((!alt).then_some(row_serial), shown, hit));
                 taken += 1;
             }
             next = Some(at);
@@ -304,8 +310,12 @@ fn scan_lines(
                 out.push(Hit {
                     id: target.id,
                     kind: HitKind::Line,
-                    serial: Some(serial),
-                    at: ticks.time_of(serial),
+                    serial,
+                    // 番号の引けない行には、この本が最後に押し出した時刻を付ける。
+                    at: match serial {
+                        Some(serial) => ticks.time_of(serial),
+                        None => ticks.newest(),
+                    },
                     text,
                     hit,
                 });
@@ -361,19 +371,13 @@ mod tests {
         crate::term::new_term(size, scrollback, proxy)
     }
 
-    /// 台本を流した `Target` を 1 本作る。
+    /// 台本を流した `Target` を 1 本作る。目盛りは呼ぶ側が渡す。
     ///
-    /// `at` を渡すと、その時刻の目盛りを 1 つだけ残す。目盛りが 1 つなら
-    /// どの行もその時刻になるので、本どうしの新しさを比べるのに足りる。
     /// 押し出した行数は走査では読むだけなので、試験では 0 のままにする。
-    fn target(id: SessionId, play: &[u8], at: Option<Instant>) -> Target {
+    fn target_with(id: SessionId, play: &[u8], ticks: Ticks) -> Target {
         let mut term = make_term(COLS, ROWS, 10_000);
         let mut parser: Processor<StdSyncHandler> = Processor::new();
         parser.advance(&mut term, play);
-        let mut ticks = Ticks::new();
-        if let Some(at) = at {
-            ticks.mark_read(0, 1, at);
-        }
         Target {
             id,
             term: Arc::new(FairMutex::new(term)),
@@ -383,6 +387,21 @@ mod tests {
             title: None,
             branch: None,
         }
+    }
+
+    /// 台本を流した `Target`。
+    ///
+    /// `at` を渡すとその時刻の目盛りを 1 つだけ置く。目盛りが 1 つならどの行も
+    /// その時刻になるので、本どうしの新しさを比べるのに足りる。`None` なら
+    /// 目盛りの無い本になり、行から時刻が引けない。
+    /// 環は `Ticks::empty` から作る。`Ticks::new` の種が入っていると、
+    /// 置いた目盛りが「同じ行数は積まない」で落ちてしまう。
+    fn target(id: SessionId, play: &[u8], at: Option<Instant>) -> Target {
+        let mut ticks = Ticks::empty();
+        if let Some(at) = at {
+            ticks.mark_read(0, 1, at);
+        }
+        target_with(id, play, ticks)
     }
 
     /// 伏せる式を 1 つも持たない `Redactor`。行の走りだけを見たいとき。
@@ -420,6 +439,32 @@ mod tests {
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!(hits[0].id, 2, "新しい本が先に来る");
         assert_eq!(hits[1].id, 1);
+    }
+
+    #[test]
+    fn 時刻の無い行は後ろへ回す() {
+        // 時刻の引けない行を、分かっている新しい行の上に出さない。
+        // 先頭に来るのは名前・題名・枝だけである。
+        let t0 = Instant::now();
+        let dated = target(1, &play(&["ses 時刻あり"]), Some(t0));
+        let mut undated = target(2, &play(&["ses 時刻なし"]), None);
+        undated.name = "ses の本".to_string();
+        let hits = scan(&[dated, undated], "ses", &plain(), Limits::default());
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(hits[0].kind, HitKind::Name, "名前は先頭に残る");
+        assert_eq!(hits[1].at, Some(t0), "時刻の分かる行が先");
+        assert_eq!(hits[2].at, None, "{hits:?}");
+    }
+
+    #[test]
+    fn 一度も流れていない本の行にも時刻が付く() {
+        // 開いたばかりの本は 1 行も押し出していないが、`Ticks::new` の種で
+        // 行から時刻が引ける。引けないと一覧の並びが決まらない。
+        let t = target_with(1, &play(&["ses one"]), Ticks::new());
+        let hits = scan(std::slice::from_ref(&t), "ses", &plain(), Limits::default());
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].at.is_some(), "{hits:?}");
+        assert!(hits[0].serial.is_some(), "本画面の行には通し番号が付く");
     }
 
     #[test]
@@ -540,7 +585,11 @@ mod tests {
         let mut script = play(&["main hit one", "main hit two"]);
         script.extend_from_slice(b"\x1b[?1049h");
         script.extend_from_slice(&play(&["alt hit one", "alt hit two"]));
-        let t = target(1, &script, None);
+        let t0 = Instant::now();
+        let t = target(1, &script, Some(t0));
+        // 本画面で押し出した行のぶん、目盛りを 2 つ持たせる。
+        let newest = t0 + Duration::from_secs(60);
+        t.ticks.lock().expect("目盛りの錠").mark_read(1, 2, newest);
         assert!(t.term.lock().mode().contains(TermMode::ALT_SCREEN));
         assert_eq!(
             t.term.lock().grid().history_size(),
@@ -551,6 +600,10 @@ mod tests {
         let hits = scan(std::slice::from_ref(&t), "hit", &plain(), Limits::default());
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert!(hits.iter().all(|h| h.text.starts_with("alt")), "{hits:?}");
+        // 代替画面の行に通し番号は付けない。`pushed` が進まないので、付けると
+        // 本画面の無関係な履歴行を指す。時刻は最後の目盛りから取る。
+        assert!(hits.iter().all(|h| h.serial.is_none()), "{hits:?}");
+        assert!(hits.iter().all(|h| h.at == Some(newest)), "{hits:?}");
     }
 
     #[test]
