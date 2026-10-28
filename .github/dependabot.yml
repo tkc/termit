@@ -1,0 +1,20 @@
+version: 2
+
+# 依存の更新は月に一度でよい。数は 20 ほどで、週ごとに出すと
+# 更新の PR を読むほうが仕事になる。Cargo は 1 本にまとめ、
+# Actions は別に出す。
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
