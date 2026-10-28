@@ -2473,6 +2473,11 @@ mod sidebar {
     /// 描く側と当たり判定で同じ値を使う。食い違うと、窓を押したのに
     /// セッションが増える。
     pub const PLUS_ZONE: f32 = 24.0;
+    /// 変換中に、検索窓の中で変換中の文字列へ必ず残す幅。
+    ///
+    /// 確定した語が窓いっぱいに伸びていると、変換中の文字列に幅が残らず、
+    /// いま打っている字が見えなくなる。全角で 4 字ぶん（12pt）より少し広く取る。
+    pub const MIN_PREEDIT: f32 = 56.0;
     /// 区切り線の上下の余白。
     pub const SEP_PAD: f32 = 8.0;
 
@@ -2883,18 +2888,31 @@ fn draw_search_box(state: &mut State, sl: &SidebarLayout, theme: &Theme) {
         .map(|a| a.query.clone())
         .unwrap_or_default();
     // 打っている末尾を残す。先頭が落ちる。
-    let shown = state.renderer.fit_head(&query, st, avail);
+    // 変換中は、変換中の文字列のぶんを先に取り分ける。
+    let (query_w, preedit_w) =
+        split_box_width(avail, !state.preedit.is_empty(), sidebar::MIN_PREEDIT * sc);
+    let shown = state.renderer.fit_head(&query, st, query_w);
     x += state
         .renderer
         .put_text_px(x, ty, &shown, st, theme.fg_primary);
     // 箱の右端までに収める。下敷きは窓自身の色にする。
-    let room = (sl.rect_x + box_w - pad - x).max(0.0);
-    x += draw_preedit_px(state, x, ty, st, theme, Some((room, theme.surface)));
+    x += draw_preedit_px(state, x, ty, st, theme, Some((preedit_w, theme.surface)));
     state
         .renderer
         .fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
     // 候補窓はここへ寄せる。`draw_terminal` は箱に入っているあいだ書かない。
     state.cursor_px = Some((x, ty));
+}
+
+/// 窓の中の幅を、確定した語と変換中の文字列へ分ける。
+/// 変換中は、いま打っている末尾が必ず見えるだけの幅を残す。
+fn split_box_width(avail: f32, composing: bool, min_preedit: f32) -> (f32, f32) {
+    let avail = avail.max(0.0);
+    if !composing {
+        return (avail, 0.0);
+    }
+    let preedit = min_preedit.min(avail);
+    (avail - preedit, preedit)
 }
 
 /// 結果の 1 件を描くのに要るもの。`renderer` を触る前に写し取る。
@@ -3798,7 +3816,8 @@ fn draw_preedit_px(
         return 0.0;
     }
     let (text, under) = match bound {
-        Some((room, color)) => (state.renderer.fit_tail(&state.preedit, st, room), color),
+        // 窓の中では、いま打っている末尾を残す。他の呼び手は切らない。
+        Some((room, color)) => (state.renderer.fit_head(&state.preedit, st, room), color),
         None => (state.preedit.clone(), theme.chrome_bg),
     };
     let w = state.renderer.measure_px(&text, st);
@@ -4483,6 +4502,17 @@ mod search_view_tests {
         a.query.push_str("ab ");
         a.push_pasted("cd\r\nef\tg\n");
         assert_eq!(a.query, "ab cd  efg ");
+    }
+
+    #[test]
+    fn 変換中は窓の幅から文字列のぶんを先に取り分ける() {
+        // 変換中でなければ、幅は全部が語のもの。
+        assert_eq!(split_box_width(100.0, false, 56.0), (100.0, 0.0));
+        // 広い窓は、指定のぶんだけ変換中へ割く。
+        assert_eq!(split_box_width(100.0, true, 56.0), (44.0, 56.0));
+        // 狭い窓でも、語の幅が負にならない。
+        assert_eq!(split_box_width(30.0, true, 56.0), (0.0, 30.0));
+        assert_eq!(split_box_width(-5.0, true, 56.0), (0.0, 0.0));
     }
 
     #[test]

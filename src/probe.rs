@@ -253,8 +253,9 @@ pub fn run(out_path: &str) {
                 selected: 1,
                 ..Default::default()
             });
-            // 変換中の文字列が窓へ出ることも確かめる。
-            state.preedit = "まっち".into();
+            // 変換中の文字列が窓へ出ることも確かめる。窓に収まらない長さにして、
+            // 切れ方（末尾が残ること）と、語が窓いっぱいでも幅が残ることを見る。
+            state.preedit = "けんさくごをながくへんかんしているところ".into();
         }
         Ok("preedit") => {
             state.preedit = "あっだ".into();
