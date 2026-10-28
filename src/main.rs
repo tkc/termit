@@ -158,7 +158,8 @@ fn main() {
             .then(Counters::default),
         resize_quiet_since: None,
         agent_state_at: None,
-        redactor_seed: redactor,
+        // 走査スレッドへも同じものを渡す。式を 2 度組み立てはしない。
+        redactor_seed: Arc::new(redactor),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("termit: {e}");
@@ -267,6 +268,62 @@ impl SearchState {
     }
 }
 
+/// 打鍵が止まったと見なすまでの間。
+///
+/// 打鍵ごとには走らせない（仕様 §10）。走査は別スレッドへ出すが、
+/// 出したところで 1 字ごとに始めれば、14 本ぶんの錠を取り合うだけになる。
+const SCAN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// 全セッションを横断する検索。左ペインの箱と、そこに出す当たりの一覧。
+///
+/// `⌘⇧F` では空のまま置く。語が変わるたびに `typed_at` を更新し、
+/// 手が止まったところで走らせる。受けた結果は次の打鍵まで固める（仕様 §12）。
+#[derive(Default)]
+pub(crate) struct CrossSearch {
+    pub(crate) query: String,
+    /// いま待っている走査の世代。これと違う世代の結果は捨てる。
+    pub(crate) generation: u64,
+    /// 最後に語が変わった時刻。走っていないあいだは `None`。
+    pub(crate) typed_at: Option<std::time::Instant>,
+    /// いま出している当たり。新しい順に並んでいる。
+    pub(crate) hits: Vec<scan::Hit>,
+    pub(crate) selected: usize,
+    /// 一覧の先頭に出している位置。選んでいる件が外へ出ないよう追う。
+    pub(crate) offset: usize,
+}
+
+impl CrossSearch {
+    /// 走査の結果を受ける。入れ替えたなら `true`。
+    ///
+    /// 世代が合わないのは、この結果が帰るより先に次の走査を始めた場合である。
+    /// 走査は別スレッドで走るので、結果は打った順に帰るとは限らない。
+    /// 遅れて届いた古い結果で、新しい結果を上書きしない。
+    fn accept(&mut self, generation: u64, hits: Vec<scan::Hit>) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.hits = hits;
+        self.selected = 0;
+        self.offset = 0;
+        true
+    }
+
+    /// 選んでいる件が見える範囲に入るよう、出す位置を合わせる。
+    ///
+    /// `rows` は結果を置ける件数。1 件が 2 段を取るので、左ペインの高さで変わる。
+    // 呼ぶのは一覧を動かす仕事（↑ と ↓）。それまで読み手がいない。
+    #[allow(dead_code)]
+    fn follow(&mut self, rows: usize) {
+        // 1 件も置けない高さでも、選んでいる件を追い越さない。
+        let rows = rows.max(1);
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + rows {
+            self.offset = self.selected + 1 - rows;
+        }
+    }
+}
+
 pub(crate) struct State {
     renderer: Renderer,
     manager: Manager,
@@ -281,6 +338,13 @@ pub(crate) struct State {
     sidebar_width: f32,
     /// 画面の中の検索。
     find: Option<search::ScreenSearch>,
+    /// 全セッションを横断する検索。開いていなければ `None`。
+    pub(crate) across: Option<CrossSearch>,
+    /// 次に走らせる走査の世代。1 つずつ増やすだけで、戻さない。
+    ///
+    /// `CrossSearch` の中に置くと `⌘⇧F` で箱を開き直すたびに 0 へ戻る。
+    /// 走り続けている前の走査が、新しい箱の世代と一致して受け取られてしまう。
+    scan_generation: u64,
     /// 見えている範囲で強調するセル。
     find_cells: std::collections::HashSet<(i32, usize)>,
     /// そのうち、いま選んでいる一致のセル。
@@ -307,7 +371,9 @@ pub(crate) struct State {
     /// 窓が完全に隠れているか。隠れているあいだは組み立てもしない。
     occluded: bool,
     /// 画面で伏せる式。起動時に 1 度だけ組み立てる。
-    pub(crate) redactor: crate::secret::Redactor,
+    ///
+    /// 横断検索の走査スレッドにも同じものを渡すので `Arc` で持つ。
+    pub(crate) redactor: Arc<crate::secret::Redactor>,
     /// セッションの並びが変わった。少し置いてから書き出す。
     state_dirty: bool,
     /// 最後に書き出した時刻。
@@ -437,7 +503,7 @@ struct App {
     /// 返事待ちを最後に調べた時刻。毎フレーム画面を読まないための間隔。
     agent_state_at: Option<std::time::Instant>,
     /// 画面を作るときに State へ渡す式。組み立ては起動時に済ませてある。
-    redactor_seed: crate::secret::Redactor,
+    redactor_seed: Arc<crate::secret::Redactor>,
 }
 
 /// 画面の割り付け。すべてセル単位で扱う。
@@ -472,6 +538,9 @@ impl ApplicationHandler<UiEvent> for App {
                 if s.needs_redraw
                     || s.manager.has_pending_size()
                     || s.manager.sessions().iter().any(|x| x.shown_working)
+                    // 横断検索の走査を始めるのは描画の最後なので、
+                    // 頃合いになっても描き直さなければ始まらない。
+                    || s.across.as_ref().is_some_and(|a| a.typed_at.is_some())
                 {
                     s.request_redraw();
                 }
@@ -512,6 +581,8 @@ impl ApplicationHandler<UiEvent> for App {
             rename: None,
             sidebar_width: self.config.window.sidebar_width,
             find: None,
+            across: None,
+            scan_generation: 0,
             find_cells: Default::default(),
             find_current: Default::default(),
             mouse: MouseState::default(),
@@ -641,6 +712,17 @@ impl ApplicationHandler<UiEvent> for App {
                     }
                 }
                 state.recent_for = None;
+            }
+            UiEvent::Scanned(generation, hits) => {
+                // 描き直すかどうかは `wants_redraw` では決められない。
+                // 古い世代の結果なら、出ているものは何も変わらない。
+                let took = state
+                    .across
+                    .as_mut()
+                    .is_some_and(|across| across.accept(generation, hits));
+                if took {
+                    state.request_redraw();
+                }
             }
         }
         if redraw {
@@ -1619,6 +1701,9 @@ fn wants_redraw(
         UiEvent::Command(id, _) => shown(*id),
         // 目に見えるものは変わらない。
         UiEvent::ClipboardStore(_, _) | UiEvent::ClipboardLoad(_, _) => false,
+        // 古い世代なら一覧は変わらない。受け取れたかどうかで分かれるので、
+        // 描き直しは受け取る分岐が決める。
+        UiEvent::Scanned(_, _) => false,
     }
 }
 
@@ -1885,6 +1970,67 @@ impl App {
         search.offset = 0;
     }
 
+    /// 語が変わったことを覚える。走らせるのは手が止まってからである（仕様 §10）。
+    // 呼ぶのは箱の鍵を受ける仕事。それまで読み手がいない。
+    #[allow(dead_code)]
+    fn queue_scan(&mut self) {
+        let Some(across) = self.state.as_mut().and_then(|s| s.across.as_mut()) else {
+            return;
+        };
+        across.typed_at = Some(std::time::Instant::now());
+    }
+
+    /// 走査を別スレッドで始める。
+    ///
+    /// UI スレッドは `scan` を呼ばない（仕様 §4）。1 フレームの余白は 0.3ms ほどで、
+    /// 14 本 × 10000 行の走査はそこに入らない。別スレッドへ渡すのは `Arc` の複製と
+    /// 短い文字列だけで、`Term` の中身は写さない（仕様 §10）。
+    /// 結果は `UiEvent::Scanned` で帰ってくる。
+    fn start_scan(&mut self) {
+        let ui_tx: crate::term::UiSender = self.proxy.clone().into();
+        let Some(state) = &mut self.state else { return };
+        let Some(across) = &mut state.across else {
+            return;
+        };
+        // 走らせるかどうかに関わらず、待ちは解く。残すと過ぎた時刻で起こされ続ける。
+        across.typed_at = None;
+        // 語が空白だけなら走らせない。一覧はセッションのものに戻っている。
+        if across.query.trim().is_empty() {
+            return;
+        }
+        state.scan_generation += 1;
+        across.generation = state.scan_generation;
+        let generation = across.generation;
+        let query = across.query.clone();
+        let targets: Vec<scan::Target> = state
+            .manager
+            .sessions()
+            .iter()
+            .map(|s| scan::Target {
+                id: s.id,
+                term: s.term.clone(),
+                pushed: s.pushed.clone(),
+                ticks: s.ticks.clone(),
+                // 探すのは左ペインに出ている名前である（仕様 §7）。
+                name: s.display_name().0,
+                title: s.window_title.clone(),
+                branch: s.branch.clone(),
+            })
+            .collect();
+        let redactor = state.redactor.clone();
+        let spawned = std::thread::Builder::new()
+            .name("termit-scan".into())
+            .spawn(move || {
+                let hits = scan::scan(&targets, &query, &redactor, scan::Limits::default());
+                // 窓が閉じていれば送り先はもう無い。結果は捨てる。
+                let _ = ui_tx.send_event(UiEvent::Scanned(generation, hits));
+            });
+        if let Err(e) = spawned {
+            // スレッドが作れないなら、この走査だけ諦める。端末は動き続ける。
+            log::warn!("cannot start the cross-session scan: {e}");
+        }
+    }
+
     // ---------------------------------------------------------------- 描画
 
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
@@ -2002,6 +2148,20 @@ impl App {
         if let Some(state) = &self.state {
             if state.manager.sessions().iter().any(|s| s.shown_working) {
                 want(std::time::Instant::now() + WORKING_REFRESH);
+            }
+        }
+        // 横断検索の語が変わっているなら、手が止まったころに走らせる。
+        let scan_due = self
+            .state
+            .as_ref()
+            .and_then(|s| s.across.as_ref())
+            .and_then(|across| across.typed_at)
+            .map(|at| at + SCAN_DEBOUNCE);
+        if let Some(due) = scan_due {
+            if due <= std::time::Instant::now() {
+                self.start_scan();
+            } else {
+                want(due);
             }
         }
         if let Some(at) = wake {
@@ -3306,6 +3466,12 @@ mod tests {
             Some(3),
             false
         ));
+        // 走査の結果は、受け取れたかどうかで変わる。ここでは決めない。
+        assert!(!wants_redraw(
+            &UiEvent::Scanned(1, Vec::new()),
+            Some(3),
+            false
+        ));
     }
 
     fn px(y: f64) -> MouseScrollDelta {
@@ -3425,6 +3591,70 @@ mod tests {
     fn 括弧付き貼り付けに印を付ける() {
         let got = bracketed("x", TermMode::BRACKETED_PASTE);
         assert_eq!(got, b"\x1b[200~x\x1b[201~");
+    }
+
+    /// 走査は別スレッドで走るので、結果は打った順に帰ってくるとは限らない。
+    /// 遅れて来た古い結果で、新しい結果を上書きしないこと。
+    mod 横断検索の受け口 {
+        use super::*;
+
+        fn 当たり(text: &str) -> crate::scan::Hit {
+            crate::scan::Hit {
+                id: 1,
+                kind: crate::scan::HitKind::Line,
+                serial: Some(0),
+                at: None,
+                text: text.into(),
+                hit: 0..text.len(),
+            }
+        }
+
+        #[test]
+        fn 古い世代の結果は捨てる() {
+            // 世代 2 を待っているあいだに、1 本前の走査が結果を持って帰ってくる。
+            let mut across = CrossSearch {
+                query: "ses".into(),
+                generation: 2,
+                ..CrossSearch::default()
+            };
+            assert!(!across.accept(1, vec![当たり("古い")]), "古い世代を受けた");
+            assert!(across.hits.is_empty(), "古い世代の結果で入れ替わった");
+
+            // 待っていた世代なら受ける。選んでいた位置は先頭へ戻す。
+            across.selected = 4;
+            across.offset = 2;
+            assert!(across.accept(2, vec![当たり("新しい")]));
+            assert_eq!(across.hits.len(), 1);
+            assert_eq!(across.hits[0].text, "新しい");
+            assert_eq!((across.selected, across.offset), (0, 0));
+
+            // 受け取ったあとで届いた古い世代も捨てる。
+            assert!(!across.accept(1, vec![当たり("もっと古い")]));
+            assert_eq!(across.hits[0].text, "新しい", "古い結果に戻された");
+        }
+
+        #[test]
+        fn 選んでいる件が窓から出ないよう追う() {
+            // 窓は 3 件。下へ出たら、下端に付いてくる。
+            let mut across = CrossSearch {
+                selected: 5,
+                ..CrossSearch::default()
+            };
+            across.follow(3);
+            assert_eq!(across.offset, 3);
+            // 窓の中にいるあいだは動かさない。
+            across.selected = 4;
+            across.follow(3);
+            assert_eq!(across.offset, 3);
+            // 上へ出たら、上端に付いてくる。
+            across.selected = 1;
+            across.follow(3);
+            assert_eq!(across.offset, 1);
+            // 1 件も置けない高さでも、選んでいる件を追い越さない。
+            across.selected = 7;
+            across.follow(0);
+            assert_eq!(across.offset, 7);
+        }
     }
 }
 

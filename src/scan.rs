@@ -140,8 +140,6 @@ impl Default for Limits {
 ///
 /// 走るのは別スレッドである（仕様 §10）。1 フレームの余白は 0.3ms ほどしかなく、
 /// 10000 行の走査はそこに入らない。
-// 呼ぶのは次の仕事（別スレッドで走らせ、結果を UI へ渡す）。それまで読み手がいない。
-#[allow(dead_code)]
 pub fn scan(targets: &[Target], query: &str, redactor: &Redactor, limits: Limits) -> Vec<Hit> {
     // 針も 1 文字ずつ小文字にする。`find_hit` は干し草を `char::to_lowercase` で
     // 小文字にするので、こちらだけ `str::to_lowercase` を使うと食い違う。
