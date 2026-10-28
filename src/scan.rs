@@ -103,8 +103,6 @@ pub struct Hit {
     pub id: SessionId,
     pub kind: HitKind,
     /// 当たった行の通し番号。名前・題名・枝と、代替画面の行なら `None`。
-    // 読むのは選んで飛ぶ仕事。それまで試験のほかに読み手がいない。
-    #[allow(dead_code)]
     pub serial: Option<i64>,
     /// その行が現れた時刻。目盛りが残っていなければ `None`。
     pub at: Option<Instant>,
@@ -274,18 +272,7 @@ fn scan_lines(
                 at -= 1;
                 walked += 1;
 
-                text.clear();
-                for cell in &grid[Line(row)][..] {
-                    // 全角の後ろ半分は実体を持たないコマなので飛ばす
-                    // （`session.rs` の `grid_text` と同じ規則）。
-                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                        continue;
-                    }
-                    text.push(cell.c);
-                }
-                while text.ends_with(' ') {
-                    text.pop();
-                }
+                row_text(grid, row, &mut text);
                 if text.is_empty() {
                     continue;
                 }
@@ -326,6 +313,27 @@ fn scan_lines(
         if !more {
             return;
         }
+    }
+}
+
+/// グリッドの 1 行を文字列にする。行末の空白は落とす。
+///
+/// 全角の後ろ半分は実体を持たないコマなので飛ばす（`session.rs` の `grid_text` と
+/// 同じ規則）。走査と、選んで飛ぶときの確かめが同じ読み方をするよう、ここに 1 つだけ置く。
+pub fn row_text(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    row: i32,
+    out: &mut String,
+) {
+    out.clear();
+    for cell in &grid[Line(row)][..] {
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        out.push(cell.c);
+    }
+    while out.ends_with(' ') {
+        out.pop();
     }
 }
 

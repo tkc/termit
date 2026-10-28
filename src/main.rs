@@ -2021,6 +2021,63 @@ impl App {
         }
     }
 
+    /// 結果の `n` 件目を開く。そのセッションへ切り替え、行が残っていればそこへ飛ぶ。
+    ///
+    /// 名前・題名・枝の件と、行が履歴から消えた件は、送り先が無いので切り替えて
+    /// 語を `⌘F` に渡すだけにする（仕様 §12）。
+    fn open_hit(&mut self, n: usize) {
+        let Some(state) = &mut self.state else { return };
+        let Some(across) = &state.across else { return };
+        let Some(hit) = across.hits.get(n).cloned() else {
+            return;
+        };
+        let query = across.query.clone();
+        // 閉じたセッションの件なら、何も動かさず窓も閉じない。
+        let ids: Vec<_> = state.manager.sessions().iter().map(|s| s.id).collect();
+        let Some(index) = position_of(&ids, hit.id) else {
+            return;
+        };
+        state.manager.select(index);
+        let mut find = search::ScreenSearch::new();
+        find.query = query.clone();
+        find.rebuild();
+        state.find = Some(find);
+        state.across = None;
+
+        let Some(serial) = hit.serial.filter(|_| hit.kind == scan::HitKind::Line) else {
+            return;
+        };
+        let needle = query.to_lowercase();
+        // 錠は 1 度の短い読みだけで放す。`pushed` はグリッドと同じ錠の下で読む。
+        let target = state.manager.selected().and_then(|session| {
+            let term = session.term.lock();
+            let pushed = session.pushed.load(std::sync::atomic::Ordering::Relaxed);
+            use alacritty_terminal::grid::Dimensions as _;
+            let grid = term.grid();
+            let history = grid.history_size();
+            let line = jump_target(Some(serial), pushed, history)?;
+            if line > grid.screen_lines() as i32 - 1 {
+                return None;
+            }
+            // 出力が流れていても番号から引き直した行を読む。語がもう無ければ
+            // 数え違い・書き換えなので、送らずに `find_step` へ任せる。
+            let mut text = String::new();
+            scan::row_text(grid, line, &mut text);
+            scan::find_hit(&text, &needle).map(|_| line)
+        });
+        match target {
+            Some(line) => {
+                if let Some(session) = state.manager.selected() {
+                    session.term.lock().scroll_to_point(Point::new(
+                        alacritty_terminal::index::Line(line),
+                        Column(0),
+                    ));
+                }
+            }
+            None => self.find_step(Direction::Left),
+        }
+    }
+
     fn on_search_key(&mut self, key: &Key, event: &winit::event::KeyEvent, mods: ModifiersState) {
         let Some(state) = &mut self.state else { return };
         let Some(search) = &mut state.search else {
@@ -2134,8 +2191,11 @@ impl App {
                 state.across = None;
                 return;
             }
-            // 飛ぶのは別の仕事である。ここで受けて、字として入らないようにする。
-            Key::Named(NamedKey::Enter) => return,
+            Key::Named(NamedKey::Enter) => {
+                let n = across.selected;
+                self.open_hit(n);
+                return;
+            }
             Key::Named(NamedKey::ArrowDown) => {
                 if !across.hits.is_empty() {
                     across.selected = (across.selected + 1) % across.hits.len();
@@ -4408,9 +4468,40 @@ mod tests {
     }
 }
 
+/// 通し番号がいまどの行位置か。番号が無い件と、履歴から消えた件は `None`。
+fn jump_target(serial: Option<i64>, pushed: u64, history: usize) -> Option<i32> {
+    serial.and_then(|serial| lines::line_of(serial, pushed, history))
+}
+
+/// `id` のセッションが並びの何番目か。閉じていれば `None`。
+fn position_of(ids: &[crate::session::SessionId], id: crate::session::SessionId) -> Option<usize> {
+    ids.iter().position(|&i| i == id)
+}
+
 #[cfg(test)]
 mod search_view_tests {
     use super::*;
+
+    #[test]
+    fn 流れた行は通し番号から引き直す() {
+        assert_eq!(jump_target(Some(97), 100, 10000), Some(-3));
+        // 30 行流れたあとは、同じ番号が 30 行ぶん上にある。
+        assert_eq!(jump_target(Some(97), 130, 10000), Some(-33));
+    }
+
+    #[test]
+    fn 消えた行なら送らずに語だけ渡す() {
+        assert_eq!(jump_target(None, 100, 10000), None);
+        assert_eq!(jump_target(Some(97), 120, 10), None);
+        assert_eq!(jump_target(Some(97), 120, 10000), Some(-23));
+    }
+
+    #[test]
+    fn 閉じたセッションの件は何もしない() {
+        let ids = [1, 3];
+        assert_eq!(position_of(&ids, 3), Some(1));
+        assert_eq!(position_of(&ids, 2), None);
+    }
 
     fn view(selected: usize, offset: usize) -> SearchState {
         SearchState {
