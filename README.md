@@ -135,7 +135,7 @@ Everything else goes to the child process untouched.
 
 **Searching across sessions** (`⌘⇧F`) walks every session on a worker thread,
 so typing never waits on it. It has one hole: a session sitting in the
-alternate screen (`vim`, `less`, most full-screen agent UIs) can only be
+alternate screen (`vim`, `less`, or any other full-screen program) can only be
 searched over the screen it is showing right now. Its real scrollback is parked
 in alacritty's `inactive_grid`, and nothing outside the crate can read it. The
 history comes back to the search when the program exits. A hit on such a

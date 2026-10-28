@@ -611,15 +611,16 @@ glyphon の `prepare` は `impl IntoIterator<Item = TextArea>` を取る。
    `term`・`pushed`・`ticks` の `Arc` を複製し、名前・題名・枝の文字列と語を複製する（`src/main.rs:2295-2310`）。
    `Redactor` も `Arc` の複製である（`src/main.rs:2310`）。グリッドは複製しない。
    スレッドを作るのは `std::thread::Builder::spawn` の 1 回で、描画の経路に走査の中身は入らない（`src/main.rs:2311`）。
-2. **描画の経路は走査も `Term` の錠も呼ばない。** 描画は結果の `Vec<Hit>`（最大 200 件）のうち、
+2. **描画の関数は走査も `Term` の錠も呼ばない。** 描画は結果の `Vec<Hit>`（最大 200 件）のうち、
    窓に見える数件だけを組む（`across_blocks`、`src/main.rs:2732-2750`）。
    `draw_across_hits`（`src/main.rs:3083`）から `draw_sidebar`（`src/main.rs:3201`）の範囲に、
    `scan::scan` の呼び出しも `term.lock()` も無い。履歴の長さに比例する仕事は無い。
+   `start_scan` はイベントループがフレームの最後に呼ぶ（`src/main.rs:2454`）が、することはスレッドへ仕事を渡すだけで、1 がその費用を述べている。
 3. **走査は `Limits::chunk` 行ごとに `Term` の錠を放す。** `scan_lines`（`src/scan.rs:214`）は、
    錠を取る `let term = target.term.lock()`（`src/scan.rs:242`）を塊ごとの内側の区画に入れ、
    `walked < chunk` で歩く行数を切る（`src/scan.rs:274`）。区画を抜けると錠が放れ、
    `ticks` はその後で取る（`src/scan.rs:300`）。1 本の履歴を取りっぱなしで走ることは無い。
-   1 塊は 256 行で、約 49ms を 547 塊（14 万行 / 256）で割ると、1 塊は約 90µs になる。
+   1 塊は 256 行で、塊は本ごとに切るので、全体で 14 x ceil(10024 / 256) = 560、約 550 塊になる。約 49ms を約 550 で割ると、1 塊は約 90µs になる。
    これは割り算の見積もりで、錠の保持時間を直接測ったものではない。
 
 **未了：実際のウィンドウでフレームの記録を見る確認。** この節を書いたのは窓も画面も無い環境で、

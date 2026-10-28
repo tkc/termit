@@ -148,7 +148,7 @@ fn scan_cost() {
     const HISTORY: usize = 10_000;
     const COLS: usize = 80;
     const LINES: usize = 24;
-    // どの行にも現れない語。
+    // 1 本に 1 行だけ現れる語。当たりが全体 200 件の上限に届かず、早じまいせずに全部歩く最悪の場合が測れる。
     const WORD: &str = "zebraquux";
 
     let targets: Vec<Target> = (0..SESSIONS)
