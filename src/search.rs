@@ -204,8 +204,8 @@ mod tests {
     }
 
     #[test]
-    fn 旗を立てなければ_smart_case_のままである() {
-        // `⌘F` 自身の振る舞いは変えない。大文字を含む語は区別する。
+    fn 旗を立てなければ大文字を含む語は区別する() {
+        // `⌘F` 自身の振る舞いは変えない。`RegexSearch::new` の smart-case のままである。
         let term = fed("the ses bounce handler\r\n");
         let mut s = ScreenSearch::new();
         s.query = "SES".into();
