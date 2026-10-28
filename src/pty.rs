@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
@@ -20,6 +20,7 @@ use crate::osc::{OscEvent, OscScanner};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 
+use crate::lines::{Counting, Ticks};
 use crate::session::{grid_text, CommandRecord, SessionId};
 use crate::term::{EventProxy, TermSize, UiEvent, UiSender};
 
@@ -77,6 +78,10 @@ pub struct Spawned {
     /// 描き直しの有無に左右されず、出力があったことだけを表す。
     /// 左ペインで「動いている」印を出すのに使う。
     pub activity: Arc<AtomicU64>,
+    /// これまでに履歴へ押し出した行の数。行に通し番号を付けるのに使う。
+    pub pushed: Arc<AtomicU64>,
+    /// 押し出した行数と時刻の対応。通し番号から時刻を引くのに使う。
+    pub ticks: Arc<Mutex<Ticks>>,
 }
 
 #[derive(Debug)]
@@ -173,6 +178,8 @@ pub fn spawn(opts: SpawnOptions<'_>, ui_tx: UiSender) -> Result<Spawned, SpawnEr
 
     let dirty = Arc::new(AtomicBool::new(true));
     let activity = Arc::new(AtomicU64::new(crate::term::now_ms()));
+    let pushed = Arc::new(AtomicU64::new(0));
+    let ticks = Arc::new(Mutex::new(Ticks::new()));
     spawn_reader(
         id,
         reader,
@@ -181,6 +188,9 @@ pub fn spawn(opts: SpawnOptions<'_>, ui_tx: UiSender) -> Result<Spawned, SpawnEr
         ReaderFlags {
             dirty: dirty.clone(),
             activity: activity.clone(),
+            pushed: pushed.clone(),
+            ticks: ticks.clone(),
+            scrollback,
         },
         cwd.to_string_lossy().to_string(),
         session_key,
@@ -202,6 +212,8 @@ pub fn spawn(opts: SpawnOptions<'_>, ui_tx: UiSender) -> Result<Spawned, SpawnEr
         window_size,
         dirty,
         activity,
+        pushed,
+        ticks,
     })
 }
 
@@ -312,12 +324,18 @@ impl CommandTracker {
     }
 }
 
-/// 読み取りスレッドが共有する印。
+/// 読み取りスレッドが共有する印と、行を数えるのに要る上限。
 struct ReaderFlags {
     /// 前回の描画以降に画面が変わったか。
     dirty: Arc<AtomicBool>,
     /// 最後に何か読んだ時刻。
     activity: Arc<AtomicU64>,
+    /// これまでに履歴へ押し出した行の数。
+    pushed: Arc<AtomicU64>,
+    /// 押し出した行数と時刻の対応。
+    ticks: Arc<Mutex<Ticks>>,
+    /// スクロールバックの上限（行）。数え方の切り替えに使う。
+    scrollback: usize,
 }
 
 fn spawn_reader(
@@ -329,7 +347,13 @@ fn spawn_reader(
     cwd: String,
     session_key: String,
 ) {
-    let ReaderFlags { dirty, activity } = flags;
+    let ReaderFlags {
+        dirty,
+        activity,
+        pushed,
+        ticks,
+        scrollback,
+    } = flags;
     thread::Builder::new()
         .name("termit-pty-read".into())
         .spawn(move || {
@@ -347,6 +371,8 @@ fn spawn_reader(
             let mut sent = 0u64;
             let mut skipped = 0u64;
             let mut last = std::time::Instant::now();
+            // 履歴へ押し出した行の数。この数え手はこのスレッドだけである。
+            let mut counted = 0u64;
             loop {
                 let n = match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
@@ -381,15 +407,25 @@ fn spawn_reader(
                     let mut pos = 0usize;
                     // OSC の終端ごとに区切って流し、その時点の画面を読む。
                     for (end, ev) in events {
-                        parser.advance(&mut *term, &bytes[pos..end]);
+                        let mut counting = Counting::new(&mut term, counted, scrollback);
+                        parser.advance(&mut counting, &bytes[pos..end]);
+                        counted = counting.pushed();
                         pos = end;
                         if let Some(record) = tracker.on_event(id, &ev, &term) {
                             out.push(UiEvent::Command(id, record));
                         }
                         out.push(UiEvent::Osc(id, ev));
                     }
-                    parser.advance(&mut *term, &bytes[pos..]);
+                    let mut counting = Counting::new(&mut term, counted, scrollback);
+                    parser.advance(&mut counting, &bytes[pos..]);
+                    counted = counting.pushed();
                 }
+                // 行数と時刻は、錠を手放してから 1 読みにつき 1 回だけ残す。
+                pushed.store(counted, Ordering::Relaxed);
+                ticks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(counted, std::time::Instant::now());
                 for ev in out {
                     if ui_tx.send_event(ev).is_err() {
                         return;

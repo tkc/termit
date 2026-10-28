@@ -9,6 +9,7 @@ mod history;
 mod input;
 mod keytest;
 mod latency;
+mod lines;
 mod link;
 mod mouse;
 mod osc;
