@@ -250,6 +250,7 @@ fn scan_lines(
             let history = grid.history_size();
             let top = grid.screen_lines() as i32 - 1;
             // 行位置に足して通し番号にする数。グリッドと同じ錠の下で読む。
+            // 読み手も錠の中で書くので、この総数は手に持ったグリッドのものである。
             let pushed = target.pushed.load(Relaxed);
             let mut at = match next {
                 None => {

@@ -2047,8 +2047,9 @@ impl App {
         let needle = scan::needle(&query);
         use alacritty_terminal::grid::Dimensions as _;
         // 錠は 1 度の短い読みだけで放す。`pushed` は走査と同じ読み方で、錠の中で読む。
-        // 読み手は `term` を放してから `pushed` を書くので 1 読みぶんずれうるが、
-        // そのずれは下の行の再確認で捕まえる。
+        // 読み手も錠の中で書くので、グリッドと総数は食い違わない。
+        // それでも下で行を再確認するのは、走査してから選ぶまでに行が書き換わる
+        // （その場で描き直す UI、`resize` の折り返し直し）ことへの備えである。
         let landed = state.manager.selected().map(|session| {
             let term = session.term.lock();
             let pushed = session.pushed.load(std::sync::atomic::Ordering::Relaxed);

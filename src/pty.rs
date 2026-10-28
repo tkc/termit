@@ -427,15 +427,22 @@ fn spawn_reader(
                     start_line.get_or_insert_with(|| counting.start_line());
                     parser.advance(&mut counting, &bytes[pos..]);
                     counted = counting.finish();
+                    // 押し出した総数は、グリッドと同じ錠の下で公開する。原子なので
+                    // 錠は増えない。錠を手放してから書くと、その隙間に走査スレッドが
+                    // 錠を取り、進んだグリッドと古い総数を見てしまう。そのセッションの
+                    // 通し番号が 1 読みぶん（64KiB なら数千行）低く出て、`time_of` が
+                    // ずっと古い印を返す。いま流れるのを見ていた行が、理由の分からない
+                    // まま一覧の下へ沈むか `truncate` で切られる。
+                    pushed.store(counted, Ordering::Relaxed);
                 }
-                // 行数と時刻は、錠を手放してから 1 読みにつき 1 回だけ残す。
+                // 時刻は、錠を手放してから 1 読みにつき 1 回だけ残す。
+                // 読み手は `term` を持ったまま `ticks` を取らない（走査もその順を守る）。
                 //
                 // 目盛りへ入れるのは読む前の数に読み始めのカーソル行を足した番号である。
                 // 読んだ後の数を入れると、この読みで出た行の番号がどれも目盛りより
                 // 大きくなり、一つ前の目盛り（間が空いていれば何分も前の時刻）に
                 // 落ちてしまう。読む前の数そのものだと、逆に 1 画面ぶん早く打つ。
                 // 1 行も押し出していない読みを渡すかどうかは `Ticks` が決める。
-                pushed.store(counted, Ordering::Relaxed);
                 ticks
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
