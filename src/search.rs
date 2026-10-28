@@ -13,6 +13,16 @@ pub struct ScreenSearch {
     pub query: String,
     /// 入力をそのまま正規表現として扱うか。
     pub regex_mode: bool,
+    /// 大文字小文字を区別しないで探すか。
+    ///
+    /// `RegexSearch::new` は smart-case である（大文字を含む語だけ区別する）。
+    /// `⌘F` 自身はそれを変えないので、既定は偽のままにする。
+    ///
+    /// 立てるのは、全セッション検索から語を受け取るときだけである。あちらは
+    /// 無条件に区別しない（`scan::needle`）ので、`SES`・`AWS`・`TODO` のような
+    /// 大文字を含む語が小文字の行に当たりうる。その件を区別する式で渡すと、
+    /// 切り替えて飛んだあと `⌘F` が何も見つけず、強調が黙って点かない（仕様 §9）。
+    pub ignore_case: bool,
     /// いま選んでいる一致。
     pub current: Option<Match>,
     /// 正規表現として組み立てられなかった。
@@ -25,6 +35,7 @@ impl ScreenSearch {
         Self {
             query: String::new(),
             regex_mode: false,
+            ignore_case: false,
             current: None,
             invalid: false,
             regex: None,
@@ -39,11 +50,7 @@ impl ScreenSearch {
             self.regex = None;
             return;
         }
-        let pattern = if self.regex_mode {
-            self.query.clone()
-        } else {
-            escape(&self.query)
-        };
+        let pattern = pattern(&self.query, self.regex_mode, self.ignore_case);
         match RegexSearch::new(&pattern) {
             Ok(r) => self.regex = Some(r),
             Err(_) => {
@@ -115,6 +122,23 @@ fn start_point<T>(term: &Term<T>, direction: Direction) -> Point {
     }
 }
 
+/// 打った語から、組み立てる式を作る。
+///
+/// `(?i)` を足すのは**打ち消したあと**である。先に足すと `(`・`?`・`)` が
+/// 打ち消されて、ただの文字列になってしまう。打った語そのもの（`query`）は
+/// 触らないので、帯に出る文字は変わらない。
+fn pattern(query: &str, regex_mode: bool, ignore_case: bool) -> String {
+    let mut out = if regex_mode {
+        query.to_string()
+    } else {
+        escape(query)
+    };
+    if ignore_case {
+        out.insert_str(0, "(?i)");
+    }
+    out
+}
+
 /// 正規表現の特殊文字を打ち消す。既定では入力をそのままの文字列として探す。
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
@@ -130,6 +154,81 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::term::{EventProxy, TermSize, UiSender};
+    use alacritty_terminal::event::WindowSize;
+    use alacritty_terminal::sync::FairMutex;
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+
+    /// 台本を流した端末を 1 つ作る。
+    fn fed(script: &str) -> Term<EventProxy> {
+        let (pty_tx, _pty_rx) = channel();
+        let (ui_tx, _ui_rx) = channel();
+        let (cols, lines) = (60, 8);
+        let ws = Arc::new(FairMutex::new(WindowSize {
+            num_lines: lines as u16,
+            num_cols: cols as u16,
+            cell_width: 8,
+            cell_height: 16,
+        }));
+        let proxy = EventProxy::new(1, pty_tx, UiSender::Channel(ui_tx), ws);
+        let mut term = crate::term::new_term(TermSize::new(cols, lines), 1000, proxy);
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        parser.advance(&mut term, script.as_bytes());
+        term
+    }
+
+    #[test]
+    fn 区別しない旗を立てると式の頭に付く() {
+        assert_eq!(pattern("SES", false, false), "SES");
+        assert_eq!(pattern("SES", false, true), "(?i)SES");
+        // 打ち消したあとに付ける。先に付けると括弧まで打ち消される。
+        assert_eq!(pattern("a.b", false, true), r"(?i)a\.b");
+        assert_eq!(pattern("a(b)", true, true), "(?i)a(b)");
+    }
+
+    #[test]
+    fn 旗を立てた語は小文字の行にも当たる() {
+        // 全セッション検索から渡された語の経路。あちらは無条件に区別しないので、
+        // 大文字を含む語が小文字の行に当たりうる。
+        let term = fed("the ses bounce handler\r\n");
+        let mut s = ScreenSearch::new();
+        s.query = "SES".into();
+        s.ignore_case = true;
+        s.rebuild();
+        assert!(
+            s.step(&term, Direction::Left).is_some(),
+            "区別しないので小文字の行に当たる"
+        );
+    }
+
+    #[test]
+    fn 旗を立てなければ_smart_case_のままである() {
+        // `⌘F` 自身の振る舞いは変えない。大文字を含む語は区別する。
+        let term = fed("the ses bounce handler\r\n");
+        let mut s = ScreenSearch::new();
+        s.query = "SES".into();
+        s.rebuild();
+        assert!(
+            s.step(&term, Direction::Left).is_none(),
+            "大文字を含む語は区別するので当たらない"
+        );
+        let mut lower = ScreenSearch::new();
+        lower.query = "Ses".into();
+        lower.rebuild();
+        assert!(
+            lower.step(&term, Direction::Left).is_none(),
+            "大文字が 1 つでも有れば区別する"
+        );
+        let mut plain = ScreenSearch::new();
+        plain.query = "ses".into();
+        plain.rebuild();
+        assert!(
+            plain.step(&term, Direction::Left).is_some(),
+            "小文字だけなら区別しない"
+        );
+    }
 
     #[test]
     fn 特殊文字を打ち消す() {

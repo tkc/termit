@@ -2039,6 +2039,11 @@ impl App {
         state.manager.select(index);
         let mut find = search::ScreenSearch::new();
         find.query = query.clone();
+        // 全セッション検索は無条件に大文字小文字を無視する（`scan::needle`）。
+        // `RegexSearch::new` は smart-case なので、打った語をそのまま渡すと
+        // `SES` で当てた小文字の行を `⌘F` が見つけられず、強調が黙って点かない。
+        // 旗を立てるのはこの受け渡しのときだけで、`⌘F` 自身は smart-case のままである。
+        find.ignore_case = true;
         find.rebuild();
         state.find = Some(find);
         state.across = None;
