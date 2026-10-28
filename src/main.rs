@@ -2889,14 +2889,15 @@ fn draw_search_box(state: &mut State, sl: &SidebarLayout, theme: &Theme) {
         .unwrap_or_default();
     // 打っている末尾を残す。先頭が落ちる。
     // 変換中は、変換中の文字列のぶんを先に取り分ける。
-    let (query_w, preedit_w) =
-        split_box_width(avail, !state.preedit.is_empty(), sidebar::MIN_PREEDIT * sc);
+    let (query_w, _) = split_box_width(avail, !state.preedit.is_empty(), sidebar::MIN_PREEDIT * sc);
     let shown = state.renderer.fit_head(&query, st, query_w);
-    x += state
+    let used = state
         .renderer
         .put_text_px(x, ty, &shown, st, theme.fg_primary);
+    x += used;
     // 箱の右端までに収める。下敷きは窓自身の色にする。
-    x += draw_preedit_px(state, x, ty, st, theme, Some((preedit_w, theme.surface)));
+    let room = preedit_room(avail, used);
+    x += draw_preedit_px(state, x, ty, st, theme, Some((room, theme.surface)));
     state
         .renderer
         .fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
@@ -2913,6 +2914,14 @@ fn split_box_width(avail: f32, composing: bool, min_preedit: f32) -> (f32, f32) 
     }
     let preedit = min_preedit.min(avail);
     (avail - preedit, preedit)
+}
+
+/// 語を描いたあとに、変換中の文字列へ残る幅。
+///
+/// 取り分は語の予算にだけ掛ける（`split_box_width`）。変換中の文字列は、
+/// 語が実際に使わなかった幅をすべて使える。
+fn preedit_room(avail: f32, query_used: f32) -> f32 {
+    (avail - query_used).max(0.0)
 }
 
 /// 結果の 1 件を描くのに要るもの。`renderer` を触る前に写し取る。
@@ -4513,6 +4522,18 @@ mod search_view_tests {
         // 狭い窓でも、語の幅が負にならない。
         assert_eq!(split_box_width(30.0, true, 56.0), (0.0, 30.0));
         assert_eq!(split_box_width(-5.0, true, 56.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn 変換中の文字列は語が使わなかった幅をすべて使える() {
+        let (query_w, _) = split_box_width(100.0, true, 56.0);
+        // 短い語なら、取り分ではなく実際の余りが残る。
+        assert_eq!(preedit_room(100.0, 20.0), 80.0);
+        // 語が予算いっぱいなら、残るのはちょうど取り分。
+        assert_eq!(preedit_room(100.0, query_w), 56.0);
+        // 負にならない。
+        assert_eq!(preedit_room(100.0, 130.0), 0.0);
+        assert_eq!(preedit_room(-5.0, 0.0), 0.0);
     }
 
     #[test]
