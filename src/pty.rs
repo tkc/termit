@@ -402,14 +402,19 @@ fn spawn_reader(
                 let bytes = &buf[..n];
                 let events = scanner.feed(bytes);
                 let mut out: Vec<UiEvent> = Vec::new();
-                // この読みで出る行は、これより後の番号を持つ。目盛りに入れる数である。
+                // 読む前の押し出し総数。目盛りを打つかどうかの判定に使う。
                 let before = counted;
+                // 読み始めのカーソル行。この読みが作る行はそこから始まるので、
+                // 目盛りもそこへ打つ。1 回の読みで `Counting` を何度も作るから、
+                // 取るのは最初のものからである（錠の中で読む）。
+                let mut start_line: Option<i32> = None;
                 {
                     let mut term = term.lock();
                     let mut pos = 0usize;
                     // OSC の終端ごとに区切って流し、その時点の画面を読む。
                     for (end, ev) in events {
                         let mut counting = Counting::new(&mut term, counted, scrollback);
+                        start_line.get_or_insert_with(|| counting.start_line());
                         parser.advance(&mut counting, &bytes[pos..end]);
                         counted = counting.finish();
                         pos = end;
@@ -419,20 +424,27 @@ fn spawn_reader(
                         out.push(UiEvent::Osc(id, ev));
                     }
                     let mut counting = Counting::new(&mut term, counted, scrollback);
+                    start_line.get_or_insert_with(|| counting.start_line());
                     parser.advance(&mut counting, &bytes[pos..]);
                     counted = counting.finish();
                 }
                 // 行数と時刻は、錠を手放してから 1 読みにつき 1 回だけ残す。
                 //
-                // 目盛りへ入れるのは読む前の数である。読んだ後の数を入れると、
-                // この読みで出た行の番号がどれも目盛りより大きくなり、一つ前の
-                // 目盛り（間が空いていれば何分も前の時刻）に落ちてしまう。
+                // 目盛りへ入れるのは読む前の数に読み始めのカーソル行を足した番号である。
+                // 読んだ後の数を入れると、この読みで出た行の番号がどれも目盛りより
+                // 大きくなり、一つ前の目盛り（間が空いていれば何分も前の時刻）に
+                // 落ちてしまう。読む前の数そのものだと、逆に 1 画面ぶん早く打つ。
                 // 1 行も押し出していない読みを渡すかどうかは `Ticks` が決める。
                 pushed.store(counted, Ordering::Relaxed);
                 ticks
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .mark_read(before, counted, std::time::Instant::now());
+                    .mark_read(
+                        before,
+                        counted,
+                        start_line.unwrap_or(0),
+                        std::time::Instant::now(),
+                    );
                 for ev in out {
                     if ui_tx.send_event(ev).is_err() {
                         return;

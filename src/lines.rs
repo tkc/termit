@@ -87,18 +87,32 @@ impl Ticks {
         }
     }
 
-    /// 1 回の読みを目盛りに残す。`before` は読む前、`after` は読んだ後の行数。
+    /// 1 回の読みを目盛りに残す。`before` は読む前、`after` は読んだ後の行数で、
+    /// `start_line` は読み始めのカーソル行である。
     ///
     /// 目盛り `(p, t)` は「番号 p から次の目盛りまでの行が t に出た」という意味なので、
+    /// 打つ番号はこの読みが**作る最初の行**でなければならない。`line = 0` は画面の
+    /// 上端なので、`before` が指すのは読み始めに画面の上端に有る行 — ずっと前の読みが
+    /// 書いた行 — である。そこへ打つと、すでに画面に出ていた最大「画面行数 - 1」行が
+    /// この読みの時刻になってしまう。既定の窓なら 46 行ほどで、エージェントが 20 分後に
+    /// 1 行出すだけで、前の答えの末尾 46 行が新しい時刻を持つ。この読みが作る行は
+    /// カーソルの居る所から始まるので、`before + start_line` へ打つ。
+    ///
     /// 1 行も押し出していない読みには残すものが無い。それどころか、同じ行数の目盛りは
     /// 積まないので、次に本当に押し出した読みの枠を取ってしまう。プロンプトの
     /// 描き直しや打った字の echo がまさにそれで、`ls` の出力がその前の出力の時刻に
     /// なってしまう。
-    pub fn mark_read(&mut self, before: u64, after: u64, at: Instant) {
+    ///
+    /// カーソルを足すぶん、打つ番号が前の目盛りより小さくなりうる（本画面の UI が
+    /// その場で描き直してカーソルを上へ戻し、押し出した行がその戻りより少ないとき）。
+    /// `push` の昇順の番はそれを捨てるので、その読みの行は次に押し出す読みまで
+    /// 前の時刻のままになる。`Counting` が既に抱えている「その場の描き直しは追えない」
+    /// 穴と同じもので、並びの前提を崩すより落とすほうを採る。
+    pub fn mark_read(&mut self, before: u64, after: u64, start_line: i32, at: Instant) {
         if after == before {
             return;
         }
-        self.push(before, at);
+        self.push(before + start_line.max(0) as u64, at);
     }
 
     /// いまの行数と時刻を積む。
@@ -186,6 +200,8 @@ pub struct Counting<'a> {
     cap: usize,
     /// 行ごとの道で数えた行数。
     hooked: u64,
+    /// 始めた時点のカーソル行。この読みが作る行はここから始まる。
+    start_line: i32,
 }
 
 impl<'a> Counting<'a> {
@@ -193,13 +209,26 @@ impl<'a> Counting<'a> {
         // 代替画面の履歴行数は本画面のものではない。差の起点にはしない。
         let before =
             (!inner.mode().contains(TermMode::ALT_SCREEN)).then(|| inner.grid().history_size());
+        // 本画面なら 0..画面行数 に収まる。`max(0)` は守りである。
+        let start_line = inner.grid().cursor.point.line.0.max(0);
         Self {
             inner,
             pushed,
             before,
             cap,
             hooked: 0,
+            start_line,
         }
+    }
+
+    /// 始めた時点のカーソル行。
+    ///
+    /// この読みが作る行は、カーソルの居る所から始まる。`serial = pushed + line` で
+    /// `line = 0` は画面の上端なので、読む前の総数だけでは目盛りを 1 画面ぶん
+    /// 早く打ってしまう（`Ticks::mark_read`）。読み手は 1 回の読みで `Counting` を
+    /// 何度も作るので、その読みの**最初の**ものから取る。
+    pub fn start_line(&self) -> i32 {
+        self.start_line
     }
 
     /// 数え終えて、押し出した行の合計を返す。
@@ -627,7 +656,7 @@ mod tests {
         // 落ちて、出力が 20 分前の時刻になってしまう。探している行はたいていそれである。
         let mut ticks = Ticks::new();
         let first = Instant::now() + Duration::from_secs(1200);
-        ticks.mark_read(0, 76, first);
+        ticks.mark_read(0, 76, 0, first);
         assert_eq!(ticks.time_of(30), Some(first), "出力はその読みの時刻になる");
     }
 
@@ -645,6 +674,22 @@ mod tests {
     }
 
     #[test]
+    fn 画面に残っていた行は次の読みの時刻にならない() {
+        // 1 つめの読みが 76 行押し出し、カーソルは画面の 24 行目に残った。
+        // 2 つめの読みはそこから書き始めるので、その読みの行は 100 番から。
+        // 76..100 は 1 つめの読みが画面に残した行で、1 つめの時刻のままである。
+        // 読む前の総数 76 へ目盛りを打つと、この帯が 10 分新しい時刻を持ってしまう。
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(600);
+        let mut ticks = Ticks::new();
+        ticks.mark_read(0, 76, 0, t0);
+        ticks.mark_read(76, 176, 24, t1);
+        assert_eq!(ticks.time_of(80), Some(t0), "1 つめの読みが画面に残した行");
+        assert_eq!(ticks.time_of(100), Some(t1), "2 つめの読みが書き始めた行");
+        assert_eq!(ticks.time_of(150), Some(t1), "2 つめの読みで出た行");
+    }
+
+    #[test]
     fn 押し出さない読みは目盛りを取らない() {
         // 出力 → プロンプトの描き直し（押し出しなし）→ 10 分の間 → `ls` の出力。
         // 押し出さない読みが目盛りを取ると、同じ行数の目盛りは積まないので
@@ -653,9 +698,9 @@ mod tests {
         let prompt = t0 + Duration::from_secs(1);
         let t1 = t0 + Duration::from_secs(600);
         let mut ticks = Ticks::new();
-        ticks.mark_read(0, 76, t0);
-        ticks.mark_read(76, 76, prompt);
-        ticks.mark_read(76, 176, t1);
+        ticks.mark_read(0, 76, 0, t0);
+        ticks.mark_read(76, 76, 0, prompt);
+        ticks.mark_read(76, 176, 0, t1);
         assert_eq!(ticks.time_of(150), Some(t1), "`ls` の出力で出た行");
         assert_eq!(ticks.time_of(30), Some(t0), "1 つめの出力で出た行");
     }

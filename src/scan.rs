@@ -409,7 +409,7 @@ mod tests {
         parser.advance(&mut term, play);
         let mut ticks = Ticks::new();
         if let Some(at) = at {
-            ticks.mark_read(0, 1, at);
+            ticks.mark_read(0, 1, 0, at);
         }
         Target {
             id,
@@ -639,7 +639,10 @@ mod tests {
         let t = target(1, &script, Some(t0));
         // 本画面で押し出した行のぶん、目盛りを 2 つ持たせる。
         let newest = t0 + Duration::from_secs(60);
-        t.ticks.lock().expect("目盛りの錠").mark_read(1, 2, newest);
+        t.ticks
+            .lock()
+            .expect("目盛りの錠")
+            .mark_read(1, 2, 0, newest);
         assert!(t.term.lock().mode().contains(TermMode::ALT_SCREEN));
         assert_eq!(
             t.term.lock().grid().history_size(),
