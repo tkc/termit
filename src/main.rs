@@ -1012,6 +1012,8 @@ impl App {
                 state.search = None;
                 state.find = Some(search::ScreenSearch::new());
             }
+            // 横断検索の箱はまだ無い。キーだけ先に分けてある。
+            Action::FindAcrossSessions => {}
             Action::SearchHistory => {
                 state.picker = None;
                 state.find = None;
