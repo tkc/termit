@@ -308,6 +308,18 @@ impl CrossSearch {
         true
     }
 
+    /// 出ている当たりを捨てる。捨てるものがあったなら `true`。
+    ///
+    /// 語を消し切ったときに呼ぶ。`hits` を書くのは `accept` とここだけなので、
+    /// ここで捨てなければ、消した語の当たりがいつまでも一覧に残る。
+    fn clear_hits(&mut self) -> bool {
+        let had = !self.hits.is_empty();
+        self.hits.clear();
+        self.selected = 0;
+        self.offset = 0;
+        had
+    }
+
     /// 選んでいる件が見える範囲に入るよう、出す位置を合わせる。
     ///
     /// `rows` は結果を置ける件数。1 件が 2 段を取るので、左ペインの高さで変わる。
@@ -321,6 +333,37 @@ impl CrossSearch {
         } else if self.selected >= self.offset + rows {
             self.offset = self.selected + 1 - rows;
         }
+    }
+}
+
+/// 走査を始める頃合いか、まだ待つか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanWhen {
+    /// 語は変わっていない。起こしてもらう必要も無い。
+    Idle,
+    /// もう始める。始めれば待ちは解けるので、この腕は起こす時刻を持たない。
+    Start,
+    /// この時刻に起こしてもらう。
+    WakeAt(std::time::Instant),
+}
+
+/// 最後の打鍵からの間を見て、走らせるか・待つかを決める。
+///
+/// 決めるのは描画の最後だが、判定はここに出してある。窓の無いところでは
+/// `State` を組み立てられないので、組み立てずに確かめられるようにする。
+fn scan_due(
+    typed_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+    debounce: std::time::Duration,
+) -> ScanWhen {
+    let Some(at) = typed_at else {
+        return ScanWhen::Idle;
+    };
+    let due = at + debounce;
+    if due <= now {
+        ScanWhen::Start
+    } else {
+        ScanWhen::WakeAt(due)
     }
 }
 
@@ -1994,12 +2037,20 @@ impl App {
         };
         // 走らせるかどうかに関わらず、待ちは解く。残すと過ぎた時刻で起こされ続ける。
         across.typed_at = None;
-        // 語が空白だけなら走らせない。一覧はセッションのものに戻っている。
-        if across.query.trim().is_empty() {
-            return;
-        }
+        // 世代は、走らせない場合でも進める。進めずに抜けると、まだ走っている
+        // 前の走査の結果が `accept` に一致して、消した語の当たりが入ってしまう。
         state.scan_generation += 1;
         across.generation = state.scan_generation;
+        // 語が空白だけなら走らせない。出ている当たりは、ここで捨てる。
+        if across.query.trim().is_empty() {
+            let dropped = across.clear_hits();
+            // ここへ来るのは描画の最後である。いま出ている一覧は描き終わっていて、
+            // 捨てたことを知らせる機会が他に無い。捨てたときだけ描き直しを頼む。
+            if dropped {
+                state.request_redraw();
+            }
+            return;
+        }
         let generation = across.generation;
         let query = across.query.clone();
         let targets: Vec<scan::Target> = state
@@ -2151,18 +2202,15 @@ impl App {
             }
         }
         // 横断検索の語が変わっているなら、手が止まったころに走らせる。
-        let scan_due = self
+        let typed_at = self
             .state
             .as_ref()
             .and_then(|s| s.across.as_ref())
-            .and_then(|across| across.typed_at)
-            .map(|at| at + SCAN_DEBOUNCE);
-        if let Some(due) = scan_due {
-            if due <= std::time::Instant::now() {
-                self.start_scan();
-            } else {
-                want(due);
-            }
+            .and_then(|across| across.typed_at);
+        match scan_due(typed_at, std::time::Instant::now(), SCAN_DEBOUNCE) {
+            ScanWhen::Idle => {}
+            ScanWhen::Start => self.start_scan(),
+            ScanWhen::WakeAt(due) => want(due),
         }
         if let Some(at) = wake {
             event_loop.set_control_flow(ControlFlow::WaitUntil(at));
@@ -3631,6 +3679,38 @@ mod tests {
             // 受け取ったあとで届いた古い世代も捨てる。
             assert!(!across.accept(1, vec![当たり("もっと古い")]));
             assert_eq!(across.hits[0].text, "新しい", "古い結果に戻された");
+        }
+
+        /// 語を消し切ったら走査は始まらない。出ている当たりを捨てるのは
+        /// このときだけで、捨てなければ、消した語の当たりが一覧に残り続ける。
+        #[test]
+        fn 語を消したら当たりも捨てる() {
+            let mut across = CrossSearch {
+                hits: vec![当たり("古い")],
+                selected: 3,
+                offset: 2,
+                ..CrossSearch::default()
+            };
+            assert!(across.clear_hits(), "捨てたことを知らせない");
+            assert!(across.hits.is_empty());
+            assert_eq!((across.selected, across.offset), (0, 0));
+            // 空のまま呼ばれても、描き直しは頼まない。
+            assert!(!across.clear_hits());
+        }
+
+        /// 打鍵のたびには走らせない（仕様 §10）。
+        #[test]
+        fn 打鍵が止まるまで走らせない() {
+            let now = std::time::Instant::now();
+            let 間 = SCAN_DEBOUNCE;
+            // 語が変わっていなければ、起こしてもらう必要も無い。
+            assert_eq!(scan_due(None, now, 間), ScanWhen::Idle);
+            // まだ間が空いていなければ、その時刻に起こしてもらう。
+            let typed = now - 間 / 2;
+            assert_eq!(scan_due(Some(typed), now, 間), ScanWhen::WakeAt(typed + 間));
+            // ちょうど過ぎたところから始める。
+            assert_eq!(scan_due(Some(now - 間), now, 間), ScanWhen::Start);
+            assert_eq!(scan_due(Some(now - 間 * 2), now, 間), ScanWhen::Start);
         }
 
         #[test]
