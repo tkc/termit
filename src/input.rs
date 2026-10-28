@@ -177,12 +177,17 @@ fn action_from_physical(physical: PhysicalKey, mods: ModifiersState) -> Option<A
         };
     }
     if mods.super_key() && !mods.control_key() && !mods.alt_key() {
-        // 文字側と揃える。Shift 付きは ⌘⇧F と ⌘⇧R だけで、
-        // 他は Shift なしの割り当て（⌘N など）へ落とさない。
+        // Shift 付きで受けるのは ⌘⇧F と ⌘⇧R、それに記号キーだけ。
+        // 文字キーの Shift は別の組み合わせなので、⌘N などへ落とさない。
+        // 記号キーは US 配列の ⌘+ が物理的に ⌘⇧= になるため、Shift 付きでも通す。
         if mods.shift_key() {
             return match code {
                 KeyCode::KeyF => Some(Action::FindAcrossSessions),
                 KeyCode::KeyR => Some(Action::RenameSession),
+                KeyCode::BracketLeft => Some(Action::SelectPrev),
+                KeyCode::BracketRight => Some(Action::SelectNext),
+                KeyCode::Equal => Some(Action::FontBigger),
+                KeyCode::Minus => Some(Action::FontSmaller),
                 _ => None,
             };
         }
@@ -333,6 +338,20 @@ mod tests {
         Key::Named(k)
     }
     const NONE: ModifiersState = ModifiersState::empty();
+
+    #[test]
+    fn コマンドとシフトの記号キーは物理キー側で通る() {
+        let cs = ModifiersState::SUPER | ModifiersState::SHIFT;
+        let shift = named(NamedKey::Shift);
+        for (code, want) in [
+            (KeyCode::Equal, Action::FontBigger),
+            (KeyCode::Minus, Action::FontSmaller),
+            (KeyCode::BracketLeft, Action::SelectPrev),
+            (KeyCode::BracketRight, Action::SelectNext),
+        ] {
+            assert_eq!(action_for(&shift, PhysicalKey::Code(code), cs), Some(want));
+        }
+    }
 
     #[test]
     fn コマンドとシフトのエフは横断検索になる() {
