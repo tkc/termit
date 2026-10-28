@@ -190,7 +190,6 @@ pub fn spawn(opts: SpawnOptions<'_>, ui_tx: UiSender) -> Result<Spawned, SpawnEr
             activity: activity.clone(),
             pushed: pushed.clone(),
             ticks: ticks.clone(),
-            scrollback,
         },
         cwd.to_string_lossy().to_string(),
         session_key,
@@ -334,8 +333,6 @@ struct ReaderFlags {
     pushed: Arc<AtomicU64>,
     /// 押し出した行数と時刻の対応。
     ticks: Arc<Mutex<Ticks>>,
-    /// スクロールバックの上限（行）。数え方の切り替えに使う。
-    scrollback: usize,
 }
 
 fn spawn_reader(
@@ -352,7 +349,6 @@ fn spawn_reader(
         activity,
         pushed,
         ticks,
-        scrollback,
     } = flags;
     thread::Builder::new()
         .name("termit-pty-read".into())
@@ -407,18 +403,18 @@ fn spawn_reader(
                     let mut pos = 0usize;
                     // OSC の終端ごとに区切って流し、その時点の画面を読む。
                     for (end, ev) in events {
-                        let mut counting = Counting::new(&mut term, counted, scrollback);
+                        let mut counting = Counting::new(&mut term, counted);
                         parser.advance(&mut counting, &bytes[pos..end]);
-                        counted = counting.pushed();
+                        counted = counting.finish();
                         pos = end;
                         if let Some(record) = tracker.on_event(id, &ev, &term) {
                             out.push(UiEvent::Command(id, record));
                         }
                         out.push(UiEvent::Osc(id, ev));
                     }
-                    let mut counting = Counting::new(&mut term, counted, scrollback);
+                    let mut counting = Counting::new(&mut term, counted);
                     parser.advance(&mut counting, &bytes[pos..]);
-                    counted = counting.pushed();
+                    counted = counting.finish();
                 }
                 // 行数と時刻は、錠を手放してから 1 読みにつき 1 回だけ残す。
                 pushed.store(counted, Ordering::Relaxed);

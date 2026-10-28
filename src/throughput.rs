@@ -2,7 +2,8 @@
 //!
 //! alacritty の vtebench は端末の中で走らせて「PTY を読む速さ」だけを測る。
 //! ここではその負荷を真似た列を自分で作り、実際の読み取り経路
-//! （`OscScanner` の走査 → `vte` の解釈 → グリッドへの書き込み）を通す。
+//! （`OscScanner` の走査 → `vte` の解釈 → 行数の数え上げ → グリッドへの書き込み）
+//! を通す。
 //! 走査と解釈を別々に計るので、どちらを削ればよいかが分かる。
 
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::vte::ansi::Processor;
 
+use crate::lines::Counting;
 use crate::osc::OscScanner;
 use crate::term::{new_term, EventProxy, TermSize, UiSender};
 
@@ -80,6 +82,7 @@ fn feed(payload: &[u8]) -> (Duration, Duration) {
     let mut scanner = OscScanner::new();
     let mut scan = Duration::ZERO;
     let mut parse = Duration::ZERO;
+    let mut counted = 0u64;
     for chunk in payload.chunks(CHUNK) {
         let t = Instant::now();
         let events = scanner.feed(chunk);
@@ -87,10 +90,14 @@ fn feed(payload: &[u8]) -> (Duration, Duration) {
         let t = Instant::now();
         let mut pos = 0usize;
         for (end, _ev) in events {
-            parser.advance(&mut term, &chunk[pos..end]);
+            let mut counting = Counting::new(&mut term, counted);
+            parser.advance(&mut counting, &chunk[pos..end]);
+            counted = counting.finish();
             pos = end;
         }
-        parser.advance(&mut term, &chunk[pos..]);
+        let mut counting = Counting::new(&mut term, counted);
+        parser.advance(&mut counting, &chunk[pos..]);
+        counted = counting.finish();
         parse += t.elapsed();
     }
     drop(rx);

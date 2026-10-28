@@ -12,7 +12,7 @@
 //! まだ入っていない。数える側だけを先に置いている。
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::{Dimensions, GridCell};
 use alacritty_terminal::index::Line;
@@ -24,7 +24,6 @@ use alacritty_terminal::vte::ansi::{
     ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
 };
 use alacritty_terminal::Term;
-use unicode_width::UnicodeWidthChar;
 
 use crate::term::EventProxy;
 
@@ -44,8 +43,13 @@ pub fn line_of(serial: i64, pushed: u64, history_size: usize) -> Option<i32> {
     i32::try_from(line).ok()
 }
 
-/// 覚えておく目盛りの数。1 読みにつき 1 つ積むので、約 30 秒から数分ぶんになる。
+/// 覚えておく目盛りの数。1 秒に 1 つ積むので、約 68 分ぶんになる。
 pub const TICKS: usize = 4096;
+
+/// 目盛りの間隔。仕様は 1 秒の分解能で足りるとしている。
+///
+/// 1 読みにつき 1 つ積むと、忙しい出力では数分で環を使い切ってしまう。
+const TICK_GAP: Duration = Duration::from_secs(1);
 
 /// 通し番号と時刻の対応。古いものから捨てる環である。
 #[derive(Debug, Default)]
@@ -59,10 +63,14 @@ impl Ticks {
         Self::default()
     }
 
-    /// いまの行数と時刻を積む。行数が増えていなければ何もしない。
+    /// いまの行数と時刻を積む。
+    ///
+    /// 行数が増えていないか、前の目盛りから 1 秒経っていなければ何もしない。
     pub fn push(&mut self, pushed: u64, at: Instant) {
-        if self.marks.back().is_some_and(|&(last, _)| last >= pushed) {
-            return;
+        if let Some(&(last, when)) = self.marks.back() {
+            if pushed <= last || at.saturating_duration_since(when) < TICK_GAP {
+                return;
+            }
         }
         if self.marks.len() == TICKS {
             self.marks.pop_front();
@@ -88,55 +96,65 @@ impl Ticks {
 /// `Processor::advance` は `Handler` を実装するものを何でも受け取るので、
 /// `Term` の代わりにこれを渡せば、通った escape sequence を数えられる。
 ///
-/// 数えるのは、`Term` の中で履歴へ行が積まれる道すべてである。`alacritty_terminal`
-/// で履歴が伸びるのは `Grid::scroll_up` を画面の先頭から呼んだときだけで、そこへ
-/// 届くのは改行・NEL・SU・行削除・画面消去（ED 2）と、行末の折り返しである。
-/// 折り返しと NEL は `Term` が自分の `linefeed` を呼ぶので、こちらの `linefeed`
-/// は通らない。書き込みの側から数えないと取りこぼす。
+/// 数え方は 2 つを合わせる。
 ///
-/// 上限に達していないあいだは履歴行数の差がそのまま答えなので、どの道を通っても
-/// 正確である。上限に達してからは見積もりになり、DECSTBM で画面の一部だけを
-/// スクロール範囲にしている本画面では、改行を数え違えることがある。
-/// また、`Term::resize` の折り返し直しは行の位置を動かすので、
-/// 大きさを変えると古い通し番号は少しずれる。
+/// 1 つは履歴行数の差である。上限に届くまでは押し出した行が 1 行ずつ履歴を
+/// 伸ばすので、始めと終わりの差がそのまま答えになる。どの道を通っても漏れない。
+/// もう 1 つは行ごとの道での数え上げで、改行・NEL・SU・行削除・画面消去（ED 2）・
+/// 行末のタブを数える。上限に達すると差が出なくなるので、こちらが答えになる。
+/// 多いほうを採れば、どちらの側にいても数が合う。
+///
+/// 数え漏らしと数え過ぎが残る。
+///
+/// - 行末の折り返しは `Term` が自分の `linefeed` を呼ぶので、こちらの `linefeed`
+///   を通らない。上限に届くまでは差に出るので数えられるが、上限に達してからは
+///   数えられない。1 文字ごとに見れば数えられるが、それは `input` を 1 割ほど
+///   遅くするので採らない（仕様 §4 の非目標）。
+/// - DECSTBM で画面の一部だけをスクロール範囲にしている本画面では、履歴へ入らない
+///   改行を数えてしまうことがある。
+/// - `Term::resize` の折り返し直しは行の位置を動かすので、大きさを変えると
+///   古い通し番号は少しずれる。
 pub struct Counting<'a> {
     inner: &'a mut Term<EventProxy>,
     pushed: u64,
-    /// スクロールバックの上限（行）。履歴行数の差が頭打ちになったことを知るのに使う。
-    cap: usize,
+    /// 始めた時点の履歴行数。代替画面にいたなら `None`。
+    before: Option<usize>,
+    /// 行ごとの道で数えた行数。
+    hooked: u64,
 }
 
 impl<'a> Counting<'a> {
-    pub fn new(inner: &'a mut Term<EventProxy>, pushed: u64, cap: usize) -> Self {
-        Self { inner, pushed, cap }
+    pub fn new(inner: &'a mut Term<EventProxy>, pushed: u64) -> Self {
+        // 代替画面の履歴行数は本画面のものではない。差の起点にはしない。
+        let before =
+            (!inner.mode().contains(TermMode::ALT_SCREEN)).then(|| inner.grid().history_size());
+        Self {
+            inner,
+            pushed,
+            before,
+            hooked: 0,
+        }
     }
 
-    /// これまでに履歴へ押し出した行数。
-    pub fn pushed(&self) -> u64 {
-        self.pushed
+    /// 数え終えて、押し出した行の合計を返す。
+    pub fn finish(self) -> u64 {
+        let delta = match self.before {
+            // 途中で画面が入れ替わっていれば、差は本画面のものではない。
+            Some(before) if !self.alt() => self.history().saturating_sub(before) as u64,
+            _ => 0,
+        };
+        self.pushed + delta.max(self.hooked)
     }
 
     /// 押し出しの起きうる呼び出しを、数えながら行う。
     ///
-    /// 上限に届くまでは履歴行数の差が正確なので、差をそのまま使う。上限に達すると
-    /// 差が出なくなるので、そのときだけ `guess` 行押し出したものとして数える。
-    /// 上限をまたぐ 1 回では差が足りないことがあるので、多いほうを採る。
-    fn counted(&mut self, guess: usize, call: impl FnOnce(&mut Term<EventProxy>)) {
+    /// `lines` は押し出される行数。カーソルが動く前に数えるので、呼ぶ側で出す。
+    fn counted(&mut self, lines: usize, call: impl FnOnce(&mut Term<EventProxy>)) {
         // 代替画面に履歴は無い。全画面の UI が流す行は数えない。
-        if self.alt() {
-            call(self.inner);
-            return;
+        if !self.alt() {
+            self.hooked += lines as u64;
         }
-        let before = self.history();
         call(self.inner);
-        let after = self.history();
-        let diff = after.saturating_sub(before);
-        let counted = if after >= self.cap {
-            diff.max(guess)
-        } else {
-            diff
-        };
-        self.pushed += counted as u64;
     }
 
     fn history(&self) -> usize {
@@ -161,17 +179,6 @@ impl<'a> Counting<'a> {
     /// 溜めてある折り返しが、次の書き込みで 1 行押し出すか。
     fn wrapping(&self) -> bool {
         self.inner.grid().cursor.input_needs_wrap && self.folds()
-    }
-
-    /// 折り返しの起きうる 1 文字を、数えながら書き込む。
-    ///
-    /// 行末でしか通らないので、`input` の本体から外へ出しておく。
-    /// 入れたままにすると、字を流す速さが 1 割ほど落ちる（`--throughput` で確かめた）。
-    #[cold]
-    #[inline(never)]
-    fn wrapped_input(&mut self, c: char) {
-        let guess = usize::from(self.folds());
-        self.counted(guess, |term| term.input(c));
     }
 
     /// 画面に何か書いてある行数。ED 2 が履歴へ押し上げる行数になる。
@@ -199,69 +206,54 @@ macro_rules! forward {
 }
 
 impl Handler for Counting<'_> {
-    fn input(&mut self, c: char) {
-        // 折り返すのは、行末に折り返しを溜めているときと、行末の 1 桁に入らない
-        // 全角文字が来たときだけである。1 文字ごとに通る道なので、それ以外は
-        // 何も読まずに通す。ASCII は必ず 1 桁なので、桁数も幅も見ない。
-        let grid = self.inner.grid();
-        let may_wrap = grid.cursor.input_needs_wrap
-            || (!c.is_ascii()
-                && grid.cursor.point.column.0 + 1 >= grid.columns()
-                && c.width().is_some_and(|w| w >= 2));
-        if may_wrap {
-            self.wrapped_input(c);
-            return;
-        }
-        self.inner.input(c);
-    }
-
     fn put_tab(&mut self, count: u16) {
         // 行末のタブは折り返しになる。
-        let guess = usize::from(self.wrapping());
-        self.counted(guess, |term| term.put_tab(count));
+        let lines = usize::from(self.wrapping());
+        self.counted(lines, |term| term.put_tab(count));
     }
 
     fn linefeed(&mut self) {
-        let guess = usize::from(self.at_bottom());
-        self.counted(guess, |term| term.linefeed());
+        let lines = usize::from(self.at_bottom());
+        self.counted(lines, |term| term.linefeed());
     }
 
     fn newline(&mut self) {
         // NEL は改行と同じ道を通る。
-        let guess = usize::from(self.at_bottom());
-        self.counted(guess, |term| term.newline());
+        let lines = usize::from(self.at_bottom());
+        self.counted(lines, |term| term.newline());
     }
 
     fn scroll_up(&mut self, lines: usize) {
-        let guess = lines.min(self.inner.grid().screen_lines());
-        self.counted(guess, |term| term.scroll_up(lines));
+        let pushed = lines.min(self.inner.grid().screen_lines());
+        self.counted(pushed, |term| term.scroll_up(lines));
     }
 
     fn delete_lines(&mut self, lines: usize) {
         // 画面の先頭で消すと、下の行が上へ送られて履歴へ出る。
         let grid = self.inner.grid();
-        let guess = if grid.cursor.point.line.0 == 0 {
+        let pushed = if grid.cursor.point.line.0 == 0 {
             lines.min(grid.screen_lines())
         } else {
             0
         };
-        self.counted(guess, |term| term.delete_lines(lines));
+        self.counted(pushed, |term| term.delete_lines(lines));
     }
 
     fn clear_screen(&mut self, mode: ClearMode) {
         // ED 2 は本画面では消さずに、書いてあるぶんを履歴へ押し上げる。
-        let guess = if matches!(mode, ClearMode::All) && !self.alt() {
+        let lines = if matches!(mode, ClearMode::All) && !self.alt() {
             self.filled_lines()
         } else {
             0
         };
-        self.counted(guess, |term| term.clear_screen(mode));
+        self.counted(lines, |term| term.clear_screen(mode));
     }
 
     forward! {
         fn set_title(title: Option<String>);
         fn set_cursor_style(style: Option<CursorStyle>);
         fn set_cursor_shape(shape: CursorShape);
+        fn input(c: char);
         fn goto(line: i32, col: usize);
         fn goto_line(line: i32);
         fn goto_col(col: usize);
@@ -357,9 +349,9 @@ mod tests {
     fn feed(cols: usize, lines: usize, scrollback: usize, script: &[u8]) -> (u64, usize) {
         let mut term = make_term(cols, lines, scrollback);
         let mut parser: Processor<StdSyncHandler> = Processor::new();
-        let mut counting = Counting::new(&mut term, 0, scrollback);
+        let mut counting = Counting::new(&mut term, 0);
         parser.advance(&mut counting, script);
-        let pushed = counting.pushed();
+        let pushed = counting.finish();
         (pushed, term.grid().history_size())
     }
 
@@ -404,6 +396,7 @@ mod tests {
     fn 折り返した行も数える() {
         // 10 桁の画面を最下行まで埋めてから、35 文字を流す。
         // 折り返しも改行と同じように 1 行ずつ押し出す。
+        // 行ごとの道からは見えないが、上限より下なら履歴行数の差に出る。
         let mut script = plain_lines(4);
         script.extend(b"\r\n");
         script.extend([b'x'; 35]);
@@ -434,22 +427,33 @@ mod tests {
 
     #[test]
     fn 上限に達してからも数え方は変わらない() {
-        // 同じ台本を、上限の広い端末と狭い端末へ流す。広いほうは履歴行数が
-        // 答え合わせになり、狭いほうは見積もりで数える。両者は一致する。
+        // 同じ台本を、上限の広い端末と狭い端末へ流す。広いほうは履歴行数の差で
+        // 数え、狭いほうは行ごとの道で数える。両者は一致する。
         let mut script = plain_lines(10);
-        script.extend(b"\r\n");
-        script.extend([b'y'; 73]); // 折り返し
         script.extend(b"\r\n\x1b[3S"); // 改行とスクロールアップ
         script.extend(b"\x1bE\x1bE"); // NEL
         script.extend(plain_lines(5));
         script.extend(b"\x1b[2J"); // 画面消去
         script.extend(plain_lines(5));
 
-        let (wide, history) = feed(10, 4, 10_000, &script);
+        let (wide, history) = feed(20, 4, 10_000, &script);
         assert_eq!(wide, history as u64, "上限に届かなければ履歴行数と一致する");
-        let (narrow, capped) = feed(10, 4, 3, &script);
+        let (narrow, capped) = feed(20, 4, 3, &script);
         assert_eq!(capped, 3, "狭いほうは上限で止まっている");
         assert_eq!(narrow, wide, "上限に達しても同じ数になる");
+    }
+
+    #[test]
+    fn 上限に達してからは折り返しを数えない() {
+        // 折り返しは `Term` の中で改行になるので、行ごとの道からは見えない。
+        // 上限に達すると履歴行数の差も出ないので、そのぶんは数えられない。
+        // 1 文字ごとに見れば数えられるが、読み手を遅くするので採らない。
+        let mut script = plain_lines(4);
+        script.extend(b"\r\n\r\n\r\n\r\n"); // 最下行での改行 4 回
+        script.extend([b'x'; 35]); // 折り返し 3 回
+        let (pushed, history) = feed(10, 4, 2, &script);
+        assert_eq!(pushed, 4, "改行 4 回だけを数え、折り返し 3 回は数えない");
+        assert_eq!(history, 2);
     }
 
     #[test]
@@ -491,15 +495,30 @@ mod tests {
     }
 
     #[test]
+    fn 目盛りは一秒おきに積む() {
+        let t0 = Instant::now();
+        let mut ticks = Ticks::new();
+        ticks.push(10, t0);
+        ticks.push(20, t0 + Duration::from_millis(500));
+        assert_eq!(ticks.time_of(20), Some(t0), "1 秒経っていないので積まない");
+        ticks.push(30, t0 + Duration::from_secs(1));
+        assert_eq!(
+            ticks.time_of(30),
+            Some(t0 + Duration::from_secs(1)),
+            "1 秒経てば積む"
+        );
+    }
+
+    #[test]
     fn 目盛りは古いものから捨てる() {
         let t0 = Instant::now();
         let mut ticks = Ticks::new();
         for i in 0..(TICKS as u64 + 100) {
-            ticks.push(i, t0 + Duration::from_millis(i));
+            ticks.push(i, t0 + Duration::from_secs(i));
         }
         assert_eq!(
             ticks.time_of(0),
-            Some(t0 + Duration::from_millis(100)),
+            Some(t0 + Duration::from_secs(100)),
             "溢れた 100 件は捨て、残っている最古の時刻を返す"
         );
     }
