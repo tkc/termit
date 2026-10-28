@@ -427,11 +427,12 @@ fn spawn_reader(
                 // 目盛りへ入れるのは読む前の数である。読んだ後の数を入れると、
                 // この読みで出た行の番号がどれも目盛りより大きくなり、一つ前の
                 // 目盛り（間が空いていれば何分も前の時刻）に落ちてしまう。
+                // 1 行も押し出していない読みを渡すかどうかは `Ticks` が決める。
                 pushed.store(counted, Ordering::Relaxed);
                 ticks
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(before, std::time::Instant::now());
+                    .mark_read(before, counted, std::time::Instant::now());
                 for ev in out {
                     if ui_tx.send_event(ev).is_err() {
                         return;

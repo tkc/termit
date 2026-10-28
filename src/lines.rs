@@ -43,7 +43,11 @@ pub fn line_of(serial: i64, pushed: u64, history_size: usize) -> Option<i32> {
     i32::try_from(line).ok()
 }
 
-/// 覚えておく目盛りの数。1 秒に 1 つ積むので、約 68 分ぶんになる。
+/// 覚えておく目盛りの数。
+///
+/// 積むのは行を押し出した読みだけで、それも 1 秒に 1 つまでなので、
+/// 68 分以上ぶんになる。プロンプトの描き直しのような押し出さない読みは
+/// 枠を使わないので、静かな端末ではもっと長く覚えている。
 ///
 /// 1 件は `(u64, Instant)` の 24 バイトで、セッションあたり約 96KB になる
 /// （`size_of` で確かめた）。
@@ -66,10 +70,26 @@ impl Ticks {
         Self::default()
     }
 
+    /// 1 回の読みを目盛りに残す。`before` は読む前、`after` は読んだ後の行数。
+    ///
+    /// 目盛り `(p, t)` は「番号 p から次の目盛りまでの行が t に出た」という意味なので、
+    /// 1 行も押し出していない読みには残すものが無い。それどころか、同じ行数の目盛りは
+    /// 積まないので、次に本当に押し出した読みの枠を取ってしまう。プロンプトの
+    /// 描き直しや打った字の echo がまさにそれで、`ls` の出力がその前の出力の時刻に
+    /// なってしまう。
+    pub fn mark_read(&mut self, before: u64, after: u64, at: Instant) {
+        if after == before {
+            return;
+        }
+        self.push(before, at);
+    }
+
     /// いまの行数と時刻を積む。
     ///
     /// 行数が増えていないか、前の目盛りから 1 秒経っていなければ何もしない。
-    pub fn push(&mut self, pushed: u64, at: Instant) {
+    /// 読み手は押し出した読みでしか呼ばないので、行数は必ず増えている。
+    /// それでも見るのは、並びが昇順であることが `time_of` の前提だからである。
+    fn push(&mut self, pushed: u64, at: Instant) {
         if let Some(&(last, when)) = self.marks.back() {
             if pushed <= last || at.saturating_duration_since(when) < TICK_GAP {
                 return;
@@ -563,6 +583,22 @@ mod tests {
         ticks.push(0, t0);
         ticks.push(76, t1);
         assert_eq!(ticks.time_of(150), Some(t1), "2 つめの出力で出た行");
+        assert_eq!(ticks.time_of(30), Some(t0), "1 つめの出力で出た行");
+    }
+
+    #[test]
+    fn 押し出さない読みは目盛りを取らない() {
+        // 出力 → プロンプトの描き直し（押し出しなし）→ 10 分の間 → `ls` の出力。
+        // 押し出さない読みが目盛りを取ると、同じ行数の目盛りは積まないので
+        // `ls` の行が前の出力の時刻になってしまう。
+        let t0 = Instant::now();
+        let prompt = t0 + Duration::from_secs(1);
+        let t1 = t0 + Duration::from_secs(600);
+        let mut ticks = Ticks::new();
+        ticks.mark_read(0, 76, t0);
+        ticks.mark_read(76, 76, prompt);
+        ticks.mark_read(76, 176, t1);
+        assert_eq!(ticks.time_of(150), Some(t1), "`ls` の出力で出た行");
         assert_eq!(ticks.time_of(30), Some(t0), "1 つめの出力で出た行");
     }
 
