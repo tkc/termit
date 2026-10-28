@@ -90,12 +90,12 @@ fn feed(payload: &[u8]) -> (Duration, Duration) {
         let t = Instant::now();
         let mut pos = 0usize;
         for (end, _ev) in events {
-            let mut counting = Counting::new(&mut term, counted);
+            let mut counting = Counting::new(&mut term, counted, SCROLLBACK);
             parser.advance(&mut counting, &chunk[pos..end]);
             counted = counting.finish();
             pos = end;
         }
-        let mut counting = Counting::new(&mut term, counted);
+        let mut counting = Counting::new(&mut term, counted, SCROLLBACK);
         parser.advance(&mut counting, &chunk[pos..]);
         counted = counting.finish();
         parse += t.elapsed();

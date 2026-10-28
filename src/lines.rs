@@ -96,22 +96,22 @@ impl Ticks {
 /// `Processor::advance` は `Handler` を実装するものを何でも受け取るので、
 /// `Term` の代わりにこれを渡せば、通った escape sequence を数えられる。
 ///
-/// 数え方は 2 つを合わせる。
+/// 数え方は 2 つあり、始めた時点で履歴が上限に達していたかで選ぶ。
 ///
-/// 1 つは履歴行数の差である。上限に届くまでは押し出した行が 1 行ずつ履歴を
-/// 伸ばすので、始めと終わりの差がそのまま答えになる。どの道を通っても漏れない。
-/// もう 1 つは行ごとの道での数え上げで、改行・NEL・SU・行削除・画面消去（ED 2）・
-/// 行末のタブを数える。上限に達すると差が出なくなるので、こちらが答えになる。
-/// 多いほうを採れば、どちらの側にいても数が合う。
+/// 達していなければ、履歴行数の差がそのまま答えである。押し出した行が 1 行ずつ
+/// 履歴を伸ばすので、どの道を通っても漏れない。履歴へ入らない送り（DECSTBM で
+/// 範囲を絞った中のスクロール）を数えてしまうこともない。
+/// 達していれば差が出ないので、行ごとの道で数えたほうを答えにする。行ごとに
+/// 数えるのは、改行・NEL・SU・行削除・画面消去（ED 2）・行末のタブである。
 ///
-/// 数え漏らしと数え過ぎが残る。
+/// 数え漏らしが残る。
 ///
 /// - 行末の折り返しは `Term` が自分の `linefeed` を呼ぶので、こちらの `linefeed`
 ///   を通らない。上限に届くまでは差に出るので数えられるが、上限に達してからは
 ///   数えられない。1 文字ごとに見れば数えられるが、それは `input` を 1 割ほど
 ///   遅くするので採らない（仕様 §4 の非目標）。
-/// - DECSTBM で画面の一部だけをスクロール範囲にしている本画面では、履歴へ入らない
-///   改行を数えてしまうことがある。
+/// - 上限にちょうど届く 1 回ぶんでは、届いたあとの押し出しを数えない。
+///   取りこぼしはその 1 回ぶんで止まる。
 /// - `Term::resize` の折り返し直しは行の位置を動かすので、大きさを変えると
 ///   古い通し番号は少しずれる。
 pub struct Counting<'a> {
@@ -119,12 +119,14 @@ pub struct Counting<'a> {
     pushed: u64,
     /// 始めた時点の履歴行数。代替画面にいたなら `None`。
     before: Option<usize>,
+    /// スクロールバックの上限（行）。履歴行数の差が出ない側にいるかの判定に使う。
+    cap: usize,
     /// 行ごとの道で数えた行数。
     hooked: u64,
 }
 
 impl<'a> Counting<'a> {
-    pub fn new(inner: &'a mut Term<EventProxy>, pushed: u64) -> Self {
+    pub fn new(inner: &'a mut Term<EventProxy>, pushed: u64, cap: usize) -> Self {
         // 代替画面の履歴行数は本画面のものではない。差の起点にはしない。
         let before =
             (!inner.mode().contains(TermMode::ALT_SCREEN)).then(|| inner.grid().history_size());
@@ -132,18 +134,22 @@ impl<'a> Counting<'a> {
             inner,
             pushed,
             before,
+            cap,
             hooked: 0,
         }
     }
 
     /// 数え終えて、押し出した行の合計を返す。
     pub fn finish(self) -> u64 {
-        let delta = match self.before {
-            // 途中で画面が入れ替わっていれば、差は本画面のものではない。
+        let counted = match self.before {
+            // 上限に達していれば、もう履歴は伸びない。行ごとに数えたほうを採る。
+            Some(before) if before >= self.cap => self.hooked,
+            // 伸びる側にいれば、差が正確である。
             Some(before) if !self.alt() => self.history().saturating_sub(before) as u64,
-            _ => 0,
+            // 途中で画面が入れ替わっていれば、差は本画面のものではない。
+            _ => self.hooked,
         };
-        self.pushed + delta.max(self.hooked)
+        self.pushed + counted
     }
 
     /// 押し出しの起きうる呼び出しを、数えながら行う。
@@ -345,13 +351,18 @@ mod tests {
 
     /// 台本を端末へ流し、数えた行数と、端末が実際に抱えた履歴行数を返す。
     ///
-    /// 上限に届くまでは履歴行数が答え合わせになる。
+    /// 上限に届くまでは履歴行数が答え合わせになる。読み手と同じように、
+    /// 1 回の読みごとに `Counting` を作り直す。区切りは改行に置き、
+    /// 行単位で届く出力を真似る。
     fn feed(cols: usize, lines: usize, scrollback: usize, script: &[u8]) -> (u64, usize) {
         let mut term = make_term(cols, lines, scrollback);
         let mut parser: Processor<StdSyncHandler> = Processor::new();
-        let mut counting = Counting::new(&mut term, 0);
-        parser.advance(&mut counting, script);
-        let pushed = counting.finish();
+        let mut pushed = 0u64;
+        for read in script.split_inclusive(|&b| b == b'\n') {
+            let mut counting = Counting::new(&mut term, pushed, scrollback);
+            parser.advance(&mut counting, read);
+            pushed = counting.finish();
+        }
         (pushed, term.grid().history_size())
     }
 
@@ -441,6 +452,20 @@ mod tests {
         let (narrow, capped) = feed(20, 4, 3, &script);
         assert_eq!(capped, 3, "狭いほうは上限で止まっている");
         assert_eq!(narrow, wide, "上限に達しても同じ数になる");
+    }
+
+    #[test]
+    fn 範囲を絞った送りは数えない() {
+        // DECSTBM で画面の下半分だけを送り範囲にすると、その中の改行は履歴へ
+        // 入らない。行ごとの道からは最下行の改行に見えるので、上限より下では
+        // 履歴行数の差を答えにしないと数え過ぎる。
+        let mut script = b"\x1b[3;6r\x1b[6;1H".to_vec();
+        for i in 1..=10 {
+            script.extend(format!("line {i}\r\n").as_bytes());
+        }
+        let (pushed, history) = feed(20, 6, 100, &script);
+        assert_eq!(pushed, 0, "範囲の中で送るだけなので履歴へは出ない");
+        assert_eq!(history, 0);
     }
 
     #[test]
