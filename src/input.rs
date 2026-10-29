@@ -26,6 +26,8 @@ pub enum Action {
     FindInScreen,
     /// セッションに名前を付ける。
     RenameSession,
+    /// 全セッションの出力を探す。
+    FindAcrossSessions,
     FontBigger,
     FontSmaller,
     ScrollUp,
@@ -116,10 +118,14 @@ fn action_from_char(key: &Key, mods: ModifiersState) -> Option<Action> {
             _ => None,
         };
     }
-    // Cmd 側。Shift を併用する組み合わせは ⌘⇧R だけに限る。
+    // Cmd 側。Shift を併用する組み合わせは ⌘⇧R と ⌘⇧F だけに限る。
     if mods.super_key() && !mods.control_key() && !mods.alt_key() {
         if mods.shift_key() {
-            return (c.as_str() == "r").then_some(Action::RenameSession);
+            return match c.as_str() {
+                "f" => Some(Action::FindAcrossSessions),
+                "r" => Some(Action::RenameSession),
+                _ => None,
+            };
         }
         return match c.as_str() {
             "n" => Some(Action::NewSession),
@@ -171,6 +177,20 @@ fn action_from_physical(physical: PhysicalKey, mods: ModifiersState) -> Option<A
         };
     }
     if mods.super_key() && !mods.control_key() && !mods.alt_key() {
+        // Shift 付きで受けるのは ⌘⇧F と ⌘⇧R、それに記号キーだけ。
+        // 文字キーの Shift は別の組み合わせなので、⌘N などへ落とさない。
+        // 記号キーは US 配列の ⌘+ が物理的に ⌘⇧= になるため、Shift 付きでも通す。
+        if mods.shift_key() {
+            return match code {
+                KeyCode::KeyF => Some(Action::FindAcrossSessions),
+                KeyCode::KeyR => Some(Action::RenameSession),
+                KeyCode::BracketLeft => Some(Action::SelectPrev),
+                KeyCode::BracketRight => Some(Action::SelectNext),
+                KeyCode::Equal => Some(Action::FontBigger),
+                KeyCode::Minus => Some(Action::FontSmaller),
+                _ => None,
+            };
+        }
         let command = match code {
             KeyCode::KeyN => Some(Action::NewSession),
             KeyCode::KeyD => Some(Action::Fork),
@@ -318,6 +338,58 @@ mod tests {
         Key::Named(k)
     }
     const NONE: ModifiersState = ModifiersState::empty();
+
+    #[test]
+    fn コマンドとシフトの記号キーは物理キー側で通る() {
+        let cs = ModifiersState::SUPER | ModifiersState::SHIFT;
+        let shift = named(NamedKey::Shift);
+        for (code, want) in [
+            (KeyCode::Equal, Action::FontBigger),
+            (KeyCode::Minus, Action::FontSmaller),
+            (KeyCode::BracketLeft, Action::SelectPrev),
+            (KeyCode::BracketRight, Action::SelectNext),
+        ] {
+            assert_eq!(action_for(&shift, PhysicalKey::Code(code), cs), Some(want));
+        }
+    }
+
+    #[test]
+    fn コマンドとシフトのエフは横断検索になる() {
+        let cs = ModifiersState::SUPER | ModifiersState::SHIFT;
+        // 文字側（通常の配列）。
+        assert_eq!(
+            action_for(&ch("f"), PhysicalKey::Code(KeyCode::KeyF), cs),
+            Some(Action::FindAcrossSessions)
+        );
+        // 物理キー側（文字が取れない配列）。
+        assert_eq!(
+            action_for(
+                &named(NamedKey::Shift),
+                PhysicalKey::Code(KeyCode::KeyF),
+                cs
+            ),
+            Some(Action::FindAcrossSessions)
+        );
+    }
+
+    #[test]
+    fn コマンドだけのエフは画面内検索のまま() {
+        let cmd = ModifiersState::SUPER;
+        assert_eq!(
+            action_for(&ch("f"), PhysicalKey::Code(KeyCode::KeyF), cmd),
+            Some(Action::FindInScreen)
+        );
+    }
+
+    #[test]
+    fn コマンドとシフトはエフとアールだけ受ける() {
+        let cs = ModifiersState::SUPER | ModifiersState::SHIFT;
+        let phys = PhysicalKey::Code(KeyCode::KeyR);
+        assert_eq!(action_for(&ch("r"), phys, cs), Some(Action::RenameSession));
+        // ⌘⇧N は、いまは物理キー側で NewSession に落ちている。落ちないこと。
+        let n = PhysicalKey::Code(KeyCode::KeyN);
+        assert_eq!(action_for(&named(NamedKey::Shift), n, cs), None);
+    }
 
     #[test]
     fn 印字可能な文字をそのまま送る() {

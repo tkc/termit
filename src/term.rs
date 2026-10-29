@@ -91,6 +91,11 @@ pub enum UiEvent {
     Osc(SessionId, crate::osc::OscEvent),
     /// 組み立てが終わったコマンドの記録。
     Command(SessionId, crate::session::CommandRecord),
+    /// 横断検索の走査が終わった。第 1 要素は走査の世代。
+    ///
+    /// これだけ `SessionId` を持たない。全セッションを走った結果なので、
+    /// どれか 1 本のものではない。
+    Scanned(u64, Vec<crate::scan::Hit>),
 }
 
 /// `Term` からのイベントを受け、必要な応答を PTY へ書き戻す。
