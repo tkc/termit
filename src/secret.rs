@@ -16,8 +16,7 @@ use std::ops::Range;
 
 use regex::Regex;
 
-/// 試験で伏せた跡に置く文字列。画面では `MASK_CHAR` を 1 コマずつ置く。
-#[cfg(test)]
+/// 伏せた跡に置く文字列。画面では `MASK_CHAR` を 1 コマずつ置く。
 const REDACTED: &str = "[redacted]";
 
 /// 設定の式をまとめて持つ。起動時に 1 度だけ組み立てる。
@@ -106,8 +105,10 @@ impl Redactor {
         out
     }
 
-    /// 伏せた文字列を組み立てる。読みやすさのため、試験でだけ使う。
-    #[cfg(test)]
+    /// 伏せた文字列を組み立てる。
+    ///
+    /// 画面はコマごとに `MASK_CHAR` を置くので、こちらを通らない。読み手は
+    /// 全セッション検索の結果の行（`scan.rs`）と、この作りを確かめる試験である。
     pub fn redact(&self, text: &str) -> (String, usize) {
         let spans = self.spans(text);
         let mut out = String::with_capacity(text.len());

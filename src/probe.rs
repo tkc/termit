@@ -116,6 +116,8 @@ pub fn run(out_path: &str) {
         rename: None,
         sidebar_width: config.window.sidebar_width,
         find: None,
+        across: None,
+        scan_generation: 0,
         find_cells: Default::default(),
         find_current: Default::default(),
         mouse: Default::default(),
@@ -134,7 +136,7 @@ pub fn run(out_path: &str) {
         pending_since: None,
         needs_redraw: false,
         occluded: false,
-        redactor: crate::secret::Redactor::default(),
+        redactor: std::sync::Arc::default(),
         state_dirty: false,
         state_saved_at: None,
         shown_title: String::new(),
@@ -201,6 +203,61 @@ pub fn run(out_path: &str) {
                 selected: 0,
                 offset: 0,
             });
+        }
+        Ok("across") => {
+            // 走査は走らせず、結果の一覧の見た目だけを確かめる。
+            // 当たりの位置は `find_hit` に出させる。手で数えるとバイトと
+            // 文字を取り違える。
+            let ids: Vec<u32> = state.manager.sessions().iter().map(|s| s.id).collect();
+            let query = "SES";
+            // 走査と同じ針の作り方をする。`str::to_lowercase` は語末シグマで
+            // `find_hit` の `char` ごとの小文字化と食い違う（`scan::needle`）。
+            let needle = crate::scan::needle(query);
+            let rows: &[(u32, crate::scan::HitKind, &str)] = &[
+                // 前後どちらも落とさないと入らない長い行。
+                (
+                    ids[0],
+                    crate::scan::HitKind::Line,
+                    "waiting for the reviewer to confirm that the SES bounce handler retries \
+                     on a soft failure before we merge the branch",
+                ),
+                // 当たりの前後が全角の行。詰め方が文字の境を外さないこと。
+                (
+                    ids[1],
+                    crate::scan::HitKind::Line,
+                    "この PR では SES マッチの一覧を左ペインに出すところまで入れた",
+                ),
+                // 名乗った題名に当たった件。行の当たりと見分けが付くこと。
+                (ids[2], crate::scan::HitKind::Title, "SES bounce の調査"),
+                // 走査中に終わったセッション。1 段目が引けない。
+                (
+                    u32::MAX,
+                    crate::scan::HitKind::Line,
+                    "ses: retry queue drained",
+                ),
+            ];
+            let hits = rows
+                .iter()
+                .filter_map(|(id, kind, text)| {
+                    Some(crate::scan::Hit {
+                        id: *id,
+                        kind: *kind,
+                        serial: None,
+                        at: Some(Instant::now()),
+                        text: (*text).to_string(),
+                        hit: crate::scan::find_hit(text, &needle)?,
+                    })
+                })
+                .collect();
+            state.across = Some(crate::CrossSearch {
+                query: query.into(),
+                hits,
+                selected: 1,
+                ..Default::default()
+            });
+            // 変換中の文字列が窓へ出ることも確かめる。窓に収まらない長さにして、
+            // 切れ方（末尾が残ること）と、語が窓いっぱいでも幅が残ることを見る。
+            state.preedit = "けんさくごをながくへんかんしているところ".into();
         }
         Ok("preedit") => {
             state.preedit = "あっだ".into();

@@ -9,6 +9,7 @@ mod history;
 mod input;
 mod keytest;
 mod latency;
+mod lines;
 mod link;
 mod mouse;
 mod osc;
@@ -16,6 +17,7 @@ mod probe;
 mod pty;
 mod rect;
 mod render;
+mod scan;
 mod search;
 mod secret;
 mod session;
@@ -32,7 +34,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{viewport_to_point, TermMode};
 use alacritty_terminal::vte::ansi::CursorShape;
-use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
+use alacritty_terminal::vte::ansi::{ClearMode, Handler as _, Rgb};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -156,7 +158,8 @@ fn main() {
             .then(Counters::default),
         resize_quiet_since: None,
         agent_state_at: None,
-        redactor_seed: redactor,
+        // 走査スレッドへも同じものを渡す。式を 2 度組み立てはしない。
+        redactor_seed: Arc::new(redactor),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("termit: {e}");
@@ -265,6 +268,155 @@ impl SearchState {
     }
 }
 
+/// 打鍵が止まったと見なすまでの間。
+///
+/// 打鍵ごとには走らせない（仕様 §10）。走査は別スレッドへ出すが、
+/// 出したところで 1 字ごとに始めれば、14 本ぶんの錠を取り合うだけになる。
+const SCAN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// 全セッションを横断する検索。左ペインの箱と、そこに出す当たりの一覧。
+///
+/// `⌘⇧F` では空のまま置く。語が変わるたびに `typed_at` を更新し、
+/// 手が止まったところで走らせる。受けた結果は次の打鍵まで固める（仕様 §12）。
+#[derive(Default)]
+pub(crate) struct CrossSearch {
+    pub(crate) query: String,
+    /// いま待っている走査の世代。これと違う世代の結果は捨てる。
+    pub(crate) generation: u64,
+    /// 最後に語が変わった時刻。走っていないあいだは `None`。
+    pub(crate) typed_at: Option<std::time::Instant>,
+    /// いま出している当たり。新しい順に並んでいる。
+    pub(crate) hits: Vec<scan::Hit>,
+    pub(crate) selected: usize,
+    /// 一覧の先頭に出している位置。選んでいる件が外へ出ないよう追う。
+    pub(crate) offset: usize,
+    /// 走査を投げて、結果がまだ帰っていない。
+    ///
+    /// `typed_at` は投げた瞬間に消えるので、走っているあいだと、走り終えて
+    /// 0 件だったときを区別するには別に持つ必要がある。
+    pub(crate) scanning: bool,
+}
+
+/// 結果の一覧の下に出す一言。
+#[derive(Debug, PartialEq, Eq)]
+enum ScanNote {
+    None,
+    Searching,
+    NoMatch,
+}
+
+/// 結果の一覧の下に何を出すか。
+///
+/// 当たりが残っているあいだは出さない（前の語の結果を見ながら打ち継げる）。
+/// 走っているあいだ、または手がまだ止まっていないあいだは「無い」と言わない。
+fn scan_note(scanning: bool, typed: bool, hits: usize) -> ScanNote {
+    if hits > 0 {
+        ScanNote::None
+    } else if scanning || typed {
+        ScanNote::Searching
+    } else {
+        ScanNote::NoMatch
+    }
+}
+
+/// 結果の一覧の代わりに出す字。置く件があれば `None`。
+///
+/// 件が 1 つも置けないなら必ず何かを出す。当たりがあるのに高さが足りないとき、
+/// 何も出さないと空の帯だけが残る。
+fn across_note_text(no_blocks: bool, note: &ScanNote) -> Option<&'static str> {
+    match note {
+        ScanNote::Searching => Some("searching…"),
+        ScanNote::NoMatch => Some("no match"),
+        ScanNote::None if no_blocks => Some("too narrow"),
+        ScanNote::None => None,
+    }
+}
+
+impl CrossSearch {
+    /// 走査の結果を受ける。入れ替えたなら `true`。
+    ///
+    /// 世代が合わないのは、この結果が帰るより先に次の走査を始めた場合である。
+    /// 走査は別スレッドで走るので、結果は打った順に帰るとは限らない。
+    /// 遅れて届いた古い結果で、新しい結果を上書きしない。
+    fn accept(&mut self, generation: u64, hits: Vec<scan::Hit>) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.hits = hits;
+        self.selected = 0;
+        self.offset = 0;
+        self.scanning = false;
+        true
+    }
+
+    /// 出ている当たりを捨てる。捨てるものがあったなら `true`。
+    ///
+    /// 語を消し切ったときに呼ぶ。`hits` を書くのは `accept` とここだけなので、
+    /// ここで捨てなければ、消した語の当たりがいつまでも一覧に残る。
+    fn clear_hits(&mut self) -> bool {
+        let had = !self.hits.is_empty();
+        self.scanning = false;
+        self.hits.clear();
+        self.selected = 0;
+        self.offset = 0;
+        had
+    }
+
+    /// 貼り付けた文字列を語へ足す。改行は空白にする（検索語に改行は要らない）。
+    fn push_pasted(&mut self, text: &str) {
+        self.query.extend(
+            text.chars()
+                .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
+                .filter(|c| !c.is_control()),
+        );
+    }
+
+    /// 選んでいる件が見える範囲に入るよう、出す位置を合わせる。
+    ///
+    /// `rows` は結果を置ける件数。1 件が 2 段を取るので、左ペインの高さで変わる。
+    /// 呼ぶ側は `across_window` で出すこと。割り付けと食い違うと件が隠れる。
+    fn follow(&mut self, rows: usize) {
+        // 1 件も置けない高さでも、選んでいる件を追い越さない。
+        let rows = rows.max(1);
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + rows {
+            self.offset = self.selected + 1 - rows;
+        }
+    }
+}
+
+/// 走査を始める頃合いか、まだ待つか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanWhen {
+    /// 語は変わっていない。起こしてもらう必要も無い。
+    Idle,
+    /// もう始める。始めれば待ちは解けるので、この腕は起こす時刻を持たない。
+    Start,
+    /// この時刻に起こしてもらう。
+    WakeAt(std::time::Instant),
+}
+
+/// 最後の打鍵からの間を見て、走らせるか・待つかを決める。
+///
+/// 決めるのは描画の最後だが、判定はここに出してある。窓の無いところでは
+/// `State` を組み立てられないので、組み立てずに確かめられるようにする。
+fn scan_due(
+    typed_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+    debounce: std::time::Duration,
+) -> ScanWhen {
+    let Some(at) = typed_at else {
+        return ScanWhen::Idle;
+    };
+    let due = at + debounce;
+    if due <= now {
+        ScanWhen::Start
+    } else {
+        ScanWhen::WakeAt(due)
+    }
+}
+
 pub(crate) struct State {
     renderer: Renderer,
     manager: Manager,
@@ -279,6 +431,13 @@ pub(crate) struct State {
     sidebar_width: f32,
     /// 画面の中の検索。
     find: Option<search::ScreenSearch>,
+    /// 全セッションを横断する検索。開いていなければ `None`。
+    pub(crate) across: Option<CrossSearch>,
+    /// 次に走らせる走査の世代。1 つずつ増やすだけで、戻さない。
+    ///
+    /// `CrossSearch` の中に置くと `⌘⇧F` で箱を開き直すたびに 0 へ戻る。
+    /// 走り続けている前の走査が、新しい箱の世代と一致して受け取られてしまう。
+    scan_generation: u64,
     /// 見えている範囲で強調するセル。
     find_cells: std::collections::HashSet<(i32, usize)>,
     /// そのうち、いま選んでいる一致のセル。
@@ -305,7 +464,9 @@ pub(crate) struct State {
     /// 窓が完全に隠れているか。隠れているあいだは組み立てもしない。
     occluded: bool,
     /// 画面で伏せる式。起動時に 1 度だけ組み立てる。
-    pub(crate) redactor: crate::secret::Redactor,
+    ///
+    /// 横断検索の走査スレッドにも同じものを渡すので `Arc` で持つ。
+    pub(crate) redactor: Arc<crate::secret::Redactor>,
     /// セッションの並びが変わった。少し置いてから書き出す。
     state_dirty: bool,
     /// 最後に書き出した時刻。
@@ -435,7 +596,7 @@ struct App {
     /// 返事待ちを最後に調べた時刻。毎フレーム画面を読まないための間隔。
     agent_state_at: Option<std::time::Instant>,
     /// 画面を作るときに State へ渡す式。組み立ては起動時に済ませてある。
-    redactor_seed: crate::secret::Redactor,
+    redactor_seed: Arc<crate::secret::Redactor>,
 }
 
 /// 画面の割り付け。すべてセル単位で扱う。
@@ -470,6 +631,9 @@ impl ApplicationHandler<UiEvent> for App {
                 if s.needs_redraw
                     || s.manager.has_pending_size()
                     || s.manager.sessions().iter().any(|x| x.shown_working)
+                    // 横断検索の走査を始めるのは描画の最後なので、
+                    // 頃合いになっても描き直さなければ始まらない。
+                    || s.across.as_ref().is_some_and(|a| a.typed_at.is_some())
                 {
                     s.request_redraw();
                 }
@@ -510,6 +674,8 @@ impl ApplicationHandler<UiEvent> for App {
             rename: None,
             sidebar_width: self.config.window.sidebar_width,
             find: None,
+            across: None,
+            scan_generation: 0,
             find_cells: Default::default(),
             find_current: Default::default(),
             mouse: MouseState::default(),
@@ -639,6 +805,17 @@ impl ApplicationHandler<UiEvent> for App {
                     }
                 }
                 state.recent_for = None;
+            }
+            UiEvent::Scanned(generation, hits) => {
+                // 描き直すかどうかは `wants_redraw` では決められない。
+                // 古い世代の結果なら、出ているものは何も変わらない。
+                let took = state
+                    .across
+                    .as_mut()
+                    .is_some_and(|across| across.accept(generation, hits));
+                if took {
+                    state.request_redraw();
+                }
             }
         }
         if redraw {
@@ -807,6 +984,11 @@ impl ApplicationHandler<UiEvent> for App {
                     if let Some(r) = &mut state.rename {
                         r.input.push_str(&text);
                     }
+                } else if state.across.is_some() {
+                    if let Some(a) = &mut state.across {
+                        a.query.push_str(&text);
+                    }
+                    self.queue_scan();
                 } else if state.find.is_some() {
                     if let Some(f) = &mut state.find {
                         f.query.push_str(&text);
@@ -894,6 +1076,13 @@ impl App {
         }
         if state.rename.is_some() {
             self.on_rename_key(&base, &event);
+            if let Some(s) = &self.state {
+                s.request_redraw();
+            }
+            return;
+        }
+        if state.across.is_some() {
+            self.on_across_key(&base, &event, mods);
             if let Some(s) = &self.state {
                 s.request_redraw();
             }
@@ -1012,6 +1201,7 @@ impl App {
                 state.search = None;
                 state.find = Some(search::ScreenSearch::new());
             }
+            Action::FindAcrossSessions => self.enter_across(),
             Action::SearchHistory => {
                 state.picker = None;
                 state.find = None;
@@ -1396,9 +1586,35 @@ impl App {
                     }
                 }
                 SidebarHit::Close(i) => state.manager.close(i),
+                SidebarHit::SearchBox => {
+                    // 窓に入る（仕様 §9）。入っているなら、打った語を捨てない。
+                    if state.across.is_none() {
+                        self.enter_across();
+                    }
+                    // 並び順は変わらない。保存を予約しない。
+                    return;
+                }
+                SidebarHit::Hit(n) => {
+                    // 選び直すだけ。飛ぶのは別の仕事である。
+                    // 掴んだことにはしない（仕様 §13）。
+                    let rows = across_window(state, &layout);
+                    if let Some(across) = &mut state.across {
+                        if n < across.hits.len() {
+                            across.selected = n;
+                            across.follow(rows);
+                        }
+                    }
+                    return;
+                }
             }
             state.mark_state_dirty();
             return;
+        }
+
+        // 左ペインの外を押したら検索窓から出る。
+        // 出ないと、端末を押したあとに打った字が窓へ入っていく。
+        if state.across.is_some() && state.mouse.x >= layout.sidebar_px {
+            state.across = None;
         }
 
         // 端末領域。リンクの上なら開く。選択はしない。
@@ -1615,6 +1831,9 @@ fn wants_redraw(
         UiEvent::Command(id, _) => shown(*id),
         // 目に見えるものは変わらない。
         UiEvent::ClipboardStore(_, _) | UiEvent::ClipboardLoad(_, _) => false,
+        // 古い世代なら一覧は変わらない。受け取れたかどうかで分かれるので、
+        // 描き直しは受け取る分岐が決める。
+        UiEvent::Scanned(_, _) => false,
     }
 }
 
@@ -1787,6 +2006,101 @@ impl App {
         }
     }
 
+    /// 全セッション検索の窓に入る（仕様 §9）。
+    ///
+    /// 入る口は `⌘⇧F` と、窓を押すことの 2 つある。窓を押す側は `on_click` が
+    /// 先に重ねた一覧を閉じて帰るので、前提が違っても今は無事だが、閉じる順を
+    /// いつか動かせばそこが破れる。片方だけ直すことにならないよう、入る手順は
+    /// ここに 1 つだけ置く。
+    fn enter_across(&mut self) {
+        let Some(state) = &mut self.state else { return };
+        // 重ねた一覧は閉じる。`on_key` は picker・rename → across → find・search の
+        // 順に見るので、どちらに残しても「覆いは描かれているのに鍵が届かない」側が
+        // 出る。`rename` だけは残す（名前を打ち終える Esc がそちらへ行く）。
+        state.picker = None;
+        state.search = None;
+        state.find = None;
+        // 掴んでいた行は放す。結果の一覧に並べ替えは効かせない（仕様 §13）。
+        state.mouse.sidebar_drag = None;
+        state.across = Some(CrossSearch::default());
+        // ペインを閉じていたら開く。窓が見えないまま鍵を奪わない。
+        if !state.sidebar {
+            state.sidebar = true;
+            self.reflow();
+        }
+    }
+
+    /// 結果の `n` 件目を開く。そのセッションへ切り替え、行が残っていればそこへ飛ぶ。
+    ///
+    /// 名前・題名・枝の件と、行が履歴から消えた件は、送り先が無いので切り替えて
+    /// 語を `⌘F` に渡すだけにする（仕様 §12）。
+    fn open_hit(&mut self, n: usize) {
+        let Some(state) = &mut self.state else { return };
+        let Some(across) = &state.across else { return };
+        let Some(hit) = across.hits.get(n).cloned() else {
+            return;
+        };
+        let query = across.query.clone();
+        // 閉じたセッションの件なら、何も動かさず窓も閉じない。
+        let Some(index) = state.manager.sessions().iter().position(|s| s.id == hit.id) else {
+            return;
+        };
+        state.manager.select(index);
+        let mut find = search::ScreenSearch::new();
+        find.query = query.clone();
+        // 全セッション検索は無条件に大文字小文字を無視する（`scan::needle`）。
+        // `RegexSearch::new` は smart-case なので、打った語をそのまま渡すと
+        // `SES` で当てた小文字の行を `⌘F` が見つけられず、強調が黙って点かない。
+        // 旗を立てるのはこの受け渡しのときだけで、`⌘F` 自身は smart-case のままである。
+        find.ignore_case = true;
+        find.rebuild();
+        state.find = Some(find);
+        state.across = None;
+
+        let serial = hit.serial.filter(|_| hit.kind == scan::HitKind::Line);
+        let needle = scan::needle(&query);
+        use alacritty_terminal::grid::Dimensions as _;
+        // 錠は 1 度の短い読みだけで放す。`pushed` は走査と同じ読み方で、錠の中で読む。
+        // 読み手も錠の中で書くので、グリッドと総数は食い違わない。
+        // それでも下で行を再確認するのは、走査してから選ぶまでに行が書き換わる
+        // （その場で描き直す UI、`resize` の折り返し直し）ことへの備えである。
+        let landed = state.manager.selected().map(|session| {
+            let term = session.term.lock();
+            let pushed = session.pushed.load(std::sync::atomic::Ordering::Relaxed);
+            let grid = term.grid();
+            let land = landing(
+                serial,
+                pushed,
+                grid.history_size(),
+                grid.screen_lines() as i32,
+            );
+            let row = match land {
+                Landing::Row(line) => {
+                    // 走査と同じ述語（素の行でも伏せ字のあとでも当たる）で確かめる。
+                    let mut text = String::new();
+                    scan::row_text(grid, line, &mut text);
+                    scan::matched(&state.redactor, &text, &needle).map(|_| line)
+                }
+                _ => None,
+            };
+            (land, row)
+        });
+        match landed {
+            Some((Landing::Row(_), Some(line))) => {
+                if let Some(session) = state.manager.selected() {
+                    session.term.lock().scroll_to_point(Point::new(
+                        alacritty_terminal::index::Line(line),
+                        Column(0),
+                    ));
+                }
+            }
+            // 数え違い・書き換え。
+            Some((Landing::Search | Landing::Row(_), _)) => self.find_step(Direction::Left),
+            // 送り先が無い。語を渡すだけで画面は動かさない。
+            Some((Landing::Nothing, _)) | None => {}
+        }
+    }
+
     fn on_search_key(&mut self, key: &Key, event: &winit::event::KeyEvent, mods: ModifiersState) {
         let Some(state) = &mut self.state else { return };
         let Some(search) = &mut state.search else {
@@ -1879,6 +2193,150 @@ impl App {
         };
         search.selected = 0;
         search.offset = 0;
+    }
+
+    /// 検索窓の鍵（仕様 §9）。
+    ///
+    /// `Esc` で窓を出る。`↑` `↓` で件を選ぶ。語を変えたら走らせ直す。
+    /// 変換中の文字列は受けない。確定した分だけを `Ime::Commit` から受ける。
+    fn on_across_key(&mut self, key: &Key, event: &winit::event::KeyEvent, mods: ModifiersState) {
+        let Some(state) = &mut self.state else { return };
+        let layout = layout_of(&self.config, state);
+        // 窓に入る件数。割り付けと同じ関数で出す。
+        let rows = across_window(state, &layout);
+        let Some(across) = &mut state.across else {
+            return;
+        };
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                // 窓を出て、元の一覧へ戻る。走っている走査の結果は、
+                // 受け手が居なくなるので `Scanned` の腕で捨てられる。
+                state.across = None;
+                return;
+            }
+            Key::Named(NamedKey::Enter) => {
+                let n = across.selected;
+                self.open_hit(n);
+                return;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if !across.hits.is_empty() {
+                    across.selected = (across.selected + 1) % across.hits.len();
+                    across.follow(rows);
+                }
+                return;
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if !across.hits.is_empty() {
+                    let n = across.hits.len();
+                    across.selected = (across.selected + n - 1) % n;
+                    across.follow(rows);
+                }
+                return;
+            }
+            Key::Named(NamedKey::Backspace) => {
+                across.query.pop();
+            }
+            _ => {
+                // 貼り付けだけは `⌘` の和音でも通す。語を貼るのは普通の操作である。
+                if input::action_for(key, event.physical_key, mods) == Some(Action::Paste) {
+                    if let Some(text) = clipboard::paste() {
+                        across.push_pasted(&text);
+                        self.queue_scan();
+                    }
+                    return;
+                }
+                let Some(text) = event.text.as_deref() else {
+                    return;
+                };
+                if text.chars().any(|c| c.is_control()) {
+                    return;
+                }
+                // 変換中は、確定した文字列だけを `Ime::Commit` から受ける（仕様 §9）。
+                // ここでも入れると同じ文字が二度入る。
+                if !state.preedit.is_empty() {
+                    return;
+                }
+                // `⌘` の和音は字として入れない。入れると `⌘⇧F` を
+                // 押し直すたびに "F" が語へ足される。
+                if mods.super_key() {
+                    return;
+                }
+                across.query.push_str(text);
+            }
+        }
+        self.queue_scan();
+    }
+
+    /// 語が変わったことを覚える。走らせるのは手が止まってからである（仕様 §10）。
+    fn queue_scan(&mut self) {
+        let Some(across) = self.state.as_mut().and_then(|s| s.across.as_mut()) else {
+            return;
+        };
+        across.typed_at = Some(std::time::Instant::now());
+    }
+
+    /// 走査を別スレッドで始める。
+    ///
+    /// UI スレッドは `scan` を呼ばない（仕様 §4）。1 フレームの余白は 0.3ms ほどで、
+    /// 14 本 × 10000 行の走査はそこに入らない。別スレッドへ渡すのは `Arc` の複製と
+    /// 短い文字列だけで、`Term` の中身は写さない（仕様 §10）。
+    /// 結果は `UiEvent::Scanned` で帰ってくる。
+    fn start_scan(&mut self) {
+        let ui_tx: crate::term::UiSender = self.proxy.clone().into();
+        let Some(state) = &mut self.state else { return };
+        let Some(across) = &mut state.across else {
+            return;
+        };
+        // 走らせるかどうかに関わらず、待ちは解く。残すと過ぎた時刻で起こされ続ける。
+        across.typed_at = None;
+        // 世代は、走らせない場合でも進める。進めずに抜けると、まだ走っている
+        // 前の走査の結果が `accept` に一致して、消した語の当たりが入ってしまう。
+        state.scan_generation += 1;
+        across.generation = state.scan_generation;
+        // 語が空白だけなら走らせない。出ている当たりは、ここで捨てる。
+        if across.query.trim().is_empty() {
+            let dropped = across.clear_hits();
+            // ここへ来るのは描画の最後である。いま出ている一覧は描き終わっていて、
+            // 捨てたことを知らせる機会が他に無い。捨てたときだけ描き直しを頼む。
+            if dropped {
+                state.request_redraw();
+            }
+            return;
+        }
+        let generation = across.generation;
+        let query = across.query.clone();
+        across.scanning = true;
+        let targets: Vec<scan::Target> = state
+            .manager
+            .sessions()
+            .iter()
+            .map(|s| scan::Target {
+                id: s.id,
+                term: s.term.clone(),
+                pushed: s.pushed.clone(),
+                ticks: s.ticks.clone(),
+                // 探すのは左ペインに出ている名前である（仕様 §7）。
+                name: s.display_name().0,
+                title: s.window_title.clone(),
+                branch: s.branch.clone(),
+            })
+            .collect();
+        let redactor = state.redactor.clone();
+        let spawned = std::thread::Builder::new()
+            .name("termit-scan".into())
+            .spawn(move || {
+                let hits = scan::scan(&targets, &query, &redactor, scan::Limits::default());
+                // 窓が閉じていれば送り先はもう無い。結果は捨てる。
+                let _ = ui_tx.send_event(UiEvent::Scanned(generation, hits));
+            });
+        if let Err(e) = spawned {
+            // スレッドが作れないなら、この走査だけ諦める。端末は動き続ける。
+            log::warn!("cannot start the cross-session scan: {e}");
+            if let Some(across) = state.across.as_mut() {
+                across.scanning = false;
+            }
+        }
     }
 
     // ---------------------------------------------------------------- 描画
@@ -2000,6 +2458,17 @@ impl App {
                 want(std::time::Instant::now() + WORKING_REFRESH);
             }
         }
+        // 横断検索の語が変わっているなら、手が止まったころに走らせる。
+        let typed_at = self
+            .state
+            .as_ref()
+            .and_then(|s| s.across.as_ref())
+            .and_then(|across| across.typed_at);
+        match scan_due(typed_at, std::time::Instant::now(), SCAN_DEBOUNCE) {
+            ScanWhen::Idle => {}
+            ScanWhen::Start => self.start_scan(),
+            ScanWhen::WakeAt(due) => want(due),
+        }
         if let Some(at) = wake {
             event_loop.set_control_flow(ControlFlow::WaitUntil(at));
         }
@@ -2082,6 +2551,16 @@ mod sidebar {
     pub const RADIUS: f32 = 6.0;
     /// 上端に `+` を置く帯の高さ。
     pub const HEADER: f32 = 34.0;
+    /// 帯の右端で `+` が取る幅。残りが検索窓になる（仕様 §6）。
+    ///
+    /// 描く側と当たり判定で同じ値を使う。食い違うと、窓を押したのに
+    /// セッションが増える。
+    pub const PLUS_ZONE: f32 = 24.0;
+    /// 変換中に、検索窓の中で変換中の文字列へ必ず残す幅。
+    ///
+    /// 確定した語が窓いっぱいに伸びていると、変換中の文字列に幅が残らず、
+    /// いま打っている字が見えなくなる。全角で 4 字ぶん（12pt）より少し広く取る。
+    pub const MIN_PREEDIT: f32 = 56.0;
     /// 区切り線の上下の余白。
     pub const SEP_PAD: f32 = 8.0;
 
@@ -2093,6 +2572,13 @@ mod sidebar {
     pub const SIZE_BRANCH: f32 = 10.0;
     /// 直近のコマンド。
     pub const SIZE_RECENT: f32 = 11.0;
+    /// 検索窓に打った語。
+    pub const SIZE_QUERY: f32 = 12.0;
+
+    /// 当たった語に敷く色を、文字の両端へ広げる量。
+    ///
+    /// 字にぴったり敷くと、前後の字と地続きに見えて語の切れ目が読めない。
+    pub const HIT_PAD: f32 = 4.0;
 }
 
 /// `⌘C` で写す文字を決める。
@@ -2145,6 +2631,20 @@ fn on_divider(state: &State, layout: &Layout, px: f32) -> bool {
         && (px - layout.sidebar_px).abs() <= DIVIDER_GRAB * state.renderer.scale()
 }
 
+/// 実行状態の印の色。セッションの一覧と結果の一覧で同じ組みにする。
+///
+/// 待っている＞動いている＞止まっている、の順に強い。
+/// 待ちは黄色。動いている緑とも、異常終了の赤とも違う色にする。
+fn mark_color(theme: &Theme, exit: Option<i32>, working: bool, blocked: bool) -> Rgb {
+    match exit {
+        None if blocked => theme.ansi[3],
+        None if working => theme.accent,
+        None => theme.fg_tertiary,
+        Some(0) => theme.fg_tertiary,
+        Some(_) => theme.warn,
+    }
+}
+
 /// 左ペインの文字の体裁。桁に縛られないので、等幅でない書体で組む。
 ///
 /// 同じ幅に多く入り、Warp の一覧の見え方に近くなる。
@@ -2157,8 +2657,10 @@ fn style(size: f32, bold: bool) -> TextStyle {
     }
 }
 
-/// 左ペインの 1 セッションぶんの領域。描画と当たり判定で同じ値を使う。
+/// 左ペインの 1 件ぶんの領域。描画と当たり判定で同じ値を使う。
 struct Block {
+    /// セッションの一覧では `sessions()` の添字。結果の一覧では
+    /// `across.hits` の添字で、送った位置（`offset`）を足した絶対の値。
     index: usize,
     depth: usize,
     /// 矩形の上端（画素）。
@@ -2178,39 +2680,142 @@ struct SidebarLayout {
     sep_y: f32,
 }
 
+/// 一覧に使える高さ（画素）。下段に直近のコマンドを出す余地を残す。
+fn sidebar_limit(state: &State, layout: &Layout) -> f32 {
+    let height_px = layout.rows as f32 * state.renderer.cell().height;
+    height_px - 120.0 * state.renderer.scale()
+}
+
+/// セッションの一覧を、結果の一覧に差し替えるか。
+///
+/// 語が空、または空白だけなら元の一覧へ戻る（仕様 §6）。
+/// 走査を始めない判定（`start_scan`）と同じ規則にしてある。違えてしまうと、
+/// 語を消し切って当たりを捨てたあとも、空の一覧が出たままになる。
+fn showing_hits(across: Option<&CrossSearch>) -> bool {
+    across.is_some_and(|a| !a.query.trim().is_empty())
+}
+
+/// 結果 1 件ぶんの高さ（画素）。1 件は 2 段を取る（仕様 §6）。
+///
+/// 測った段の高さを受け取るので、`Renderer` を立てずに試験できる。
+fn across_block_height(sc: f32, title_h: f32, sub_h: f32) -> f32 {
+    (sidebar::PAD_TOP + sidebar::PAD_BOTTOM) * sc + title_h + sub_h
+}
+
+/// 当たりが 1 件も無いときに、代わりの字を出す高さ（画素）。
+///
+/// 1 件目と同じ位置から出す。割り付けもこの字のぶんを空ける。
+fn across_note_y(sc: f32) -> f32 {
+    sidebar::HEADER * sc + sidebar::PAD_TOP * sc
+}
+
+/// `top` から `limit` までに置ける件数。
+fn across_rows(top: f32, limit: f32, height: f32, gap: f32) -> usize {
+    // 高さの無い件を数え続けない。ここは描画の経路にある。
+    if height <= 0.0 {
+        return 0;
+    }
+    let mut rows = 0;
+    let mut y = top;
+    while y + height <= limit {
+        rows += 1;
+        y += height + gap;
+    }
+    rows
+}
+
+/// いま結果を置ける件数。
+///
+/// 割り付け（`across_blocks`）と窓送り（`CrossSearch::follow`）で同じ値を使う。
+/// 食い違うと、選んだ件が見えない位置へ出る。
+fn across_window(state: &State, layout: &Layout) -> usize {
+    let sc = state.renderer.scale();
+    let height = across_block_height(
+        sc,
+        state.renderer.line_height_px(sidebar::SIZE_TITLE),
+        state.renderer.line_height_px(sidebar::SIZE_SUB),
+    );
+    across_rows(
+        sidebar::HEADER * sc,
+        sidebar_limit(state, layout),
+        height,
+        sidebar::GAP * sc,
+    )
+}
+
+/// 結果の一覧の領域を割り付ける。入りきらない件は `offset` から出す。
+fn across_blocks(state: &State, layout: &Layout) -> Vec<Block> {
+    let Some(across) = &state.across else {
+        return Vec::new();
+    };
+    let sc = state.renderer.scale();
+    let height = across_block_height(
+        sc,
+        state.renderer.line_height_px(sidebar::SIZE_TITLE),
+        state.renderer.line_height_px(sidebar::SIZE_SUB),
+    );
+    let last = (across.offset + across_window(state, layout)).min(across.hits.len());
+    let mut blocks = Vec::new();
+    let mut y = sidebar::HEADER * sc;
+    for index in across.offset..last {
+        // 結果の一覧に系統樹の字下げは無い（仕様 §13）。
+        blocks.push(Block {
+            index,
+            depth: 0,
+            top: y,
+            height,
+        });
+        y += height + sidebar::GAP * sc;
+    }
+    blocks
+}
+
 fn sidebar_layout(state: &State, layout: &Layout) -> SidebarLayout {
     let sc = state.renderer.scale();
     let width = layout.sidebar_px;
     let rect_x = sidebar::MARGIN_L * sc;
     let rect_w = (width - (sidebar::MARGIN_L + sidebar::MARGIN_R) * sc).max(0.0);
-    let height_px = layout.rows as f32 * state.renderer.cell().height;
-    // 下段に直近のコマンドを出す余地を残す。
-    let limit = height_px - 120.0 * sc;
+    let limit = sidebar_limit(state, layout);
 
     let mut blocks = Vec::new();
     let mut y = sidebar::HEADER * sc;
-    for tree in state.manager.tree_rows() {
-        let Some(s) = state.manager.sessions().get(tree.index) else {
-            continue;
-        };
-        let mut content = state.renderer.line_height_px(sidebar::SIZE_TITLE);
-        if s.window_title.is_some() {
-            content += state.renderer.line_height_px(sidebar::SIZE_SUB);
+    if showing_hits(state.across.as_ref()) {
+        // 打っているあいだ、一覧は結果の一覧に差し替わる（仕様 §6）。
+        blocks = across_blocks(state, layout);
+        if let Some(b) = blocks.last() {
+            y = b.top + b.height + sidebar::GAP * sc;
+        } else {
+            // 1 件も置かないときは、代わりに出す字のぶんを空ける。
+            // 空けないと、区切り線と直近のコマンドがその字に重なる。
+            y = across_note_y(sc)
+                + state.renderer.line_height_px(sidebar::SIZE_SUB)
+                + sidebar::PAD_BOTTOM * sc
+                + sidebar::GAP * sc;
         }
-        if s.branch.is_some() {
-            content += state.renderer.line_height_px(sidebar::SIZE_BRANCH);
+    } else {
+        for tree in state.manager.tree_rows() {
+            let Some(s) = state.manager.sessions().get(tree.index) else {
+                continue;
+            };
+            let mut content = state.renderer.line_height_px(sidebar::SIZE_TITLE);
+            if s.window_title.is_some() {
+                content += state.renderer.line_height_px(sidebar::SIZE_SUB);
+            }
+            if s.branch.is_some() {
+                content += state.renderer.line_height_px(sidebar::SIZE_BRANCH);
+            }
+            let height = (sidebar::PAD_TOP + sidebar::PAD_BOTTOM) * sc + content;
+            if y + height > limit {
+                break;
+            }
+            blocks.push(Block {
+                index: tree.index,
+                depth: tree.depth,
+                top: y,
+                height,
+            });
+            y += height + sidebar::GAP * sc;
         }
-        let height = (sidebar::PAD_TOP + sidebar::PAD_BOTTOM) * sc + content;
-        if y + height > limit {
-            break;
-        }
-        blocks.push(Block {
-            index: tree.index,
-            depth: tree.depth,
-            top: y,
-            height,
-        });
-        y += height + sidebar::GAP * sc;
     }
     let sep_y = y - sidebar::GAP * sc + sidebar::SEP_PAD * sc;
     SidebarLayout {
@@ -2247,8 +2852,12 @@ fn sidebar_boundary_y(sl: &SidebarLayout, at: usize, sc: f32) -> f32 {
 /// 左ペインのどこを押したか。
 enum SidebarHit {
     NewSession,
+    /// 見出しの帯の検索窓。押すと窓に入る（仕様 §9）。
+    SearchBox,
     Select(usize),
     Close(usize),
+    /// 結果の一覧の件。添字は `across.hits` の絶対の位置。
+    Hit(usize),
 }
 
 /// 画素の位置で当たりを見る。
@@ -2259,13 +2868,21 @@ fn sidebar_hit(state: &State, layout: &Layout, px: f32, py: f32) -> Option<Sideb
     let sc = state.renderer.scale();
     let sl = sidebar_layout(state, layout);
     if py < sidebar::HEADER * sc {
-        // 見出しの帯の右端に `+` を置いている。
+        // 見出しの帯の右端に `+` を置き、残りを検索窓にしている（仕様 §6）。
         let plus_right = sl.rect_x + sl.rect_w;
-        return (px > plus_right - 24.0 * sc).then_some(SidebarHit::NewSession);
+        if px > plus_right - sidebar::PLUS_ZONE * sc {
+            return Some(SidebarHit::NewSession);
+        }
+        return Some(SidebarHit::SearchBox);
     }
+    // 結果の一覧に × も並べ替えも効かせない（仕様 §13）。
+    let hits = showing_hits(state.across.as_ref());
     for b in &sl.blocks {
         if py < b.top || py >= b.top + b.height {
             continue;
+        }
+        if hits {
+            return Some(SidebarHit::Hit(b.index));
         }
         // × は、カーソルが乗っているときだけ 1 段目の右端に出る。
         // 出ていない位置で閉じないよう、同じ範囲でだけ受ける。
@@ -2280,6 +2897,322 @@ fn sidebar_hit(state: &State, layout: &Layout, px: f32, py: f32) -> Option<Sideb
     None
 }
 
+/// 検索窓の目印。
+///
+/// 絵文字は書体によって豆腐になる。`--probe` で出した画を見て選んである。
+const GLASS: &str = "🔍 ";
+
+/// 窓に入っていないときに出す案内。
+///
+/// 窓は常に見えていて、`⌘⇧F` は近道にすぎない（仕様 §12）。
+/// 何に使う窓かが読めなければ、見えていても見えていないのと同じである。
+const ACROSS_HINT: &str = "search all sessions  ⌘⇧F";
+
+/// 当たりを拾ったあとに終わったセッションの代わりに出す字。
+///
+/// `Hit.id` は、走査が走っているあいだに終わったセッションを指しうる。
+/// 1 段目は引けないが、当たった文は残っているので、件ごと捨てはしない。
+const CLOSED_SESSION: &str = "(closed)";
+
+/// 見出しの帯に置く検索窓。
+///
+/// `across` が `None` のあいだも薄く出す（仕様 §6「窓は常に見えている」）。
+/// 入っているあいだは縁と棒を出し、変換中の文字列もここへ出す（仕様 §9）。
+fn draw_search_box(state: &mut State, sl: &SidebarLayout, theme: &Theme) {
+    let sc = state.renderer.scale();
+    let st = style(sidebar::SIZE_QUERY, false);
+    let line_h = state.renderer.line_height_px(sidebar::SIZE_QUERY);
+    let box_h = line_h + 8.0 * sc;
+    let box_y = ((sidebar::HEADER * sc - box_h) / 2.0).max(0.0);
+    // `+` のぶんを右端に残す。当たり判定と同じ値で切る。
+    let box_w = sl.rect_w - sidebar::PLUS_ZONE * sc;
+    if box_w <= 0.0 {
+        return;
+    }
+    let radius = sidebar::RADIUS * sc;
+    let focused = state.across.is_some();
+    if focused {
+        // 縁は、縁の色で塗ったうえへ地の色を 1 画素内側から重ねて作る。
+        let t = sc.max(1.0);
+        state
+            .renderer
+            .fill_px(sl.rect_x, box_y, box_w, box_h, theme.accent, radius);
+        state.renderer.fill_px(
+            sl.rect_x + t,
+            box_y + t,
+            box_w - t * 2.0,
+            box_h - t * 2.0,
+            theme.surface,
+            radius,
+        );
+    } else {
+        state
+            .renderer
+            .fill_px(sl.rect_x, box_y, box_w, box_h, theme.surface, radius);
+    }
+
+    let pad = 6.0 * sc;
+    let ty = box_y + (box_h - line_h) / 2.0;
+    let mut x = sl.rect_x + pad;
+    x += state
+        .renderer
+        .put_text_px(x, ty, GLASS, st, theme.fg_tertiary);
+    let avail = (sl.rect_x + box_w - pad - x).max(0.0);
+    if !focused {
+        let hint = state.renderer.fit_tail(ACROSS_HINT, st, avail);
+        state
+            .renderer
+            .put_text_px(x, ty, &hint, st, theme.fg_tertiary);
+        return;
+    }
+    let query = state
+        .across
+        .as_ref()
+        .map(|a| a.query.clone())
+        .unwrap_or_default();
+    // 打っている末尾を残す。先頭が落ちる。
+    // 変換中は、変換中の文字列のぶんを先に取り分ける。
+    let (query_w, _) = split_box_width(avail, !state.preedit.is_empty(), sidebar::MIN_PREEDIT * sc);
+    let shown = state.renderer.fit_head(&query, st, query_w);
+    let used = state
+        .renderer
+        .put_text_px(x, ty, &shown, st, theme.fg_primary);
+    x += used;
+    // 箱の右端までに収める。下敷きは窓自身の色にする。
+    let room = preedit_room(avail, used);
+    x += draw_preedit_px(state, x, ty, st, theme, Some((room, theme.surface)));
+    state
+        .renderer
+        .fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
+    // 候補窓はここへ寄せる。`draw_terminal` は箱に入っているあいだ書かない。
+    state.cursor_px = Some((x, ty));
+}
+
+/// 窓の中の幅を、確定した語と変換中の文字列へ分ける。
+/// 変換中は、いま打っている末尾が必ず見えるだけの幅を残す。
+fn split_box_width(avail: f32, composing: bool, min_preedit: f32) -> (f32, f32) {
+    let avail = avail.max(0.0);
+    if !composing {
+        return (avail, 0.0);
+    }
+    let preedit = min_preedit.min(avail);
+    (avail - preedit, preedit)
+}
+
+/// 語を描いたあとに、変換中の文字列へ残る幅。
+///
+/// 取り分は語の予算にだけ掛ける（`split_box_width`）。変換中の文字列は、
+/// 語が実際に使わなかった幅をすべて使える。
+fn preedit_room(avail: f32, query_used: f32) -> f32 {
+    (avail - query_used).max(0.0)
+}
+
+/// 結果の 1 件を描くのに要るもの。`renderer` を触る前に写し取る。
+struct HitRow {
+    top: f32,
+    height: f32,
+    selected: bool,
+    /// 1 段目に出す名前。引けなかったセッションでは `CLOSED_SESSION`。
+    name: String,
+    is_path: bool,
+    /// `⌘` の札。引けなかったセッションでは出さない。
+    label: Option<String>,
+    exit: Option<i32>,
+    /// 走査のあいだに終わって消えたセッション。終了コードは分からない。
+    closed: bool,
+    working: bool,
+    blocked: bool,
+    kind: scan::HitKind,
+    text: String,
+    /// `text` の中の当たりのバイト位置。
+    hit: std::ops::Range<usize>,
+}
+
+/// 結果の一覧の 1 件ずつを、描く前に写し取る。
+///
+/// `Hit.id` は走査中に終わったセッションを指しうる。位置ではなく番号で引き、
+/// 引けなければ 1 段目だけを代わりの字にする（当たった文は残す）。
+fn collect_hit_rows(state: &State, sl: &SidebarLayout) -> Vec<HitRow> {
+    let Some(across) = &state.across else {
+        return Vec::new();
+    };
+    let tree = state.manager.tree_rows();
+    sl.blocks
+        .iter()
+        .filter_map(|b| {
+            let hit = across.hits.get(b.index)?;
+            let found = state
+                .manager
+                .sessions()
+                .iter()
+                .enumerate()
+                .find(|(_, s)| s.id == hit.id);
+            let (name, is_path, label, exit, closed, working, blocked) = match found {
+                Some((i, s)) => {
+                    let (name, is_path) = s.display_name();
+                    let exit = match s.state {
+                        RunState::Running => None,
+                        RunState::Exited(code) => Some(code),
+                    };
+                    // 札は一覧に出ているのと同じ番号にする。
+                    let label = tree
+                        .iter()
+                        .position(|r| r.index == i)
+                        .and_then(input::index_label);
+                    (name, is_path, label, exit, false, s.is_working(), s.blocked)
+                }
+                // 終わって消えたセッション。止まっている印で出す。
+                None => (
+                    CLOSED_SESSION.to_string(),
+                    false,
+                    None,
+                    None,
+                    true,
+                    false,
+                    false,
+                ),
+            };
+            Some(HitRow {
+                top: b.top,
+                height: b.height,
+                selected: b.index == across.selected,
+                name,
+                is_path,
+                label,
+                exit,
+                closed,
+                working,
+                blocked,
+                kind: hit.kind,
+                text: hit.text.clone(),
+                hit: hit.hit.clone(),
+            })
+        })
+        .collect()
+}
+
+/// 結果の一覧を描く。
+///
+/// 1 段目は既存の行と同じ組み（状態の点、名前、`⌘` の札）。
+/// 2 段目は当たった文で、当たりを中心に詰め、当たった語に色を敷く（仕様 §6）。
+fn draw_across_hits(state: &mut State, sl: &SidebarLayout, theme: &Theme) {
+    let sc = state.renderer.scale();
+    let title_h = state.renderer.line_height_px(sidebar::SIZE_TITLE);
+    let sub_h = state.renderer.line_height_px(sidebar::SIZE_SUB);
+    let small_h = state.renderer.line_height_px(sidebar::SIZE_BRANCH);
+    let text_x = sl.rect_x + sidebar::TEXT_INSET * sc;
+    let right = sl.rect_x + sl.rect_w;
+    let title_st = style(sidebar::SIZE_TITLE, false);
+    let sub_st = style(sidebar::SIZE_SUB, false);
+    let small_st = style(sidebar::SIZE_BRANCH, false);
+
+    // 当たりが 1 件も無いときは、何も無い理由を出す。
+    // 当たりは語より 1 走査ぶん遅れることがあるので（`queue_scan` は時刻を
+    // 押すだけ）、走らせる前に「無い」と言わない。
+    // 1 件も置けない高さのときも、割り付けは一言のぶんを空けている。
+    // 空の帯を残さず、理由を出す。
+    let note = state.across.as_ref().and_then(|a| {
+        let n = scan_note(a.scanning, a.typed_at.is_some(), a.hits.len());
+        across_note_text(sl.blocks.is_empty(), &n)
+    });
+    if let Some(note) = note {
+        state
+            .renderer
+            .put_text_px(text_x, across_note_y(sc), note, sub_st, theme.fg_tertiary);
+        return;
+    }
+
+    for row in collect_hit_rows(state, sl) {
+        if row.selected {
+            state.renderer.fill_px(
+                sl.rect_x,
+                row.top,
+                sl.rect_w,
+                row.height,
+                theme.surface,
+                sidebar::RADIUS * sc,
+            );
+        }
+        let mut y = row.top + sidebar::PAD_TOP * sc;
+
+        // ---- 1 段目：状態の点、名前、`⌘` の札
+        let label_w = match &row.label {
+            Some(l) => state.renderer.measure_px(l, small_st),
+            None => 0.0,
+        };
+        let avail = (right - 12.0 * sc - label_w - text_x).max(0.0);
+        let name = if row.is_path {
+            state.renderer.fit_head(&row.name, title_st, avail)
+        } else {
+            state.renderer.fit_tail(&row.name, title_st, avail)
+        };
+        let ended = row.closed || row.exit.is_some();
+        let fg = if !ended {
+            theme.fg_primary
+        } else {
+            theme.fg_tertiary
+        };
+        state.renderer.put_text_px(text_x, y, &name, title_st, fg);
+        state.renderer.put_text_px(
+            sl.rect_x + sidebar::MARK_INSET * sc,
+            y + (title_h - small_h) / 2.0,
+            if ended { "○" } else { "●" },
+            small_st,
+            mark_color(theme, row.exit, row.working, row.blocked),
+        );
+        if let Some(label) = &row.label {
+            state.renderer.put_text_px(
+                right - 6.0 * sc - label_w,
+                y + (title_h - small_h) / 2.0,
+                label,
+                small_st,
+                theme.fg_tertiary,
+            );
+        }
+        y += title_h;
+
+        // ---- 2 段目：当たった文
+        // 題名と枝に当たったときは、一覧と同じ印を同じ色で置く。
+        // 置かないと、出力の行に当たったのと見分けが付かない。
+        let (mark, mark_fg) = match row.kind {
+            scan::HitKind::Title => ("✻ ", theme.accent),
+            scan::HitKind::Branch => ("⋔ ", theme.fg_tertiary),
+            scan::HitKind::Line | scan::HitKind::Name => ("", theme.fg_tertiary),
+        };
+        let mut x = text_x;
+        x += state.renderer.put_text_px(x, y, mark, sub_st, mark_fg);
+        let limit = (right - 8.0 * sc - x).max(0.0);
+        // 当たりを中心にして詰める。末尾も先頭も落とす詰め方では、
+        // 探した語そのものが落ちうる（仕様 §6）。
+        let (shown, at) = state.renderer.fit_center(&row.text, sub_st, limit, row.hit);
+        // `at` は `shown` のバイト位置。境を外した範囲で落ちないようにする。
+        let head = shown.get(..at.start).unwrap_or("");
+        let word = shown.get(at.start..at.end).unwrap_or("");
+        let tail = shown.get(at.end..).unwrap_or("");
+        x += state
+            .renderer
+            .put_text_px(x, y, head, sub_st, theme.fg_secondary);
+        if !word.is_empty() {
+            let word_w = state.renderer.measure_px(word, sub_st);
+            let pad = sidebar::HIT_PAD * sc / 2.0;
+            state.renderer.fill_px(
+                x - pad,
+                y,
+                word_w + pad * 2.0,
+                sub_h,
+                theme.search_hit,
+                2.0 * sc,
+            );
+        }
+        x += state
+            .renderer
+            .put_text_px(x, y, word, sub_st, theme.search_fg);
+        state
+            .renderer
+            .put_text_px(x, y, tail, sub_st, theme.fg_secondary);
+    }
+}
+
 pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
     let sc = state.renderer.scale();
     let sl = sidebar_layout(state, layout);
@@ -2287,6 +3220,9 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
     state
         .renderer
         .fill_px(0.0, 0.0, sl.width, height_px, theme.chrome_bg, 0.0);
+
+    // 帯の左は検索窓。`+` より先に描く（仕様 §6）。
+    draw_search_box(state, &sl, theme);
 
     // 押せる目印。キーが効かない環境でもここから増やせる。
     let plus_w = state
@@ -2301,6 +3237,20 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         style(sidebar::SIZE_TITLE, true),
         theme.accent,
     );
+
+    if showing_hits(state.across.as_ref()) {
+        draw_across_hits(state, &sl, theme);
+        // 一覧を出していないあいだも「描いた状態」は合わせておく。
+        // 残しておくと、背景のセッションが字を出すたびに
+        // `wants_redraw` が描き直しを頼み続ける。
+        for s in state.manager.sessions_mut() {
+            let working = s.is_working();
+            s.shown_working = working;
+            s.shown_blocked = s.blocked;
+        }
+        draw_sidebar_recent(state, &sl, theme, height_px);
+        return;
+    }
 
     let selected = state.manager.selected_index();
     // 描いた「動いている」状態は覚えておく。変わるときだけ描き直す。
@@ -2388,22 +3338,13 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         // 実行状態は左端に置く。Warp がアバターを置いている位置にあたる。
         // 動いているあいだは明るく、待っているあいだは沈める。
         let mark = if exit.is_none() { "●" } else { "○" };
-        // 待っている＞動いている＞止まっている、の順に強い。
-        // 待ちは黄色。動いている緑とも、異常終了の赤とも違う色にする。
-        let mark_color = match exit {
-            None if blocked => theme.ansi[3],
-            None if working => theme.accent,
-            None => theme.fg_tertiary,
-            Some(0) => theme.fg_tertiary,
-            Some(_) => theme.warn,
-        };
         let small_h = state.renderer.line_height_px(sidebar::SIZE_BRANCH);
         state.renderer.put_text_px(
             sl.rect_x + sidebar::MARK_INSET * sc + indent,
             y + (title_h - small_h) / 2.0,
             mark,
             style(sidebar::SIZE_BRANCH, false),
-            mark_color,
+            mark_color(theme, exit, working, blocked),
         );
         // 右端は、ふだんは ⌘ の番号、カーソルが乗っているときは閉じる印。
         // 両方を常に置くと名前の幅が足りない。
@@ -2498,7 +3439,12 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         }
     }
 
-    // 直近のコマンド。何もなければ区切りごと出さない。
+    draw_sidebar_recent(state, &sl, theme, height_px);
+}
+
+/// 下段の直近のコマンド。何もなければ区切りごと出さない。
+fn draw_sidebar_recent(state: &mut State, sl: &SidebarLayout, theme: &Theme, height_px: f32) {
+    let sc = state.renderer.scale();
     if state.recent.is_empty() {
         return;
     }
@@ -2676,10 +3622,16 @@ pub(crate) fn draw_terminal(state: &mut State, layout: &Layout, theme: &Theme) {
         if let Some(y) = cursor_row {
             let x = layout.term_col + cursor_col.min(layout.term_cols - 1);
             let cell = state.renderer.cell();
-            state.cursor_px = Some((x as f32 * cell.width, y as f32 * cell.height));
+            // 検索窓に入っているあいだ、変換中の文字列と候補窓は窓の側が持つ。
+            // `draw_sidebar` は `draw_terminal` より先に走るので、ここで
+            // 書き直すと候補窓が端末のカーソルへ戻ってしまう。
+            let owns_ime = state.across.is_none();
+            if owns_ime {
+                state.cursor_px = Some((x as f32 * cell.width, y as f32 * cell.height));
+            }
             // 変換中の文字列は、確定するまで子プロセスへ渡さない。
             // 見えないと何を打っているか分からないので、カーソルの位置に出す。
-            let preedit = (state.find.is_none() && state.search.is_none())
+            let preedit = (owns_ime && state.find.is_none() && state.search.is_none())
                 .then(|| state.preedit.clone())
                 .filter(|p| !p.is_empty());
             if let Some(text) = preedit {
@@ -2758,7 +3710,7 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
         x += state
             .renderer
             .put_text_px(x, ty, &input, st, theme.fg_primary);
-        x += draw_preedit_px(state, x, ty, st, theme);
+        x += draw_preedit_px(state, x, ty, st, theme, None);
         state
             .renderer
             .fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
@@ -2798,7 +3750,7 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
             theme.fg_primary
         };
         x += state.renderer.put_text_px(x, ty, &query, st, fg);
-        x += draw_preedit_px(state, x, ty, st, theme);
+        x += draw_preedit_px(state, x, ty, st, theme, None);
         state
             .renderer
             .fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
@@ -2901,7 +3853,7 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
         x += state
             .renderer
             .put_text_px(x, ty, &query, st, theme.fg_primary);
-        x += draw_preedit_px(state, x, ty, st, theme);
+        x += draw_preedit_px(state, x, ty, st, theme, None);
         state
             .renderer
             .fill_px(x, ty, 2.0 * sc, line_h, theme.cursor, 0.0);
@@ -2942,14 +3894,27 @@ pub(crate) fn draw_bottom(state: &mut State, layout: &Layout, theme: &Theme) {
 }
 
 /// 変換中の文字列を帯の中に出す。返す値は描いた幅。
-fn draw_preedit_px(state: &mut State, x: f32, y: f32, st: TextStyle, theme: &Theme) -> f32 {
+///
+/// `bound` は窓の中で使うときの、残りの幅と下敷きの色。幅を越える分は切る。
+fn draw_preedit_px(
+    state: &mut State,
+    x: f32,
+    y: f32,
+    st: TextStyle,
+    theme: &Theme,
+    bound: Option<(f32, Rgb)>,
+) -> f32 {
     if state.preedit.is_empty() {
         return 0.0;
     }
-    let text = state.preedit.clone();
+    let (text, under) = match bound {
+        // 窓の中では、いま打っている末尾を残す。他の呼び手は切らない。
+        Some((room, color)) => (state.renderer.fit_head(&state.preedit, st, room), color),
+        None => (state.preedit.clone(), theme.chrome_bg),
+    };
     let w = state.renderer.measure_px(&text, st);
     let h = state.renderer.line_height_px(st.size);
-    state.renderer.fill_px(x, y, w, h, theme.chrome_bg, 0.0);
+    state.renderer.fill_px(x, y, w, h, under, 0.0);
     state
         .renderer
         .put_text_px(x, y, &text, st, theme.fg_primary);
@@ -3302,6 +4267,12 @@ mod tests {
             Some(3),
             false
         ));
+        // 走査の結果は、受け取れたかどうかで変わる。ここでは決めない。
+        assert!(!wants_redraw(
+            &UiEvent::Scanned(1, Vec::new()),
+            Some(3),
+            false
+        ));
     }
 
     fn px(y: f64) -> MouseScrollDelta {
@@ -3422,11 +4393,148 @@ mod tests {
         let got = bracketed("x", TermMode::BRACKETED_PASTE);
         assert_eq!(got, b"\x1b[200~x\x1b[201~");
     }
+
+    /// 走査は別スレッドで走るので、結果は打った順に帰ってくるとは限らない。
+    /// 遅れて来た古い結果で、新しい結果を上書きしないこと。
+    mod 横断検索の受け口 {
+        use super::*;
+
+        fn 当たり(text: &str) -> crate::scan::Hit {
+            crate::scan::Hit {
+                id: 1,
+                kind: crate::scan::HitKind::Line,
+                serial: Some(0),
+                at: None,
+                text: text.into(),
+                hit: 0..text.len(),
+            }
+        }
+
+        #[test]
+        fn 古い世代の結果は捨てる() {
+            // 世代 2 を待っているあいだに、1 本前の走査が結果を持って帰ってくる。
+            let mut across = CrossSearch {
+                query: "ses".into(),
+                generation: 2,
+                ..CrossSearch::default()
+            };
+            assert!(!across.accept(1, vec![当たり("古い")]), "古い世代を受けた");
+            assert!(across.hits.is_empty(), "古い世代の結果で入れ替わった");
+
+            // 待っていた世代なら受ける。選んでいた位置は先頭へ戻す。
+            across.selected = 4;
+            across.offset = 2;
+            assert!(across.accept(2, vec![当たり("新しい")]));
+            assert_eq!(across.hits.len(), 1);
+            assert_eq!(across.hits[0].text, "新しい");
+            assert_eq!((across.selected, across.offset), (0, 0));
+
+            // 受け取ったあとで届いた古い世代も捨てる。
+            assert!(!across.accept(1, vec![当たり("もっと古い")]));
+            assert_eq!(across.hits[0].text, "新しい", "古い結果に戻された");
+        }
+
+        /// 語を消し切ったら走査は始まらない。出ている当たりを捨てるのは
+        /// このときだけで、捨てなければ、消した語の当たりが一覧に残り続ける。
+        #[test]
+        fn 語を消したら当たりも捨てる() {
+            let mut across = CrossSearch {
+                hits: vec![当たり("古い")],
+                selected: 3,
+                offset: 2,
+                ..CrossSearch::default()
+            };
+            assert!(across.clear_hits(), "捨てたことを知らせない");
+            assert!(across.hits.is_empty());
+            assert_eq!((across.selected, across.offset), (0, 0));
+            // 空のまま呼ばれても、描き直しは頼まない。
+            assert!(!across.clear_hits());
+        }
+
+        /// 打鍵のたびには走らせない（仕様 §10）。
+        #[test]
+        fn 打鍵が止まるまで走らせない() {
+            let now = std::time::Instant::now();
+            let 間 = SCAN_DEBOUNCE;
+            // 語が変わっていなければ、起こしてもらう必要も無い。
+            assert_eq!(scan_due(None, now, 間), ScanWhen::Idle);
+            // まだ間が空いていなければ、その時刻に起こしてもらう。
+            let typed = now - 間 / 2;
+            assert_eq!(scan_due(Some(typed), now, 間), ScanWhen::WakeAt(typed + 間));
+            // ちょうど過ぎたところから始める。
+            assert_eq!(scan_due(Some(now - 間), now, 間), ScanWhen::Start);
+            assert_eq!(scan_due(Some(now - 間 * 2), now, 間), ScanWhen::Start);
+        }
+
+        #[test]
+        fn 選んでいる件が窓から出ないよう追う() {
+            // 窓は 3 件。下へ出たら、下端に付いてくる。
+            let mut across = CrossSearch {
+                selected: 5,
+                ..CrossSearch::default()
+            };
+            across.follow(3);
+            assert_eq!(across.offset, 3);
+            // 窓の中にいるあいだは動かさない。
+            across.selected = 4;
+            across.follow(3);
+            assert_eq!(across.offset, 3);
+            // 上へ出たら、上端に付いてくる。
+            across.selected = 1;
+            across.follow(3);
+            assert_eq!(across.offset, 1);
+            // 1 件も置けない高さでも、選んでいる件を追い越さない。
+            across.selected = 7;
+            across.follow(0);
+            assert_eq!(across.offset, 7);
+        }
+    }
+}
+
+/// `Enter` を押したとき、その件をどう扱うか。
+#[derive(Debug, PartialEq, Eq)]
+enum Landing {
+    /// 送り先が無い。セッションを切り替えて語を渡すだけ（仕様 §12）。
+    /// 名前・題名・枝の件と、履歴から消えた行。
+    Nothing,
+    /// 数え違い。`⌘F` に探させる。
+    Search,
+    /// この行を見に行く。まだ語が有れば送り、無ければ `Search` と同じにする。
+    Row(i32),
+}
+
+/// 通し番号を、いまの `pushed` で行位置へ引き直して扱いを決める。
+fn landing(serial: Option<i64>, pushed: u64, history: usize, screen_lines: i32) -> Landing {
+    let Some(serial) = serial else {
+        return Landing::Nothing;
+    };
+    match lines::line_of(serial, pushed, history) {
+        None => Landing::Nothing,
+        Some(line) if line > screen_lines - 1 => Landing::Search,
+        Some(line) => Landing::Row(line),
+    }
 }
 
 #[cfg(test)]
 mod search_view_tests {
     use super::*;
+
+    #[test]
+    fn 消えた行は送らずに語だけ渡す() {
+        assert_eq!(landing(None, 100, 10000, 24), Landing::Nothing);
+        assert_eq!(landing(Some(97), 120, 10, 24), Landing::Nothing);
+    }
+
+    #[test]
+    fn 流れた行は通し番号から引き直す() {
+        assert_eq!(landing(Some(97), 120, 10000, 24), Landing::Row(-23));
+        assert_eq!(landing(Some(120), 120, 10000, 24), Landing::Row(0));
+    }
+
+    #[test]
+    fn 画面より下に出た件は数え違いとして扱う() {
+        assert_eq!(landing(Some(200), 120, 10000, 24), Landing::Search);
+    }
 
     fn view(selected: usize, offset: usize) -> SearchState {
         SearchState {
@@ -3476,6 +4584,104 @@ mod search_view_tests {
                 );
             }
         }
+    }
+
+    fn cross(query: &str) -> CrossSearch {
+        CrossSearch {
+            query: query.into(),
+            ..CrossSearch::default()
+        }
+    }
+
+    #[test]
+    fn 語が空白だけなら元の一覧に戻る() {
+        // 結果 0 件の一覧を出すのではなく、セッションの一覧を組む（仕様 §6）。
+        // 走査を始めない判定（`start_scan`）と同じ規則でなければ、
+        // 当たりが捨てられたあとも空の一覧が出たままになる。
+        assert!(!showing_hits(None));
+        assert!(!showing_hits(Some(&cross(""))));
+        assert!(!showing_hits(Some(&cross(" "))));
+        assert!(!showing_hits(Some(&cross("\t "))));
+        // 全角の空白も空白として扱う。
+        assert!(!showing_hits(Some(&cross("　"))));
+        assert!(showing_hits(Some(&cross("ses"))));
+        // 前後の空白は語の一部ではないが、語そのものは残っている。
+        assert!(showing_hits(Some(&cross(" ses "))));
+    }
+
+    #[test]
+    fn 結果の行は二段ぶんの高さを取る() {
+        // 1 件は 2 段（仕様 §6）。1 段目と 2 段目の高さに、上下の余白を足す。
+        // 余白は PAD_TOP 9 + PAD_BOTTOM 10 = 19pt で、倍率 2 なら 38 画素。
+        assert_eq!(across_block_height(2.0, 34.0, 32.0), 38.0 + 34.0 + 32.0);
+        assert_eq!(across_block_height(1.0, 17.0, 16.0), 19.0 + 17.0 + 16.0);
+        // 3 段目（枝）のぶんは取らない。結果の行に枝は出さない。
+        let three = 19.0 + 17.0 + 16.0 + 13.0;
+        assert!(across_block_height(1.0, 17.0, 16.0) < three);
+    }
+
+    #[test]
+    fn 走っているあいだは当たりが無いと言わない() {
+        assert_eq!(scan_note(true, false, 0), ScanNote::Searching);
+        assert_eq!(scan_note(false, true, 0), ScanNote::Searching);
+        assert_eq!(scan_note(false, false, 0), ScanNote::NoMatch);
+        assert_eq!(scan_note(true, false, 3), ScanNote::None);
+        assert_eq!(scan_note(false, false, 3), ScanNote::None);
+    }
+
+    #[test]
+    fn 貼り付けた語の改行は空白になる() {
+        let mut a = CrossSearch::default();
+        a.query.push_str("ab ");
+        a.push_pasted("cd\r\nef\tg\n");
+        assert_eq!(a.query, "ab cd  efg ");
+    }
+
+    #[test]
+    fn 変換中は窓の幅から文字列のぶんを先に取り分ける() {
+        // 変換中でなければ、幅は全部が語のもの。
+        assert_eq!(split_box_width(100.0, false, 56.0), (100.0, 0.0));
+        // 広い窓は、指定のぶんだけ変換中へ割く。
+        assert_eq!(split_box_width(100.0, true, 56.0), (44.0, 56.0));
+        // 狭い窓でも、語の幅が負にならない。
+        assert_eq!(split_box_width(30.0, true, 56.0), (0.0, 30.0));
+        assert_eq!(split_box_width(-5.0, true, 56.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn 変換中の文字列は語が使わなかった幅をすべて使える() {
+        let (query_w, _) = split_box_width(100.0, true, 56.0);
+        // 短い語なら、取り分ではなく実際の余りが残る。
+        assert_eq!(preedit_room(100.0, 20.0), 80.0);
+        // 語が予算いっぱいなら、残るのはちょうど取り分。
+        assert_eq!(preedit_room(100.0, query_w), 56.0);
+        // 負にならない。
+        assert_eq!(preedit_room(100.0, 130.0), 0.0);
+        assert_eq!(preedit_room(-5.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn 件が置けない高さでも理由を出す() {
+        assert_eq!(across_note_text(true, &ScanNote::None), Some("too narrow"));
+        assert_eq!(across_note_text(false, &ScanNote::None), None);
+        assert_eq!(across_note_text(true, &ScanNote::NoMatch), Some("no match"));
+    }
+
+    #[test]
+    fn 高さに入る件数だけ席を作る() {
+        // 帯の下（34）から `limit` まで。1 件 50 画素、あいだ 4 画素。
+        assert_eq!(across_rows(34.0, 34.0, 50.0, 4.0), 0, "1 件も置けない");
+        assert_eq!(across_rows(34.0, 84.0, 50.0, 4.0), 1, "ちょうど 1 件");
+        assert_eq!(
+            across_rows(34.0, 137.0, 50.0, 4.0),
+            1,
+            "2 件目に 1 画素足りない"
+        );
+        assert_eq!(across_rows(34.0, 138.0, 50.0, 4.0), 2);
+        // 帯が `limit` より下にあっても数えない。
+        assert_eq!(across_rows(900.0, 100.0, 50.0, 4.0), 0);
+        // 高さの無い件を数え続けない。これは描画の経路にある。
+        assert_eq!(across_rows(0.0, 1000.0, 0.0, 0.0), 0);
     }
 }
 

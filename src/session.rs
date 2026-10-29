@@ -12,6 +12,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 
 use crate::config::{self, Config, ExpandError, Vars};
+use crate::lines::Ticks;
 use crate::pty::{self, PtyHandle, SpawnError};
 use crate::term::{now_ms, EventProxy, TermSize, UiSender};
 
@@ -43,6 +44,12 @@ pub struct Session {
     pub dirty: Arc<AtomicBool>,
     /// 最後に出力があった時刻（起動からのミリ秒）。
     pub activity: Arc<std::sync::atomic::AtomicU64>,
+    /// これまでに履歴へ押し出した行の数。行に通し番号を付けるのに使う。
+    ///
+    /// 読むのは左ペインの横断検索で、走査スレッドへ `Arc` の複製を渡す。
+    pub pushed: Arc<std::sync::atomic::AtomicU64>,
+    /// 押し出した行数と時刻の対応。通し番号から時刻を引くのに使う。
+    pub ticks: Arc<std::sync::Mutex<Ticks>>,
     /// 左ペインに「動いている」と描いてあるか。
     ///
     /// 描いた状態を覚えておき、変わるときだけ描き直す。
@@ -650,6 +657,8 @@ impl Manager {
             window_size: spawned.window_size,
             dirty: spawned.dirty,
             activity: spawned.activity,
+            pushed: spawned.pushed,
+            ticks: spawned.ticks,
             shown_working: false,
             title_working: None,
             blocked: false,
