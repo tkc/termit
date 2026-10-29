@@ -115,6 +115,8 @@ pub fn run(out_path: &str) {
         picker: None,
         rename: None,
         sidebar_width: config.window.sidebar_width,
+        sidebar_offset: 0,
+        sidebar_followed: None,
         find: None,
         across: None,
         scan_generation: 0,
@@ -258,6 +260,22 @@ pub fn run(out_path: &str) {
             // 変換中の文字列が窓へ出ることも確かめる。窓に収まらない長さにして、
             // 切れ方（末尾が残ること）と、語が窓いっぱいでも幅が残ることを見る。
             state.preedit = "けんさくごをながくへんかんしているところ".into();
+        }
+        Ok("many") => {
+            // 一覧に入りきらない数まで増やし、送った一覧を描く。
+            // 選ぶのは末尾の行で、送り位置は `draw_sidebar` が追いかける。
+            let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+            for _ in 0..18 {
+                if state
+                    .manager
+                    .spawn_new(&config, HOST_PROFILE, &cwd)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let last = state.manager.sessions().len().saturating_sub(1);
+            state.manager.select(last);
         }
         Ok("preedit") => {
             state.preedit = "あっだ".into();
