@@ -233,6 +233,11 @@ and pass it through `printf '%b'`, the escape handling collides and the link
 comes out broken. Keep the colours as real bytes (`$'\033[33m'`) and print
 everything with `%s`.
 
+**When the sessions outgrow the left pane.** The list shows as many rows as
+fit and scrolls for the rest: the wheel over the left pane moves it, and
+switching sessions brings the selected row back into view. A row always wears
+the key that selects it, so the labels tell you where in the list you are.
+
 **Reordering the left pane.** Drag a row and drop it where the line appears.
 A session with forks under it moves together with them, and a fork moves within
 its parent — the drop marker only appears where the row can actually land. The
@@ -281,6 +286,7 @@ actually arrive as.
 | Drag in the terminal | Select text (`⌘C` copies) |
 | Double / triple click | Select word / line |
 | Wheel | Scroll |
+| Wheel over the left pane | Scroll the session list |
 | Drag the pane border | Resize the left pane |
 
 When the program running in the terminal asks for mouse reporting (vim, htop,

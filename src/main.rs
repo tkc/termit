@@ -429,6 +429,16 @@ pub(crate) struct State {
     rename: Option<RenameState>,
     /// 左ペインの幅（pt）。境目を掴んで変えられる。
     sidebar_width: f32,
+    /// 一覧の先頭に出している行（`Manager::tree_rows` の添字）。
+    ///
+    /// セッションが増えると、入りきらない行が下で見切れる。車輪で送り、
+    /// 選んだ行が窓の外へ出たときは追いかける。
+    sidebar_offset: usize,
+    /// 送り位置を合わせた選択行。これが変わったときだけ合わせ直す。
+    ///
+    /// 毎フレーム合わせると、車輪で送った位置をその場で戻してしまう。
+    /// `shown_title` と同じ、描いた状態の控えである。
+    sidebar_followed: Option<usize>,
     /// 画面の中の検索。
     find: Option<search::ScreenSearch>,
     /// 全セッションを横断する検索。開いていなければ `None`。
@@ -673,6 +683,8 @@ impl ApplicationHandler<UiEvent> for App {
             picker: None,
             rename: None,
             sidebar_width: self.config.window.sidebar_width,
+            sidebar_offset: 0,
+            sidebar_followed: None,
             find: None,
             across: None,
             scan_generation: 0,
@@ -1578,7 +1590,9 @@ impl App {
                     let sl = sidebar_layout(state, &layout);
                     if let Some(row) = sl.blocks.iter().position(|b| b.index == i) {
                         state.mouse.sidebar_drag = Some(SidebarDrag {
-                            from_row: row,
+                            // 掴んだのは窓の中の位置。送っているぶんを足して
+                            // 木の行に直す。
+                            from_row: sl.offset + row,
                             start_y: state.mouse.y,
                             to: None,
                             moved: false,
@@ -1765,6 +1779,12 @@ impl App {
             return;
         }
         let layout = layout_of(&self.config, state);
+        // 左ペインの上で回したら、一覧を送る。ここで返さないと、下の経路が
+        // 選んでいるセッションのスクロールバックを遡らせる。
+        if state.mouse.x < layout.sidebar_px {
+            scroll_sidebar(state, &layout, lines);
+            return;
+        }
         let (col, row, _) = mouse_cell(state);
         let cell = terminal_cell(&layout, col, row);
         let Some(session) = state.manager.selected() else {
@@ -2676,6 +2696,11 @@ struct SidebarLayout {
     rect_x: f32,
     rect_w: f32,
     blocks: Vec<Block>,
+    /// 一覧の先頭に出している行。`blocks` の添字に足すと木の行になる。
+    ///
+    /// 結果の一覧では 0 のままにする。`Block::index` が当たりの絶対の
+    /// 位置を持っており、送った位置はそちらに入っている。
+    offset: usize,
     /// 区切り線の位置（画素）。
     sep_y: f32,
 }
@@ -2684,6 +2709,154 @@ struct SidebarLayout {
 fn sidebar_limit(state: &State, layout: &Layout) -> f32 {
     let height_px = layout.rows as f32 * state.renderer.cell().height;
     height_px - 120.0 * state.renderer.scale()
+}
+
+/// 各行の矩形の高さ（画素）。渡された行と同じ並びで返す。
+///
+/// 高さは段の数で変わる（題名や枝があれば高い）。送り位置を決める側と
+/// 割り付ける側で同じ値を使うため、ここで 1 度だけ出す。
+/// 行の並びは呼ぶ側から渡す。`tree_rows` は毎回組み直すので、
+/// 1 フレームのうちに何度も作らせない。
+fn sidebar_row_heights(state: &State, rows: &[crate::session::TreeRow]) -> Vec<f32> {
+    let sc = state.renderer.scale();
+    let title = state.renderer.line_height_px(sidebar::SIZE_TITLE);
+    let sub = state.renderer.line_height_px(sidebar::SIZE_SUB);
+    let branch = state.renderer.line_height_px(sidebar::SIZE_BRANCH);
+    rows.iter()
+        .map(|tree| {
+            // `tree_rows` はセッションを数え上げて作るので、添字は必ずある。
+            let s = &state.manager.sessions()[tree.index];
+            let mut content = title;
+            if s.window_title.is_some() {
+                content += sub;
+            }
+            if s.branch.is_some() {
+                content += branch;
+            }
+            (sidebar::PAD_TOP + sidebar::PAD_BOTTOM) * sc + content
+        })
+        .collect()
+}
+
+/// `offset` から `limit` までに置ける行数。
+///
+/// 高さが行ごとに違うので、件数では出せない。割り付け（`sidebar_layout`）と
+/// 同じ順で足していく。
+fn sidebar_rows(heights: &[f32], offset: usize, top: f32, limit: f32, gap: f32) -> usize {
+    let mut y = top;
+    let mut rows = 0;
+    for h in heights.iter().skip(offset) {
+        if y + h > limit {
+            break;
+        }
+        rows += 1;
+        y += h + gap;
+    }
+    rows
+}
+
+/// 送れる上限。最後の行が下端に来る位置より先へは送らない。
+///
+/// 送りすぎて空白だけを出さないための歯止めである。末尾から積み上げて、
+/// まだ入る限り先頭へ戻す。
+fn sidebar_max_offset(heights: &[f32], top: f32, limit: f32, gap: f32) -> usize {
+    let mut y = top;
+    let mut offset = heights.len();
+    for (i, h) in heights.iter().enumerate().rev() {
+        if y + h > limit {
+            break;
+        }
+        y += h + gap;
+        offset = i;
+    }
+    // 送り位置は行の範囲に収める。`len` を返すと、どこへ送っても空になる。
+    offset.min(heights.len().saturating_sub(1))
+}
+
+/// 選んだ行が窓の中に入るよう、送り位置を出す。
+///
+/// 上に隠れていればその行へ戻す。下に隠れていれば、入るまで 1 行ずつ送る。
+/// 行の高さが違うので、引き算では出せない。
+fn sidebar_follow(
+    heights: &[f32],
+    offset: usize,
+    selected: usize,
+    top: f32,
+    limit: f32,
+    gap: f32,
+) -> usize {
+    if selected < offset {
+        return selected;
+    }
+    let mut offset = offset;
+    while selected >= offset + sidebar_rows(heights, offset, top, limit, gap) {
+        // 1 行も入らない高さでは、送っても入らない。選んだ行で止める。
+        if offset >= selected {
+            break;
+        }
+        offset += 1;
+    }
+    offset
+}
+
+/// 車輪の行数を送り位置に足す。
+///
+/// 上へ回すと `lines` は正で、先頭（古い添字）へ戻る。
+fn wheel_offset(offset: usize, lines: i32, max: usize) -> usize {
+    if lines > 0 {
+        offset.saturating_sub(lines as usize)
+    } else {
+        (offset + lines.unsigned_abs() as usize).min(max)
+    }
+}
+
+/// 送り位置を、いまの選択と高さに合わせ直す。
+///
+/// 選択行が変わったときだけ追いかける。毎フレーム追いかけると、車輪で
+/// 送った位置をその場で戻してしまい、車輪が効かなくなる。
+/// 上限の丸めは毎フレームかける。セッションを閉じれば上限は下がる。
+fn settle_sidebar_offset(state: &mut State, layout: &Layout) {
+    let sc = state.renderer.scale();
+    let top = sidebar::HEADER * sc;
+    let gap = sidebar::GAP * sc;
+    let limit = sidebar_limit(state, layout);
+    let rows = state.manager.tree_rows();
+    let heights = sidebar_row_heights(state, &rows);
+    let selected = state.manager.selected_index();
+    let row = rows.iter().position(|r| r.index == selected);
+    if state.sidebar_followed != row {
+        state.sidebar_followed = row;
+        if let Some(row) = row {
+            state.sidebar_offset =
+                sidebar_follow(&heights, state.sidebar_offset, row, top, limit, gap);
+        }
+    }
+    state.sidebar_offset = state
+        .sidebar_offset
+        .min(sidebar_max_offset(&heights, top, limit, gap));
+}
+
+/// 左ペインの一覧を車輪で送る。いま出している側の一覧だけを動かす。
+fn scroll_sidebar(state: &mut State, layout: &Layout, lines: i32) {
+    if showing_hits(state.across.as_ref()) {
+        // 窓に入る件数は割り付けと同じ関数で出す。
+        let rows = across_window(state, layout);
+        if let Some(across) = &mut state.across {
+            let max = across.hits.len().saturating_sub(rows);
+            across.offset = wheel_offset(across.offset, lines, max);
+        }
+        return;
+    }
+    let sc = state.renderer.scale();
+    let rows = state.manager.tree_rows();
+    let heights = sidebar_row_heights(state, &rows);
+    let max = sidebar_max_offset(
+        &heights,
+        sidebar::HEADER * sc,
+        sidebar_limit(state, layout),
+        sidebar::GAP * sc,
+    );
+    state.sidebar_offset = wheel_offset(state.sidebar_offset, lines, max);
 }
 
 /// セッションの一覧を、結果の一覧に差し替えるか。
@@ -2778,6 +2951,7 @@ fn sidebar_layout(state: &State, layout: &Layout) -> SidebarLayout {
     let limit = sidebar_limit(state, layout);
 
     let mut blocks = Vec::new();
+    let mut offset = 0;
     let mut y = sidebar::HEADER * sc;
     if showing_hits(state.across.as_ref()) {
         // 打っているあいだ、一覧は結果の一覧に差し替わる（仕様 §6）。
@@ -2793,18 +2967,15 @@ fn sidebar_layout(state: &State, layout: &Layout) -> SidebarLayout {
                 + sidebar::GAP * sc;
         }
     } else {
-        for tree in state.manager.tree_rows() {
-            let Some(s) = state.manager.sessions().get(tree.index) else {
-                continue;
-            };
-            let mut content = state.renderer.line_height_px(sidebar::SIZE_TITLE);
-            if s.window_title.is_some() {
-                content += state.renderer.line_height_px(sidebar::SIZE_SUB);
-            }
-            if s.branch.is_some() {
-                content += state.renderer.line_height_px(sidebar::SIZE_BRANCH);
-            }
-            let height = (sidebar::PAD_TOP + sidebar::PAD_BOTTOM) * sc + content;
+        // 入りきらない行は下で見切れる。`offset` から出し、残りは車輪で送る。
+        let rows = state.manager.tree_rows();
+        let heights = sidebar_row_heights(state, &rows);
+        offset =
+            state
+                .sidebar_offset
+                .min(sidebar_max_offset(&heights, y, limit, sidebar::GAP * sc));
+        for (row, tree) in rows.iter().enumerate().skip(offset) {
+            let height = heights[row];
             if y + height > limit {
                 break;
             }
@@ -2823,24 +2994,31 @@ fn sidebar_layout(state: &State, layout: &Layout) -> SidebarLayout {
         rect_x,
         rect_w,
         blocks,
+        offset,
         sep_y,
     }
 }
 
-/// 縦の位置が、行と行のどの境目を指しているか。0 は先頭、行数は末尾。
+/// 縦の位置が、行と行のどの境目を指しているか。
+///
+/// 返すのは木の行の境目（`Manager::drop_row` と同じ単位）で、窓に出ている
+/// 位置ではない。送っているあいだ、この 2 つは `offset` だけずれる。
+/// 混ぜると、掴んだ行が送った数だけ離れた位置へ落ちる。
 fn sidebar_boundary(sl: &SidebarLayout, py: f32) -> usize {
     for (i, b) in sl.blocks.iter().enumerate() {
         if py < b.top + b.height / 2.0 {
-            return i;
+            return sl.offset + i;
         }
     }
-    sl.blocks.len()
+    sl.offset + sl.blocks.len()
 }
 
-/// 境目を描く高さ。
+/// 境目を描く高さ。`at` は木の行の境目。
 fn sidebar_boundary_y(sl: &SidebarLayout, at: usize, sc: f32) -> f32 {
     let half = sidebar::GAP * sc / 2.0;
-    match sl.blocks.get(at) {
+    // 窓より上の境目は先頭の行の上端、下の境目は末尾の行の下端に寄せる。
+    // 窓の外に線を引いても見えない。
+    match sl.blocks.get(at.saturating_sub(sl.offset)) {
         Some(b) => b.top - half,
         None => match sl.blocks.last() {
             Some(b) => b.top + b.height + half,
@@ -3215,6 +3393,8 @@ fn draw_across_hits(state: &mut State, sl: &SidebarLayout, theme: &Theme) {
 
 pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
     let sc = state.renderer.scale();
+    // 割り付ける前に送り位置を決める。選択が動いていれば追いかける。
+    settle_sidebar_offset(state, layout);
     let sl = sidebar_layout(state, layout);
     let height_px = layout.rows as f32 * state.renderer.cell().height;
     state
@@ -3253,8 +3433,6 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
     }
 
     let selected = state.manager.selected_index();
-    // 描いた「動いている」状態は覚えておく。変わるときだけ描き直す。
-    let mut shown: Vec<(usize, bool, bool)> = Vec::with_capacity(sl.blocks.len());
     for (n, b) in sl.blocks.iter().enumerate() {
         let s = &state.manager.sessions()[b.index];
         let running = s.is_running();
@@ -3270,7 +3448,6 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         };
         let working = s.is_working();
         let blocked = s.blocked;
-        shown.push((b.index, working, blocked));
 
         let hovered =
             state.mouse.x < sl.width && state.mouse.y >= b.top && state.mouse.y < b.top + b.height;
@@ -3290,7 +3467,9 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         // 右端に並べる印の左端。名前はここまでで切る。
         let right = sl.rect_x + sl.rect_w;
         // 印は行ごとに幅が違う。実際に出すものではかる。
-        let hint = input::index_label(n);
+        // 札は木の行で振る。窓の中の位置で振ると、送ったとき
+        // `⌘1` が別の行に付き、押すと窓の外の行へ飛ぶ。
+        let hint = input::index_label(sl.offset + n);
         let hint_w = match &hint {
             Some(h) => state
                 .renderer
@@ -3417,11 +3596,13 @@ pub(crate) fn draw_sidebar(state: &mut State, layout: &Layout, theme: &Theme) {
         }
     }
 
-    for (i, working, blocked) in shown {
-        if let Some(s) = state.manager.sessions_mut().get_mut(i) {
-            s.shown_working = working;
-            s.shown_blocked = blocked;
-        }
+    // 描いた「動いている」状態は、窓の外の行も含めて合わせる。
+    // 外の行を残すと、見えていないセッションが字を出すたびに
+    // `wants_redraw` が窓ぜんぶの描き直しを頼み続ける。
+    for s in state.manager.sessions_mut() {
+        let working = s.is_working();
+        s.shown_working = working;
+        s.shown_blocked = s.blocked;
     }
 
     // 掴んでいる行の落とし先。
@@ -4682,6 +4863,104 @@ mod search_view_tests {
         assert_eq!(across_rows(900.0, 100.0, 50.0, 4.0), 0);
         // 高さの無い件を数え続けない。これは描画の経路にある。
         assert_eq!(across_rows(0.0, 1000.0, 0.0, 0.0), 0);
+    }
+
+    #[test]
+    fn 送った位置から置ける行数を数える() {
+        // 高さの違う 3 行。帯の下（34）から、あいだ 4 画素で置く。
+        let h = [54.0, 71.0, 54.0];
+        // 54 + 4 + 71 で 129。34 から置いて 163 がちょうど 2 行。
+        assert_eq!(sidebar_rows(&h, 0, 34.0, 163.0, 4.0), 2);
+        assert_eq!(
+            sidebar_rows(&h, 0, 34.0, 162.0, 4.0),
+            1,
+            "2 行目に 1 画素足りない"
+        );
+        // 送れば、先頭の行が落ちた先から数える。
+        assert_eq!(sidebar_rows(&h, 1, 34.0, 163.0, 4.0), 2);
+        assert_eq!(
+            sidebar_rows(&h, 3, 34.0, 1000.0, 4.0),
+            0,
+            "末尾より先は 0 行"
+        );
+    }
+
+    #[test]
+    fn 最後の行が下端に来る位置より先へは送らない() {
+        let h = [54.0, 71.0, 54.0];
+        // 3 行とも入るなら送らない。
+        assert_eq!(sidebar_max_offset(&h, 34.0, 1000.0, 4.0), 0);
+        // 末尾の 2 行（71 + 4 + 54）が入る高さ。
+        assert_eq!(sidebar_max_offset(&h, 34.0, 163.0, 4.0), 1);
+        // 末尾の 1 行しか入らない高さ。
+        assert_eq!(sidebar_max_offset(&h, 34.0, 162.0, 4.0), 2);
+        // 1 行も入らない高さでも、行の範囲は出ない。
+        assert_eq!(sidebar_max_offset(&h, 34.0, 34.0, 4.0), 2);
+    }
+
+    #[test]
+    fn 選んだ行が下に隠れていれば送り位置を進める() {
+        let h = [54.0, 71.0, 54.0];
+        // 2 行しか入らない高さで、3 行目を選ぶ。
+        assert_eq!(sidebar_follow(&h, 0, 2, 34.0, 163.0, 4.0), 1);
+        // 入っているあいだは動かさない。車輪で送った位置を奪わない。
+        assert_eq!(sidebar_follow(&h, 0, 1, 34.0, 163.0, 4.0), 0);
+    }
+
+    #[test]
+    fn 選んだ行が上に隠れていればその行まで戻す() {
+        let h = [54.0, 71.0, 54.0];
+        assert_eq!(sidebar_follow(&h, 2, 0, 34.0, 163.0, 4.0), 0);
+    }
+
+    #[test]
+    fn 一行も入らない高さでも送り続けない() {
+        // ここは描画の経路にある。入らない高さで回り続けてはならない。
+        let h = [54.0, 71.0, 54.0];
+        assert_eq!(sidebar_follow(&h, 0, 2, 34.0, 34.0, 4.0), 2);
+    }
+
+    #[test]
+    fn 車輪は上で戻し下で進める() {
+        // 上へ回すと `lines` は正。既存の経路と同じ向きである。
+        assert_eq!(wheel_offset(3, 2, 10), 1);
+        assert_eq!(wheel_offset(1, 3, 10), 0, "先頭より前へは行かない");
+        assert_eq!(wheel_offset(3, -2, 10), 5);
+        assert_eq!(wheel_offset(9, -5, 10), 10, "上限で止まる");
+    }
+
+    #[test]
+    fn 送った一覧でも境目は木の行で返る() {
+        // 窓の中の位置と木の行を混ぜると、掴んだ行が送った数だけ
+        // 離れた位置へ落ちる。
+        let sl = SidebarLayout {
+            width: 200.0,
+            rect_x: 6.0,
+            rect_w: 186.0,
+            blocks: vec![
+                Block {
+                    index: 7,
+                    depth: 0,
+                    top: 34.0,
+                    height: 50.0,
+                },
+                Block {
+                    index: 8,
+                    depth: 0,
+                    top: 88.0,
+                    height: 50.0,
+                },
+            ],
+            offset: 5,
+            sep_y: 150.0,
+        };
+        // 1 本目の上半分はその行の前の境目、下半分は次の境目。
+        assert_eq!(sidebar_boundary(&sl, 40.0), 5);
+        assert_eq!(sidebar_boundary(&sl, 80.0), 6);
+        // 窓の末尾より下は、出ている最後の行の後ろ。
+        assert_eq!(sidebar_boundary(&sl, 300.0), 7);
+        // 描く高さは窓の中へ戻す。
+        assert_eq!(sidebar_boundary_y(&sl, 6, 1.0), 86.0);
     }
 }
 
